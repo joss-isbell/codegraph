@@ -16,7 +16,7 @@
  *   - crash recovery: a dead worker is respawned and its in-flight call retried
  *     once; a poison call that keeps crashing fails gracefully (never wedges the
  *     pool). A crash budget trips a circuit breaker (`healthy` → false) so the
- *     caller falls back to in-process dispatch instead of thrashing respawns.
+ *     pool settles affected calls instead of silently leaving worker execution.
  *   - graceful backstop: a call that can't be served within `softTimeoutMs`
  *     resolves with SUCCESS-shaped "busy, retry" guidance — never `isError`, so
  *     a momentary overload can't teach the agent to abandon codegraph — instead
@@ -49,10 +49,10 @@ export interface PoolWorker {
 
 /** Default linger before a queued call is answered with busy-guidance. */
 /**
- * Total worker deaths before the pool declares itself unhealthy and the caller
- * reverts to in-process dispatch. High enough to ride out a few transient
+ * Total worker deaths before the pool declares permanent capacity loss.
+ * High enough to ride out a few transient
  * crashes, low enough that a systematically-broken worker (e.g. a platform that
- * can't spawn threads) degrades quickly instead of respawning forever.
+ * can't spawn threads) fails truthfully instead of respawning forever.
  */
 const CRASH_BUDGET = 12;
 
@@ -104,7 +104,7 @@ export interface QueryPoolOptions {
   root: string | null;
   /** Max worker threads. Defaults to `clamp(cores-1, 1, 16)`. */
   size?: number;
-  /** Linger before a queued call gets busy-guidance. Default 45s. */
+  /** Admission-to-answer backstop (queue plus execution). Default 45s. */
   softTimeoutMs?: number;
   /** Retries for an in-flight call whose worker crashed. Default 1. */
   maxRetries?: number;
@@ -132,8 +132,8 @@ function busyGuidance(waitedMs: number): ToolResult {
     content: [{
       type: 'text',
       text:
-        `CodeGraph is busy serving other concurrent requests right now (this call waited ${secs}s in the queue). ` +
-        `This is NOT an error and the index is fine — wait a few seconds and retry this exact call; it will return normally. ` +
+        `CodeGraph could not return this pooled call within ${secs}s after admission (including queueing and execution). ` +
+        `This is busy guidance, not an error. Wait a few seconds and retry this exact call. ` +
         `If you can't wait, use your built-in tools for just this one step.`,
     }],
   };
@@ -153,10 +153,13 @@ export class QueryPool {
   // Each worker's start, settled when it posts 'ready' (either way) or goes
   // away — what destroy() waits on before terminating it (see
   // WORKER_START_SETTLE_MS).
-  private starts = new Map<PoolWorker, { settled: Promise<void>; settle: () => void }>();
+  private starts = new Map<PoolWorker, { settled: Promise<void>; settle: () => void; timer: NodeJS.Timeout }>();
+  private terminations = new Set<Promise<void>>();
+  private destroyPromise: Promise<void> | null = null;
   private nextId = 1;
   private totalCrashes = 0;
   private destroyed = false;
+  private failure: string | null = null;
   private readonly root: string | null;
   private readonly maxSize: number;
   private readonly softTimeoutMs: number | null;
@@ -167,10 +170,10 @@ export class QueryPool {
 
   constructor(opts: QueryPoolOptions) {
     this.root = opts.root;
-    // Standalone legacy callers retain the old parser and constructor cap.
+    // Standalone legacy callers retain permissive parsing and ordinary defaults.
     // Engine callers always supply one already-resolved context; no env reread.
     this.execution = opts.execution ?? createQueryExecutionContext(resolveLegacyQueryPolicy({ ...requestedQueryPolicy(process.env),
-      poolSize: String(Math.max(1, Math.min(opts.size ?? Math.max(1, os.cpus().length - 1), 16))),
+      poolSize: String(opts.size ?? Math.max(1, Math.min(os.cpus().length - 1, 16))),
       ...(opts.softTimeoutMs !== undefined ? { busyTimeoutMs: String(opts.softTimeoutMs) } : {}),
     }, 'shared-daemon', os.cpus().length), { readOnly: false, writer: false, synchronization: false });
     const { concurrency, deadline } = this.execution.policy;
@@ -190,48 +193,75 @@ export class QueryPool {
   get liveWorkers(): number { return this.workers.size; }
 
   /**
-   * False once the crash budget is exhausted (or after destroy). The ToolHandler
-   * checks this and falls back to in-process dispatch — a broken worker platform
-   * degrades to today's behavior instead of failing tool calls.
+   * False after permanent capacity loss or destroy. Pool presence remains the
+   * dispatch boundary; this flag must never select a main-thread fallback.
    */
   get healthy(): boolean {
-    return !this.destroyed && this.totalCrashes < CRASH_BUDGET;
+    return !this.destroyed && this.failure === null;
+  }
+
+  get state(): 'accepting' | 'failed' | 'destroyed' {
+    return this.destroyed ? 'destroyed' : this.failure ? 'failed' : 'accepting';
+  }
+
+  /** Immutable ownership facts, including execution whose caller already expired. */
+  get activity(): Readonly<{ queued: number; executing: number; starting: number; retiring: number }> {
+    return Object.freeze({ queued: this.queue.filter(job => !job.settled).length, executing: this.inflight.size,
+      starting: this.pendingWorkers.size, retiring: this.terminations.size });
+  }
+
+  private unavailable(): ToolResult {
+    return { isError: true, content: [{ type: 'text', text: this.destroyed
+      ? 'codegraph is shutting down; retry shortly.'
+      : `CodeGraph query worker capacity is unavailable: ${this.failure ?? 'worker failed'}. Retry after correcting the worker failure.` }] };
+  }
+
+  private fail(reason: string): void {
+    if (!this.healthy) return;
+    this.failure = reason;
+    for (const job of [...this.inflight.values(), ...this.queue]) this.settle(job, this.unavailable());
+    const workers = [...this.workers];
+    this.workers.clear();
+    this.pendingWorkers.clear();
+    this.inflight.clear();
+    this.idle = [];
+    this.queue = [];
+    for (const worker of workers) this.retire(worker);
   }
 
   /**
-   * True once at least one worker has completed its cold start (posted the
-   * 'ready' handshake). Until then the ToolHandler serves calls IN-PROCESS:
-   * a worker cold start is a full module load + DB open — seconds normally,
-   * tens of seconds on a loaded machine — and a call queued behind it gets
-   * nothing until the 45s busy backstop. The daemon's very first tool call
-   * hitting that window was the recurring #662 test flake (and a real
-   * first-call stall for agents). The pool exists for CONCURRENT load, which
-   * by definition arrives after warm-up; the pre-pool in-process path is
-   * strictly better while nothing is warm. Stays true for the pool's
-   * lifetime — later crash-respawn gaps are covered by retry + backstop.
+   * Whether actual ready capacity exists, including occupied workers. Cold or
+   * recovering demand still belongs to this pool and waits in its queue.
    */
   get ready(): boolean {
-    return this.everReady && !this.destroyed;
+    return this.healthy && this.workers.size > this.pendingWorkers.size;
   }
-  private everReady = false;
 
   private spawnOne(): void {
-    if (this.destroyed || this.workers.size >= this.maxSize) return;
+    if (!this.healthy || this.workers.size >= this.maxSize) return;
     let w: PoolWorker;
     try {
       w = this.createWorker();
     } catch {
       this.totalCrashes++; // counts toward the circuit breaker
+      if (this.totalCrashes >= CRASH_BUDGET) this.fail('worker creation failed repeatedly');
       return;
     }
     this.workers.add(w);
     this.pendingWorkers.add(w);
     let settle!: () => void;
     const settled = new Promise<void>((resolve) => { settle = resolve; });
-    this.starts.set(w, { settled, settle });
+    // This bounds only startup, independently of a job's optional busy timer.
+    // At expiry the worker has had the full Windows startup-handshake grace.
+    const timer = setTimeout(() => {
+      this.startSettled(w);
+      this.onWorkerGone(w, 'worker did not become ready within its startup allowance');
+    }, this.startSettleMs);
+    timer.unref?.();
+    this.starts.set(w, { settled, settle, timer });
     w.on('message', (m) => this.onMessage(w, (m ?? {}) as WorkerMessage));
-    w.on('error', () => { this.startSettled(w); this.onWorkerGone(w); });
-    w.on('exit', (code) => { this.startSettled(w); if (code !== 0) this.onWorkerGone(w); });
+    w.on('error', () => { this.startSettled(w); this.onWorkerGone(w, 'worker error'); });
+    w.on('exit', (code) => { this.startSettled(w); this.onWorkerGone(w, `worker exited (${code})`); });
   }
 
   private onMessage(w: PoolWorker, m: WorkerMessage): void {
@@ -241,20 +271,21 @@ export class QueryPool {
     if (!m || !this.workers.has(w)) return; // ignore late messages from retired workers
     if (m.type === 'ready') {
       if (!this.pendingWorkers.delete(w)) return; // already handled this handshake
-      if (m.ok === false) {
+      if (m.ok !== true) {
         this.onWorkerGone(w); // failed opens consume the same budget as crashes
         return;
       }
-      this.everReady = true;
       this.idle.push(w);
       this.drain();
       return;
     }
     if (m.type === 'result') {
       const job = this.inflight.get(w);
+      // A late/duplicate/wrong-id result cannot release a different job's slot.
+      if (!job || m.id !== job.id || !m.result) return;
       this.inflight.delete(w);
       this.idle.push(w);
-      if (job) this.settle(job, m.result ?? busyGuidance(0));
+      this.settle(job, m.result);
       this.drain();
     }
   }
@@ -262,7 +293,7 @@ export class QueryPool {
   // A worker died (crash hook, OOM, segfault, exit≠0). Respawn a replacement and
   // retry its in-flight job once; a job that keeps crashing workers fails
   // gracefully so it can't loop the pool forever.
-  private onWorkerGone(w: PoolWorker): void {
+  private onWorkerGone(w: PoolWorker, reason = 'worker failed to open its project'): void {
     if (!this.workers.has(w)) return; // already handled (error+exit both fire)
     this.workers.delete(w);
     this.pendingWorkers.delete(w);
@@ -270,9 +301,14 @@ export class QueryPool {
     this.totalCrashes++;
     const job = this.inflight.get(w);
     this.inflight.delete(w);
-    try { void w.terminate(); } catch { /* already gone */ }
+    this.retire(w);
+    if (this.totalCrashes >= CRASH_BUDGET) {
+      if (job) this.settle(job, { isError: true, content: [{ type: 'text', text: `CodeGraph query worker capacity is unavailable: ${reason}; recovery exhausted.` }] });
+      this.fail(`${reason}; recovery exhausted`);
+      return;
+    }
     if (this.healthy) this.spawnOne(); // keep capacity
-    if (job) {
+    if (job && !job.settled) {
       if (job.retries < this.maxRetries && this.healthy) {
         job.retries++;
         this.queue.unshift(job); // head of line — retry promptly
@@ -284,6 +320,7 @@ export class QueryPool {
   }
 
   private drain(): void {
+    if (!this.healthy) return;
     // Grow toward maxSize while queued work outstrips workers that are idle OR
     // already on their way up (pending) — so we never spawn the whole pool for a
     // single call whose eager worker just hasn't reported ready yet.
@@ -302,7 +339,11 @@ export class QueryPool {
       if (!job || job.settled) break;
       const w = this.idle.pop()!;
       this.inflight.set(w, job);
-      w.postMessage({ type: 'call', id: job.id, toolName: job.toolName, args: job.args, context: job.context });
+      try {
+        w.postMessage({ type: 'call', id: job.id, toolName: job.toolName, args: job.args, context: job.context });
+      } catch {
+        this.onWorkerGone(w, 'worker dispatch failed');
+      }
     }
   }
 
@@ -315,6 +356,7 @@ export class QueryPool {
 
   /** Run a read tool on the pool. Always resolves (never rejects). */
   run(toolName: string, args: Record<string, unknown>, context?: QueryRequestContext): Promise<ToolResult> {
+    if (!this.healthy) return Promise.resolve(this.unavailable());
     return new Promise<ToolResult>((resolve) => {
       const job: Job = {
         id: this.nextId++, toolName, args, context, resolve,
@@ -338,7 +380,14 @@ export class QueryPool {
     const start = this.starts.get(w);
     if (!start) return;
     this.starts.delete(w);
+    clearTimeout(start.timer);
     start.settle();
+  }
+
+  private retire(worker: PoolWorker): void {
+    const termination = this.terminateStarted(worker);
+    this.terminations.add(termination);
+    void termination.finally(() => this.terminations.delete(termination));
   }
 
   /**
@@ -356,6 +405,7 @@ export class QueryPool {
       ]);
       clearTimeout(cap);
     }
+    this.startSettled(w);
     try { await w.terminate(); } catch { /* already gone */ }
   }
 
@@ -364,8 +414,8 @@ export class QueryPool {
    * still starting up is terminated once it has started (see
    * WORKER_START_SETTLE_MS); outstanding calls are answered first.
    */
-  async destroy(): Promise<void> {
-    if (this.destroyed) return;
+  destroy(): Promise<void> {
+    if (this.destroyPromise) return this.destroyPromise;
     this.destroyed = true;
     const ws = [...this.workers];
     this.workers.clear();
@@ -376,6 +426,8 @@ export class QueryPool {
     }
     this.inflight.clear();
     this.queue = [];
-    await Promise.all(ws.map((w) => this.terminateStarted(w)));
+    for (const worker of ws) this.retire(worker);
+    this.destroyPromise = Promise.all([...this.terminations]).then(() => undefined);
+    return this.destroyPromise;
   }
 }

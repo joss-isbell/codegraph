@@ -73,8 +73,8 @@ describe('resolvePoolSize', () => {
     expect(resolvePoolSize('0', 8)).toBe(0);
     expect(resolvePoolSize('3', 8)).toBe(3);
   });
-  it('caps the override at the hard ceiling', () => {
-    expect(resolvePoolSize('999', 8)).toBe(16);
+  it('preserves supported explicit maxima above the ordinary default ceiling', () => {
+    expect(resolvePoolSize('999', 8)).toBe(999);
   });
   it('defaults to clamp(cores-1, 1, 16) when unset/blank/non-numeric', () => {
     expect(resolvePoolSize(undefined, 8)).toBe(7);
@@ -240,10 +240,7 @@ describe('QueryPool', () => {
   });
 
   it('is not `ready` until a worker completes its cold start (#662 first-call stall)', async () => {
-    // A worker cold start is seconds (tens under load); a call queued behind it
-    // waits for the 45s busy backstop with nothing served. The ToolHandler must
-    // be able to see "no warm worker yet" and dispatch in-process instead — so
-    // `ready` is false before the first 'ready' handshake and true after.
+    // Readiness is an observation, never a switch to owner-thread execution.
     // (FakeWorker posts 'ready' on a macrotask — the synchronous check below
     // observes the cold-start window.)
     const pool = new QueryPool({ root: '/x', size: 1, createWorker: () => new FakeWorker((m) => ({ result: ok(`r:${m.toolName}`) })) });
@@ -336,14 +333,14 @@ describe('QueryPool', () => {
         workers[i].emitExit();
         expect(workers.filter((w) => w.alive).length).toBeLessThanOrEqual(2);
       }
-      // One other pending worker can fail after the twelfth failure trips the breaker.
+      // One other pending worker is retired when the twelfth failure trips the breaker.
       expect(workers).toHaveLength(13);
       expect(pool.healthy).toBe(false);
       expect(pool.ready).toBe(false);
       expect(pool.liveWorkers).toBe(0);
       for (const result of await Promise.all(calls)) {
-        expect(result.isError).toBeFalsy();
-        expect(result.content[0].text).toMatch(/busy/i);
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toMatch(/capacity.*unavailable/i);
       }
     } finally { await pool.destroy(); }
   });
@@ -395,10 +392,12 @@ describe('MCP query pool with real projects (#1465)', () => {
     fs.mkdirSync(workspace);
     const activeEngine = await start(hasDefault ? alpha : workspace);
     expect(pool).not.toBeNull();
-    await vi.waitFor(() => expect(pool!.ready).toBe(true), { timeout: 15000 });
+    expect(pool!.ready).toBe(false);
+    const workerResults: unknown[] = [];
+    for (const worker of (pool as unknown as { workers: Set<Worker> }).workers) {
+      worker.on('message', message => { if (message.type === 'result') workerResults.push(message); });
+    }
     const handler = activeEngine.getToolHandler();
-    // Drain catch-up before comparing the worker and in-process paths.
-    await handler.execute('codegraph_status', { projectPath: alpha });
     const session = new ExploreSessionState();
     const calls = Array.from({ length: 6 }, (_, i) => {
       const projectPath = i % 2 ? beta : alpha;
@@ -406,6 +405,7 @@ describe('MCP query pool with real projects (#1465)', () => {
       return handler.execute('codegraph_explore', { projectPath, query }, session);
     });
     const results = await Promise.all(calls);
+    expect(workerResults.length).toBeGreaterThan(0);
     // Explicit projects pass an asynchronous catch-up gate before dispatch.
     // Check pool growth once the calls have actually reached the workers.
     expect(pool!.liveWorkers).toBe(2);

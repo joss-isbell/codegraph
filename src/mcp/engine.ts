@@ -144,9 +144,8 @@ export class MCPEngine {
 
   /**
    * Start the worker-thread query pool after resolving the default project
-   * (which may be absent). Honors `CODEGRAPH_QUERY_POOL_SIZE`; best-effort:
-   * if workers can't spawn on this platform the ToolHandler keeps serving reads
-   * in-process, so the pool can only help, never break, tool calls.
+   * (which may be absent). A configured pool remains authoritative through
+   * startup and recovery; worker failures settle through its capacity contract.
    */
   private maybeStartPool(root: string | null): void {
     if (this.opts.readOnly || !this.opts.queryPool || this.queryPool || this.closed) return;
@@ -155,16 +154,10 @@ export class MCPEngine {
       process.stderr.write('[CodeGraph MCP] Query pool disabled (CODEGRAPH_QUERY_POOL_SIZE=0); serving reads in-process.\n');
       return;
     }
-    try {
-      this.queryPool = new QueryPool({ root, execution: this.execution });
-      this.toolHandler.setQueryPool(this.queryPool);
-      const size = concurrency.kind === 'finite' ? concurrency.maximum : 'unlimited';
-      process.stderr.write(`[CodeGraph MCP] Query pool: up to ${size} worker thread(s) for concurrent reads.\n`);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      process.stderr.write(`[CodeGraph MCP] Query pool unavailable (${msg}); serving reads in-process.\n`);
-      this.queryPool = null;
-    }
+    this.queryPool = new QueryPool({ root, execution: this.execution });
+    this.toolHandler.setQueryPool(this.queryPool);
+    const size = concurrency.kind === 'finite' ? concurrency.maximum : 'unlimited';
+    process.stderr.write(`[CodeGraph MCP] Query pool: up to ${size} worker thread(s) for concurrent reads.\n`);
   }
 
   /**
@@ -189,10 +182,11 @@ export class MCPEngine {
   /** Internal construction facts for later diagnostics; resolution is not uptake. */
   getQueryExecutionState() {
     const pool = this.queryPool;
-    const pooled = !!(pool?.healthy && pool.ready);
+    const pooled = !!pool?.healthy;
     return immutable({ execution: this.execution, actual: {
       executionMode: this.execution.policy.executionMode,
-      dispatch: pooled ? 'worker' as const : 'main-thread' as const,
+      dispatch: pool ? pooled ? 'worker' as const : 'unavailable' as const : 'main-thread' as const,
+      lifecycle: pool?.state ?? 'disabled', ready: pool?.ready ?? false,
       concurrency: pooled ? this.execution.policy.concurrency : { kind: 'disabled' as const },
       deadline: pooled ? this.execution.policy.deadline : { kind: 'inapplicable' as const },
       // Retirement is represented in the resolved contract; lifecycle #14

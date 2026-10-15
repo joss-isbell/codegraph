@@ -93,7 +93,7 @@ export function resolveQueryPolicy(requested: RequestedQueryPolicy, executionMod
 export function resolveLegacyPoolSize(raw: string | undefined, cpuCount: number): number {
   if (raw !== undefined && raw !== '') {
     const n = Number(raw);
-    if (Number.isFinite(n) && n >= 0) return Math.min(Math.floor(n), 16);
+    if (Number.isFinite(n) && n >= 0 && Number.isSafeInteger(Math.floor(n))) return Math.floor(n);
   }
   return Math.max(1, Math.min(cpuCount - 1, 16));
 }
