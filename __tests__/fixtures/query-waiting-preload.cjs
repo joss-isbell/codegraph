@@ -3,7 +3,8 @@
 const fs = require('node:fs');
 const threads = require('node:worker_threads');
 const record = value => fs.appendFileSync(process.env.QUERY_WAITING_OBSERVATIONS,
-  JSON.stringify({ at: Date.now(), pid: process.pid, threadId: threads.threadId, ...value }) + '\n');
+  JSON.stringify({ at: Date.now(), clock: 'process.hrtime.bigint', monotonicNs: process.hrtime.bigint().toString(),
+    pid: process.pid, threadId: threads.threadId, ...value }) + '\n');
 if (threads.isMainThread) {
   const OriginalWorker = threads.Worker;
   threads.Worker = class extends OriginalWorker {
@@ -20,9 +21,14 @@ if (threads.isMainThread) {
   const originalOn = port.on.bind(port);
   port.on = (event, listener) => originalOn(event, event !== 'message' ? listener : message => {
     if (message?.type === 'call' && message.toolName === 'codegraph_search' && message.args.query === 'delayedTimingSymbol') {
-      record({ event: 'controlled-start', id: message.id, context: message.context });
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 47000);
-      record({ event: 'controlled-release', id: message.id });
+      const started = process.hrtime.bigint();
+      const release = started + 47000000000n;
+      record({ event: 'controlled-start', monotonicNs: started.toString(), id: message.id, context: message.context });
+      const gate = new Int32Array(new SharedArrayBuffer(4));
+      let remaining;
+      while ((remaining = release - process.hrtime.bigint()) > 0n) Atomics.wait(gate, 0, 0, Number(remaining) / 1e6);
+      const released = process.hrtime.bigint();
+      record({ event: 'controlled-release', monotonicNs: released.toString(), elapsedMs: Number(released - started) / 1e6, id: message.id });
     }
     listener(message);
   });

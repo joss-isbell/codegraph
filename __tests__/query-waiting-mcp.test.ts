@@ -72,7 +72,7 @@ describe('independent unlimited waiting through actual MCP requests', () => {
   ('returns the real 47-second worker result and ordinary project routes in %s', async mode => {
     // Per experiment: release at 47s, 90s complete case bound, separate client
     // deadline 80s. This proves CodeGraph timing, not every host's waiting limit.
-    const started = Date.now();
+    const started = process.hrtime.bigint();
     const fixture = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-waiting-mcp-')));
     const roots = [path.join(fixture, 'alpha'), path.join(fixture, 'beta')];
     const observations = path.join(fixture, 'workers.jsonl');
@@ -103,9 +103,9 @@ describe('independent unlimited waiting through actual MCP requests', () => {
         const result = await query(symbol!, projectPath);
         expect(result.isError).toBeFalsy(); expect(result.content[0].text).toContain(`${symbol}`); expect(result.content[0].text).toContain('app.ts:1');
       }
-      const admitted = Date.now();
+      const admitted = process.hrtime.bigint();
       const result = await query('delayedTimingSymbol');
-      const elapsed = Date.now() - admitted;
+      const elapsed = Number(process.hrtime.bigint() - admitted) / 1e6;
       expect(elapsed).toBeGreaterThanOrEqual(47000);
       expect(elapsed).toBeLessThan(80000);
       expect(result.isError).toBeFalsy();
@@ -125,12 +125,14 @@ describe('independent unlimited waiting through actual MCP requests', () => {
       expect(events.filter(event => event.event === 'exit')).toHaveLength(spawned.length);
       const controlled = events.filter(event => event.event.startsWith('controlled-'));
       expect(controlled.map(event => event.event)).toEqual(['controlled-start', 'controlled-release']);
-      expect(controlled[1].at - controlled[0].at).toBeGreaterThanOrEqual(47000);
-      expect(events.some(event => event.event === 'result' && event.threadId === controlled[0].threadId && event.id === controlled[0].id && event.at >= controlled[1].at)).toBe(true);
+      expect(controlled[1].elapsedMs).toBeGreaterThanOrEqual(47000);
+      expect(BigInt(controlled[1].monotonicNs) - BigInt(controlled[0].monotonicNs)).toBeGreaterThanOrEqual(47000000000n);
+      expect(events.some(event => event.event === 'result' && event.threadId === controlled[0].threadId && event.id === controlled[0].id
+        && BigInt(event.monotonicNs) >= BigInt(controlled[1].monotonicNs))).toBe(true);
       expect(client.replies.filter(reply => reply.id === controlled[0].context.requestId)).toHaveLength(1);
-      expect(Date.now() - started).toBeLessThan(90000);
+      expect(Number(process.hrtime.bigint() - started) / 1e6).toBeLessThan(90000);
       if (process.env.VALIDATION_OUT) fs.writeFileSync(path.join(process.env.VALIDATION_OUT, `waiting-${mode}.json`), JSON.stringify({
-        mode, releaseMs: 47000, caseBoundMs: 90000, clientDeadlineMs: 80000, elapsed, roots,
+        mode, clock: 'process.hrtime.bigint', releaseMs: 47000, caseBoundMs: 90000, clientDeadlineMs: 80000, elapsed, roots,
         inputs: roots.map(root => ({ root, source: fs.readFileSync(path.join(root, 'app.ts'), 'utf8') })), events, replies: client.replies,
       }, null, 2));
     } finally {

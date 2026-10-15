@@ -179,4 +179,32 @@ describe('independent pooled waiting override', () => {
       expect(pool.state).toBe('failed');
     } finally { await pool.destroy(); }
   });
+  it('does not create capacity for cold queued callers whose finite deadlines already expired', async () => {
+    vi.useFakeTimers(); vi.setSystemTime(0);
+    const workers: ControlledWorker[] = [];
+    const pool = new QueryPool({ root: null, size: 4, softTimeoutMs: 1000, createWorker: () => {
+      const worker = new ControlledWorker(); workers.push(worker); return worker;
+    } });
+    try {
+      const calls = Array.from({ length: 4 }, () => pool.run('codegraph_search', {}));
+      expect(workers).toHaveLength(2);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect((await Promise.all(calls)).every(result => !result.isError && result.content[0].text.includes('after admission'))).toBe(true);
+      expect(pool.activity).toMatchObject({ queued: 0, executing: 0, starting: 2 });
+      workers[0].emit('message', { type: 'ready', ok: true });
+      expect(workers).toHaveLength(2);
+      workers[1].emit('message', { type: 'ready', ok: true });
+      expect(workers.flatMap(worker => worker.calls)).toEqual([]);
+      // Live demand after pruning still grows and preserves FIFO admission order.
+      const live = Array.from({ length: 3 }, () => pool.run('codegraph_search', {}));
+      expect(workers).toHaveLength(3);
+      workers[2].emit('message', { type: 'ready', ok: true });
+      expect(workers.flatMap(worker => worker.calls).map(call => call.id).sort()).toEqual([5, 6, 7]);
+      for (const worker of workers) for (const call of worker.calls) worker.complete(call.id);
+      expect(await Promise.all(live)).toEqual([ok, ok, ok]);
+    } finally {
+      for (const worker of workers) worker.emit('message', { type: 'ready', ok: true });
+      await pool.destroy();
+    }
+  });
 });

@@ -320,6 +320,9 @@ export class QueryPool {
 
   private drain(): void {
     if (!this.healthy) return;
+    // Expired queued callers are no longer demand. Prune before growth so late
+    // readiness cannot create workers for calls the admission timer answered.
+    this.queue = this.queue.filter(job => !job.settled);
     // Grow toward maxSize while queued work outstrips workers that are idle OR
     // already on their way up (pending) — so we never spawn the whole pool for a
     // single call whose eager worker just hasn't reported ready yet.

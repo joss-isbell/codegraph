@@ -125,6 +125,8 @@ behavior are unchanged. No installation or live service is changed.
   or synchronous interruption promise. An expired queued call never executes;
   an executing call keeps its slot until completion or safe teardown, and late
   results cannot deliver a second answer or release another call's slot.
+  Expired queued entries are pruned before demand growth; a late ready worker
+  cannot allocate extra capacity for callers whose deadlines already answered.
 - Startup readiness, bounded recovery, transport/catch-up and shutdown safeguards
   remain separate. The absent busy timer is no permanent-failure settlement
   mechanism. Calling applications retain independent deadlines; a long-enough
@@ -134,7 +136,9 @@ behavior are unchanged. No installation or live service is changed.
   47 seconds, with a 90-second experiment bound and an independent 80-second
   client deadline, in direct, writable-fallback and shared-daemon modes. The test
   preload delays delivery to the unchanged worker handler; it never fabricates
-  graph output. Ordinary default/explicit project queries run beside this proof.
+  graph output. Release and elapsed/result identity use monotonic
+  `process.hrtime.bigint` timestamps; epoch timestamps remain context only.
+  Ordinary default/explicit project queries run beside this proof.
 
 ## Validation boundary
 
