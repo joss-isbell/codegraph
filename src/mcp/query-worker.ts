@@ -60,7 +60,7 @@ if (parentPort) {
   let cg: CodeGraph | null = null;
   let initError: string | null = null;
   try {
-    cg = root ? loadCodeGraph().openSync(root) : null;
+    cg = root ? loadCodeGraph().openSync(root, { readOnly: execution?.capability === 'read-only' }) : null;
     handler = new (loadToolHandler())(cg, execution);
   } catch (err) {
     cg?.close();

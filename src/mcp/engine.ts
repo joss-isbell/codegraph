@@ -148,16 +148,21 @@ export class MCPEngine {
    * startup and recovery; worker failures settle through its capacity contract.
    */
   private maybeStartPool(root: string | null): void {
-    if (this.opts.readOnly || !this.opts.queryPool || this.queryPool || this.closed) return;
+    if (!this.opts.queryPool || this.queryPool || this.closed) return;
     const concurrency = this.execution.policy.concurrency;
     if (concurrency.kind === 'disabled') {
-      process.stderr.write('[CodeGraph MCP] Query pool disabled (CODEGRAPH_QUERY_POOL_SIZE=0); serving reads in-process.\n');
+      process.stderr.write(this.opts.readOnly
+        ? '[CodeGraph MCP] Local read-only fallback uses main-thread reads unless positive finite pooling is explicitly selected.\n'
+        : '[CodeGraph MCP] Query pool disabled (CODEGRAPH_QUERY_POOL_SIZE=0); serving reads in-process.\n');
       return;
     }
+    // #11 activates explicit finite read-only pooling only. The opt-in unlimited
+    // lifecycle and public preset uptake remain with #14/#15.
+    if (this.opts.readOnly && concurrency.kind !== 'finite') return;
     this.queryPool = new QueryPool({ root, execution: this.execution });
     this.toolHandler.setQueryPool(this.queryPool);
     const size = concurrency.kind === 'finite' ? concurrency.maximum : 'unlimited';
-    process.stderr.write(`[CodeGraph MCP] Query pool: up to ${size} worker thread(s) for concurrent reads.\n`);
+    process.stderr.write(`[CodeGraph MCP] Query pool: up to ${size} worker thread(s) for concurrent reads${this.opts.readOnly ? ' (local read-only fallback; no writer or auto-sync ownership)' : ''}.\n`);
   }
 
   /**
@@ -185,6 +190,7 @@ export class MCPEngine {
     const pooled = !!pool?.healthy;
     return immutable({ execution: this.execution, actual: {
       executionMode: this.execution.policy.executionMode,
+      resourceScope: this.execution.policy.executionMode === 'shared-daemon' ? 'shared-project' as const : 'local-engine' as const,
       dispatch: pool ? pooled ? 'worker' as const : 'unavailable' as const : 'main-thread' as const,
       lifecycle: pool?.state ?? 'disabled', ready: pool?.ready ?? false,
       concurrency: pooled ? this.execution.policy.concurrency : { kind: 'disabled' as const },

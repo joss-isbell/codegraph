@@ -79,6 +79,9 @@ describe('internal query policy', () => {
       concurrency: { kind: 'finite', maximum: 7 }, deadline: { kind: 'absent' }, retention: 'ordinary',
     });
     expect(resolveLegacyQueryPolicy({ poolSize: ' ' }, 'direct', 8).deadline.kind).toBe('inapplicable');
-    expect(resolveLegacyQueryPolicy({ poolSize: '4' }, 'read-only-fallback', 8).concurrency.kind).toBe('disabled');
+    expect(resolveLegacyQueryPolicy({ poolSize: '4' }, 'read-only-fallback', 8)).toMatchObject({ concurrency: { kind: 'finite', maximum: 4 }, deadline: { kind: 'finite', milliseconds: 45000 } });
+    for (const poolSize of [undefined, '', 'malformed', 'unlimited', '0']) {
+      expect(resolveLegacyQueryPolicy({ poolSize }, 'read-only-fallback', 8)).toMatchObject({ concurrency: { kind: 'disabled' }, deadline: { kind: 'inapplicable' } });
+    }
   });
 });

@@ -168,39 +168,32 @@ export class DatabaseConnection {
     }
 
     const { db, backend } = createDatabase(dbPath, options);
-
-    configureConnection(db, options.readOnly);
-
-    // Detect FTS5 availability for search fallback (#1532)
-    let fts5Available = true;
     try {
-      db.exec("SELECT * FROM nodes_fts LIMIT 0");
-    } catch {
-      fts5Available = false;
+      configureConnection(db, options.readOnly);
+
+      // Detect FTS5 availability for search fallback (#1532)
+      let fts5Available = true;
+      try { db.exec("SELECT * FROM nodes_fts LIMIT 0"); }
+      catch { fts5Available = false; }
+
+      const conn = new DatabaseConnection(db, dbPath, backend, fts5Available, options.readOnly);
+      // Concurrent readers leave migrations, repair and WAL maintenance to the
+      // writer, including when versions differ (#1963).
+      if (options.readOnly) return conn;
+      const currentVersion = getCurrentVersion(db);
+      if (currentVersion < CURRENT_SCHEMA_VERSION) runMigrations(db, currentVersion);
+
+      // Heal incomplete bulk loads and killed writers only on writable opens.
+      conn.healBulkNodeLoad();
+      conn.healBulkSecondaryIndexes();
+      void conn.healOversizedWal();
+      return conn;
+    } catch (err) {
+      // An unsuitable database can reject connection configuration after the
+      // native handle opens. No failed read/open may retain that handle.
+      try { db.close(); } catch { /* preserve the original opening failure */ }
+      throw err;
     }
-
-    // Check and run migrations if needed
-    const conn = new DatabaseConnection(db, dbPath, backend, fts5Available, options.readOnly);
-    // A concurrent reader must leave migrations, bulk-load repair, and WAL
-    // maintenance to the writer, including when versions differ (#1963).
-    if (options.readOnly) return conn;
-    const currentVersion = getCurrentVersion(db);
-
-    if (currentVersion < CURRENT_SCHEMA_VERSION) {
-      runMigrations(db, currentVersion);
-    }
-
-    // Self-heal a bulk-load window that never closed (crash between
-    // beginBulkNodeLoad and endBulkNodeLoad): the FTS triggers are missing and
-    // nodes_fts is stale. Rebuild + recreate so search stays in sync.
-    conn.healBulkNodeLoad();
-    conn.healBulkSecondaryIndexes();
-
-    // Self-heal a killed session's leftover oversized WAL (#1431) — one
-    // statSync when healthy, off-thread checkpoint+truncate when not.
-    void conn.healOversizedWal();
-
-    return conn;
   }
 
   /**
