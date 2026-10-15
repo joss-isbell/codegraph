@@ -2852,17 +2852,10 @@ export class ToolHandler {
         return await this.handleStatus(args);
       }
 
-      // Read tools: off-load the CPU-heavy dispatch to the worker pool when one
-      // is attached, healthy, AND has finished its first cold start,
-      // so the server's single event loop stays free for the MCP
-      // transport under concurrent load — otherwise N concurrent explores
-      // serialize AND starve the transport until the whole batch drains
-      // (clients then time out). Before the first worker is warm, calls run
-      // in-process: a call queued behind a cold start sat invisible until the
-      // 45s busy backstop — the daemon's first tool call stalling for however
-      // long a worker spawn takes on a loaded machine (the #662 flake). With
-      // no pool or a degraded one, dispatch runs in-process
-      // exactly as before. Either way the result flows through the
+      // A configured pool owns reads even while cold, recovering or failed.
+      // Its queue waits for readiness; permanent capacity loss returns the
+      // pool's terminal outcome rather than silently blocking the main loop.
+      // Only explicitly unpooled engines execute reads here. Results retain the
       // cross-cutting notices — worktree-index mismatch (#155) and per-file
       // staleness (#403) — which need the watched MAIN instance and so are
       // always applied here, never in the worker.
@@ -2876,10 +2869,10 @@ export class ToolHandler {
       // The default may have appeared after the workers started. Pass the
       // main thread's current root explicitly; with no root or projectPath,
       // keep the main handler's workspace-specific not-indexed guidance.
-      const pooled = !!(this.queryPool && this.queryPool.healthy && this.queryPool.ready);
-      const projectPath = pooled ? args.projectPath ?? this.cg?.getProjectRoot() : undefined;
+      const pooled = this.queryPool !== null;
+      const projectPath = project.getProjectRoot();
       const wasDegraded = project.isWatcherDegraded?.();
-      const raw = (pooled && projectPath)
+      const raw = pooled
         ? await this.queryPool!.run(toolName, { ...dispatchArgs, projectPath }, context)
         : await this.executeReadTool(toolName, dispatchArgs, context);
       const answeredFrom = raw._cgAnswerFiles;

@@ -73,7 +73,7 @@ describe('internal query policy', () => {
   });
   it('preserves permissive public parsing without activating the new preset', () => {
     expect(resolveLegacyQueryPolicy({ mode: 'unlimited', poolSize: '1e3', busyTimeoutMs: '1000.9' }, 'direct', 8)).toMatchObject({
-      source: 'legacy', preset: 'default', classification: 'custom', concurrency: { kind: 'finite', maximum: 16 }, deadline: { kind: 'finite', milliseconds: 1000 }, retention: 'ordinary',
+      source: 'legacy', preset: 'default', classification: 'custom', concurrency: { kind: 'finite', maximum: 1000 }, deadline: { kind: 'finite', milliseconds: 1000 }, retention: 'ordinary',
     });
     expect(resolveLegacyQueryPolicy({ mode: 'unlimited', poolSize: 'unlimited', busyTimeoutMs: 'unlimited' }, 'direct', 8)).toMatchObject({
       concurrency: { kind: 'finite', maximum: 7 }, deadline: { kind: 'finite', milliseconds: 45000 }, retention: 'ordinary',

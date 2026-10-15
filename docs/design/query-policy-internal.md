@@ -12,10 +12,12 @@ behavior are unchanged. No installation or live service is changed.
   `ResolvedQueryPolicy`. `resolveQueryPolicy` implements the settled strict
   contract. It is not the public environment adapter until Issue #15.
 - `resolveLegacyQueryPolicy` snapshots existing settings at engine construction.
-  It preserves numeric coercion, flooring, the 16-worker explicit override cap,
+  It preserves numeric coercion and flooring,
   ignored malformed input and legacy timeout behavior. It deliberately ignores
   the new mode input. Its direct/writable defaults are bounded to two workers;
-  shared-daemon defaults use cores minus one bounded to 1–16. Read-only defaults
+  shared-daemon defaults use cores minus one bounded to 1–16. Issue #10 removes
+  both explicit finite override clamps; supported finite maxima are exact lazy
+  demand ceilings. Read-only defaults
   disable pooling. `resolvePoolSize` remains the old parser's compatibility seam.
 - Strict resolution uses decimal digits only, trimmed case-sensitive sentinels,
   exact safe pool integers 0–9,007,199,254,740,991 and finite deadlines
@@ -31,8 +33,10 @@ behavior are unchanged. No installation or live service is changed.
   Startup pacing remains distinct from the maximum. Unlimited lifecycle proof
   belongs to the later lifecycle tickets; this interface alone is not acceptance.
 - `getQueryExecutionState` separates resolution from current construction and
-  dispatch: read-only, cold, disabled or unhealthy execution reports main-thread
-  inapplicability. Actual retention remains ordinary until Issue #14. This is an
+  dispatch: read-only/disabled execution reports main-thread inapplicability.
+  A constructed cold/recovering pool reports worker dispatch with `ready:false`;
+  permanent failure reports unavailable dispatch and a failed lifecycle, never a
+  main-thread escape. Actual retention remains ordinary until Issue #14. This is an
   internal diagnostics input, not an additional MCP tool or public claim.
 - `connectWithHello` resolves a prospective **shared-daemon** policy, independently
   of a direct/fallback engine, and sends it in the internal client hello. Issue
@@ -67,6 +71,44 @@ behavior are unchanged. No installation or live service is changed.
   This ticket does not enable public read-only pooling or change existing worker
   opening behavior. Main-thread read-only default and explicit routes continue
   through the engine's existing read-only project lifecycle.
+
+## Worker readiness and capacity boundary (Issue #10)
+
+- A pool's presence owns every validated read. Cold starts, a recovering empty
+  ready set and terminal failure never select owner-thread execution. Status,
+  catch-up, watcher notices and session emission handling stay on the main
+  thread. Explicit pool zero remains the ordinary unpooled path.
+- Failed default initialization starts a rootless pool, including the synchronous
+  retry path, so a valid explicit project still receives real worker execution.
+  The unavailable default keeps its existing owner-side guidance; workers do not
+  initialize or repair it as a side effect of serving another project.
+- Finite overrides above 16 are exact safe-integer demand ceilings. Defaults
+  remain direct/writable maximum two and daemon cores-minus-one bounded to
+  1–16. At most two workers start concurrently; ready workers continue growing
+  on demand, so this pacing does not limit actual execution to two. A very large
+  maximum never eagerly allocates that many workers.
+- Readiness has its own 15-second startup allowance. It does not constrain
+  healthy execution and does not depend on the optional busy timer. Factory
+  failures, failed/never-ready opens, dispatch exceptions, errors and every exit
+  code consume the bounded recovery budget. A running call retries once with
+  the same admission identity and timer. Exhaustion settles outstanding callers
+  truthfully, retires owned workers and rejects later admissions. No automatic
+  replacement revives a failed or destroyed pool.
+- `state` (`accepting`/`failed`/`destroyed`) and immutable `activity` observations
+  are the internal lifecycle seams for #12 and #14. `activity.executing` includes
+  work whose caller's finite timer expired; it stays occupied until actual
+  completion or worker teardown. `activity.queued` counts only unsettled callers,
+  `starting` counts readiness waits and `retiring` counts awaited owned teardown.
+  Jobs already retain immutable per-request/session/generation context, and all
+  caller outcomes share one idempotent settlement path. Cancellation, natural
+  drain and idle retirement are not implemented here.
+- Results must match both the owned Worker object and its current job id.
+  Duplicate readiness, stale/duplicate results and error/exit races cannot free
+  another job's slot or deliver a second outcome. Expired jobs are never retried.
+  Destroy is idempotent and awaits failed as well as active owned workers. It
+  retains the Windows startup handshake/grace before termination. The real
+  worker crash fixture collects before self-exit; failed initialization closes
+  any connection it already opened.
 
 ## Validation boundary
 

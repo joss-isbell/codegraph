@@ -25,6 +25,8 @@ import { parentPort, workerData } from 'worker_threads';
 import type { ToolResult } from './tools';
 import type { QueryExecutionContext, QueryRequestContext } from './query-context';
 import { immutable } from './query-policy';
+import { collectBeforeExit } from '../worker-teardown';
+import type CodeGraph from '../index';
 
 interface WorkerInit {
   root: string | null;
@@ -55,16 +57,18 @@ if (parentPort) {
   // own per-handler cache. openSync does not start a watcher — workers are pure
   // readers; the single watcher/writer stays on the daemon's main thread.
   let handler: InstanceType<typeof import('./tools').ToolHandler> | null = null;
+  let cg: CodeGraph | null = null;
   let initError: string | null = null;
   try {
-    const cg = root ? loadCodeGraph().openSync(root) : null;
+    cg = root ? loadCodeGraph().openSync(root) : null;
     handler = new (loadToolHandler())(cg, execution);
   } catch (err) {
+    cg?.close();
     initError = err instanceof Error ? err.message : String(err);
   }
 
   // Tell the pool we're up. `ok:false` lets the pool count a hard open failure
-  // against its crash budget (→ fall back to in-process) without hanging.
+  // against its recovery budget without hanging or changing execution paths.
   port.postMessage({ type: 'ready', ok: initError === null, error: initError });
 
   port.on('message', (msg: CallMessage) => {
@@ -78,6 +82,7 @@ if (parentPort) {
     // deterministically. Gated behind an env flag only the suite sets — inert in
     // normal operation (and `__test_crash__` isn't a real tool name anyway).
     if (msg.toolName === '__test_crash__' && process.env.CODEGRAPH_QUERY_WORKER_ALLOW_TEST_CRASH === '1') {
+      collectBeforeExit();
       process.exit(13);
     }
     if (!handler) {
