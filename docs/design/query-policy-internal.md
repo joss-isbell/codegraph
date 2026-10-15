@@ -1,7 +1,7 @@
 # Internal query policy and request context (Issue #9)
 
 This is an internal preparation seam. Public startup still uses the original
-permissive parser, finite concurrency, 45-second pooled busy timer and ordinary
+permissive numeric parser, finite concurrency, default 45-second pooled busy timer and ordinary
 retention. `CODEGRAPH_QUERY_MODE` does not activate a preset in this change.
 Read-only fallback remains unpooled by default; Issue #11 permits an explicitly
 selected positive finite pool. Service compatibility and replacement
@@ -14,7 +14,10 @@ behavior are unchanged. No installation or live service is changed.
   contract. It is not the public environment adapter until Issue #15.
 - `resolveLegacyQueryPolicy` snapshots existing settings at engine construction.
   It preserves numeric coercion and flooring,
-  ignored malformed input and legacy timeout behavior. It deliberately ignores
+  ignored malformed input and numeric timeout flooring. Issue #13 adds the
+  trimmed, case-sensitive independent `CODEGRAPH_QUERY_BUSY_TIMEOUT_MS=unlimited`
+  sentinel and prevents timer overflow; malformed numeric input still falls back
+  to 45 seconds until strict public validation in #15. It deliberately ignores
   the new mode input. Its direct/writable defaults are bounded to two workers;
   shared-daemon defaults use cores minus one bounded to 1–16. Issue #10 removes
   both explicit finite override clamps; supported finite maxima are exact lazy
@@ -112,6 +115,33 @@ behavior are unchanged. No installation or live service is changed.
   worker crash fixture collects before self-exit; failed initialization closes
   any connection it already opened.
 
+## Independent waiting boundary (Issue #13)
+
+- The existing busy-timeout override can omit the pool admission timer entirely.
+  It preserves mode capacity and ordinary retention; it does not activate the
+  unlimited preset. Disabled pools, including ordinary read-only fallback, retain
+  inapplicable deadlines. Unset waiting keeps the 45-second finite default.
+- Finite waiting starts on admission and spans queue plus execution without
+  resetting on dispatch or recovery. Busy guidance reports actual total elapsed
+  time, is success-shaped and asks the caller to retry. It makes no worker-health
+  or synchronous interruption promise. An expired queued call never executes;
+  an executing call keeps its slot until completion or safe teardown, and late
+  results cannot deliver a second answer or release another call's slot.
+  Expired queued entries are pruned before demand growth; a late ready worker
+  cannot allocate extra capacity for callers whose deadlines already answered.
+- Startup readiness, bounded recovery, transport/catch-up and shutdown safeguards
+  remain separate. The absent busy timer is no permanent-failure settlement
+  mechanism. Calling applications retain independent deadlines; a long-enough
+  controlled client proves CodeGraph waiting only. #15 integrates cancellation
+  and the complete strict preset/input contract; #16 completes attachment safety.
+- Controlled host-facing proofs release a real built SQLite worker call at
+  47 seconds, with a 90-second experiment bound and an independent 80-second
+  client deadline, in direct, writable-fallback and shared-daemon modes. The test
+  preload delays delivery to the unchanged worker handler; it never fabricates
+  graph output. Release and elapsed/result identity use monotonic
+  `process.hrtime.bigint` timestamps; epoch timestamps remain context only.
+  Ordinary default/explicit project queries run beside this proof.
+
 ## Validation boundary
 
 The policy matrix, real SQLite/worker protocol, all four host-facing modes and
@@ -122,7 +152,11 @@ replacement suites remain regression evidence. Run all checks with the proved
 `dist`, runtime and both dependency trees. `query-tests.py` uses Vitest 2's Node
 API with an explicit empty workspace, no implicit build and an attempt-local Vite
 cache. Its JSON result must contain every test tail; only predeclared exact
-platform-gated skips are accepted. No held project or installed registry is used.
+platform-gated skips are accepted. A separate diagnostic collection retains
+Vitest's unhandled errors and actual exit state through shutdown; both the full
+report and an empty error collection with exit 0 are required. The actual adapter
+producer/consumer proof accepts a clean run and rejects an unhandled rejection
+even when its test assertion passes. No held project or installed registry is used.
 
 ## Read-only fallback boundary (Issue #11)
 

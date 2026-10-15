@@ -17,10 +17,10 @@
  *     once; a poison call that keeps crashing fails gracefully (never wedges the
  *     pool). A crash budget trips a circuit breaker (`healthy` → false) so the
  *     pool settles affected calls instead of silently leaving worker execution.
- *   - graceful backstop: a call that can't be served within `softTimeoutMs`
+ *   - optional admission deadline: a call that can't be served within `softTimeoutMs`
  *     resolves with SUCCESS-shaped "busy, retry" guidance — never `isError`, so
  *     a momentary overload can't teach the agent to abandon codegraph — instead
- *     of hanging past the client's hard timeout.
+ *     of continuing to wait. Calling applications have independent deadlines.
  */
 
 import { Worker } from 'worker_threads';
@@ -47,7 +47,6 @@ export interface PoolWorker {
   on(event: 'exit', cb: (code: number) => void): void;
 }
 
-/** Default linger before a queued call is answered with busy-guidance. */
 /**
  * Total worker deaths before the pool declares permanent capacity loss.
  * High enough to ride out a few transient
@@ -127,7 +126,7 @@ export function resolvePoolSize(envVal: string | undefined, cpuCount: number): n
 
 /** Success-shaped overload guidance (NEVER isError — see the abandonment rule). */
 function busyGuidance(waitedMs: number): ToolResult {
-  const secs = Math.max(1, Math.round(waitedMs / 1000));
+  const secs = (Math.max(0, waitedMs) / 1000).toFixed(3);
   return {
     content: [{
       type: 'text',
@@ -321,6 +320,9 @@ export class QueryPool {
 
   private drain(): void {
     if (!this.healthy) return;
+    // Expired queued callers are no longer demand. Prune before growth so late
+    // readiness cannot create workers for calls the admission timer answered.
+    this.queue = this.queue.filter(job => !job.settled);
     // Grow toward maxSize while queued work outstrips workers that are idle OR
     // already on their way up (pending) — so we never spawn the whole pool for a
     // single call whose eager worker just hasn't reported ready yet.
@@ -362,9 +364,9 @@ export class QueryPool {
         id: this.nextId++, toolName, args, context, resolve,
         retries: 0, settled: false, enqueuedAt: Date.now(),
       };
-      // Don't let the caller wait past softTimeoutMs. The worker may still be
-      // busy (we can't cancel synchronous CPU), but the CLIENT gets a prompt,
-      // success-shaped "retry" instead of a hard timeout.
+      // This optional timer starts once on admission, spanning queue and actual
+      // execution. Retry keeps the same timer. Expiry answers only the caller;
+      // an executing worker stays occupied until completion or safe teardown.
       if (this.softTimeoutMs !== null) {
         job.softTimer = setTimeout(() => {
           if (!job.settled) this.settle(job, busyGuidance(Date.now() - job.enqueuedAt));
