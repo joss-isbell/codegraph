@@ -76,7 +76,7 @@ describe('internal query policy', () => {
       source: 'legacy', preset: 'default', classification: 'custom', concurrency: { kind: 'finite', maximum: 1000 }, deadline: { kind: 'finite', milliseconds: 1000 }, retention: 'ordinary',
     });
     expect(resolveLegacyQueryPolicy({ mode: 'unlimited', poolSize: 'unlimited', busyTimeoutMs: 'unlimited' }, 'direct', 8)).toMatchObject({
-      concurrency: { kind: 'finite', maximum: 7 }, deadline: { kind: 'finite', milliseconds: 45000 }, retention: 'ordinary',
+      concurrency: { kind: 'finite', maximum: 7 }, deadline: { kind: 'absent' }, retention: 'ordinary',
     });
     expect(resolveLegacyQueryPolicy({ poolSize: ' ' }, 'direct', 8).deadline.kind).toBe('inapplicable');
     expect(resolveLegacyQueryPolicy({ poolSize: '4' }, 'read-only-fallback', 8).concurrency.kind).toBe('disabled');

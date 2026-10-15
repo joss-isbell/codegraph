@@ -1,7 +1,7 @@
 # Internal query policy and request context (Issue #9)
 
 This is an internal preparation seam. Public startup still uses the original
-permissive parser, finite concurrency, 45-second pooled busy timer and ordinary
+permissive numeric parser, finite concurrency, default 45-second pooled busy timer and ordinary
 retention. `CODEGRAPH_QUERY_MODE` does not activate a preset in this change.
 Read-only fallback remains unpooled. Service compatibility and replacement
 behavior are unchanged. No installation or live service is changed.
@@ -13,7 +13,10 @@ behavior are unchanged. No installation or live service is changed.
   contract. It is not the public environment adapter until Issue #15.
 - `resolveLegacyQueryPolicy` snapshots existing settings at engine construction.
   It preserves numeric coercion and flooring,
-  ignored malformed input and legacy timeout behavior. It deliberately ignores
+  ignored malformed input and numeric timeout flooring. Issue #13 adds the
+  trimmed, case-sensitive independent `CODEGRAPH_QUERY_BUSY_TIMEOUT_MS=unlimited`
+  sentinel and prevents timer overflow; malformed numeric input still falls back
+  to 45 seconds until strict public validation in #15. It deliberately ignores
   the new mode input. Its direct/writable defaults are bounded to two workers;
   shared-daemon defaults use cores minus one bounded to 1–16. Issue #10 removes
   both explicit finite override clamps; supported finite maxima are exact lazy
@@ -109,6 +112,29 @@ behavior are unchanged. No installation or live service is changed.
   retains the Windows startup handshake/grace before termination. The real
   worker crash fixture collects before self-exit; failed initialization closes
   any connection it already opened.
+
+## Independent waiting boundary (Issue #13)
+
+- The existing busy-timeout override can omit the pool admission timer entirely.
+  It preserves mode capacity and ordinary retention; it does not activate the
+  unlimited preset. Disabled pools, including ordinary read-only fallback, retain
+  inapplicable deadlines. Unset waiting keeps the 45-second finite default.
+- Finite waiting starts on admission and spans queue plus execution without
+  resetting on dispatch or recovery. Busy guidance reports actual total elapsed
+  time, is success-shaped and asks the caller to retry. It makes no worker-health
+  or synchronous interruption promise. An expired queued call never executes;
+  an executing call keeps its slot until completion or safe teardown, and late
+  results cannot deliver a second answer or release another call's slot.
+- Startup readiness, bounded recovery, transport/catch-up and shutdown safeguards
+  remain separate. The absent busy timer is no permanent-failure settlement
+  mechanism. Calling applications retain independent deadlines; a long-enough
+  controlled client proves CodeGraph waiting only. #15 integrates cancellation
+  and the complete strict preset/input contract; #16 completes attachment safety.
+- Controlled host-facing proofs release a real built SQLite worker call at
+  47 seconds, with a 90-second experiment bound and an independent 80-second
+  client deadline, in direct, writable-fallback and shared-daemon modes. The test
+  preload delays delivery to the unchanged worker handler; it never fabricates
+  graph output. Ordinary default/explicit project queries run beside this proof.
 
 ## Validation boundary
 

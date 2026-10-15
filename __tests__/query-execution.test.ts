@@ -66,7 +66,7 @@ describe('real query worker context', () => {
     } finally { await engine.stop(); }
   }, 30000);
   it.each(['direct', 'writable-fallback', 'shared-daemon', 'read-only-fallback'] as QueryExecutionMode[])
-  ('preserves public defaults and actual execution facts through default/explicit routing in %s', async (mode) => {
+  ('preserves mode capacity and independent waiting through default/explicit routing in %s', async (mode) => {
     const alpha = await fixture('alphaSymbol');
     const beta = await fixture('betaSymbol');
     vi.stubEnv('CODEGRAPH_QUERY_POOL_SIZE', undefined);
@@ -81,7 +81,7 @@ describe('real query worker context', () => {
       expect(execution).toMatchObject({ capability: readOnly ? 'read-only' : 'read-write',
         ownership: { writer: !readOnly, synchronization: !readOnly }, policy: { source: 'legacy', preset: 'default',
           executionMode: mode, concurrency: readOnly ? { kind: 'disabled' } : { kind: 'finite', maximum },
-          deadline: readOnly ? { kind: 'inapplicable' } : { kind: 'finite', milliseconds: 45000 }, retention: 'ordinary' } });
+          deadline: readOnly ? { kind: 'inapplicable' } : { kind: 'absent' }, retention: 'ordinary' } });
       if (!readOnly) {
         const deadline = Date.now() + 10000;
         while (engine.getQueryExecutionState().actual.dispatch !== 'worker' && Date.now() < deadline) {
@@ -97,7 +97,7 @@ describe('real query worker context', () => {
       const state = engine.getQueryExecutionState();
       expect(state.actual).toMatchObject({ executionMode: mode, dispatch: readOnly ? 'main-thread' : 'worker',
         concurrency: readOnly ? { kind: 'disabled' } : { kind: 'finite', maximum },
-        deadline: readOnly ? { kind: 'inapplicable' } : { kind: 'finite', milliseconds: 45000 }, retention: 'ordinary' });
+        deadline: readOnly ? { kind: 'inapplicable' } : { kind: 'absent' }, retention: 'ordinary' });
       if (readOnly) for (const root of [alpha, beta]) expect(fs.existsSync(path.join(root, '.codegraph', 'writer.pid'))).toBe(false);
       if (process.env.VALIDATION_OUT) fs.appendFileSync(path.join(process.env.VALIDATION_OUT, 'query-execution-facts.jsonl'), JSON.stringify({ mode, alpha, beta, ...state }) + '\n');
     } finally { await engine.stop(); }

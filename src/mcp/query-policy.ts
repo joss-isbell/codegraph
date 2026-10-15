@@ -98,7 +98,7 @@ export function resolveLegacyPoolSize(raw: string | undefined, cpuCount: number)
   return Math.max(1, Math.min(cpuCount - 1, 16));
 }
 
-/** Snapshot public behavior once at engine creation; never activate new mode. */
+/** Snapshot public settings once; the independent waiting sentinel does not activate a preset. */
 export function resolveLegacyQueryPolicy(requested: RequestedQueryPolicy, executionMode: QueryExecutionMode, cpuCount: number,
   options: { poolEnabled?: boolean; defaultMaximum?: number } = {}): ResolvedQueryPolicy {
   const defaults = queryDefaults(executionMode, cpuCount);
@@ -107,9 +107,11 @@ export function resolveLegacyQueryPolicy(requested: RequestedQueryPolicy, execut
   if (requested.poolSize === undefined || requested.poolSize === '') size = Math.min(size, defaultMaximum);
   if (options.poolEnabled === false || executionMode === 'read-only-fallback') size = 0;
   const n = Number(requested.busyTimeoutMs);
-  const milliseconds = requested.busyTimeoutMs !== undefined && requested.busyTimeoutMs !== '' && Number.isFinite(n) && n >= 1000 ? Math.floor(n) : QUERY_BUSY_TIMEOUT_MS;
+  // Node clamps an overflowing timeout to 1 ms. Until strict public parsing
+  // lands, preserve malformed-input fallback rather than scheduling that timer.
+  const milliseconds = requested.busyTimeoutMs !== undefined && requested.busyTimeoutMs !== '' && Number.isFinite(n) && n >= 1000 && n <= MAX_QUERY_BUSY_TIMEOUT_MS ? Math.floor(n) : QUERY_BUSY_TIMEOUT_MS;
   return immutable({ requested: { ...requested }, executionMode, defaults, preset: 'default', source: 'legacy',
     concurrency: size === 0 ? { kind: 'disabled' } : { kind: 'finite', maximum: size },
-    deadline: size === 0 ? { kind: 'inapplicable' } : { kind: 'finite', milliseconds },
+    deadline: size === 0 ? { kind: 'inapplicable' } : requested.busyTimeoutMs?.trim() === 'unlimited' ? { kind: 'absent' } : { kind: 'finite', milliseconds },
     retention: 'ordinary', classification: requested.poolSize !== undefined || requested.busyTimeoutMs !== undefined ? 'custom' : 'default' });
 }
