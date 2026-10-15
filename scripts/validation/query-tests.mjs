@@ -1,10 +1,13 @@
 import { startVitest } from 'vitest/node';
 import path from 'node:path';
+import fs from 'node:fs';
 
 // No config bundling, workspace discovery, implicit build or dependency writes.
 // The separate build receipt supplies dist for suites that use real workers.
 const root = process.env.BASELINE_ROOT;
 const out = process.env.VALIDATION_OUT;
+fs.writeFileSync(path.join(out, 'query-runtime.json'), JSON.stringify({ executable: process.execPath, versions: process.versions,
+  platform: process.platform, arch: process.arch, flags: process.execArgv }, null, 2));
 const ctx = await startVitest('test', process.argv.slice(2), {
   root, config: false, workspace: path.join(root, 'scripts/validation/query-workspace.mjs'), run: true, watch: false,
   globals: true, environment: 'node', include: ['__tests__/**/*.test.ts'],

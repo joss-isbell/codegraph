@@ -52,7 +52,8 @@ behavior are unchanged. No installation or live service is changed.
   remains in the existing session-owned `ExploreSessionState` and clone-safe args.
   Session disconnect/cancellation settlement and replay accounting follow in #12.
 - The dispatcher resolves the actual project after catch-up and captures its
-  root/index plus `default`/`explicit` origin. Worker-wire `projectPath` does not
+  canonical root/index plus `default`/`explicit` origin, including default roots
+  reached through directory aliases. Worker-wire `projectPath` does not
   change that origin. Queued jobs retain the context across retries. The worker
   freezes its cloned context, verifies engine generation, and executes against
   the admitted project rather than reinterpreting a mutable wire path. Every

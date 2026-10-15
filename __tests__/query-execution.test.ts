@@ -44,6 +44,27 @@ async function linkedFixture(): Promise<string> {
 }
 
 describe('real query worker context', () => {
+  it('preserves default and explicit queries through a directory alias', async () => {
+    const root = await fixture('aliasSymbol');
+    const aliases = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-query-alias-'));
+    roots.push(aliases);
+    const alias = path.join(aliases, 'project');
+    fs.symlinkSync(root, alias, process.platform === 'win32' ? 'junction' : 'dir');
+    const engine: MCPEngine = new BuiltEngine({ executionMode: 'direct', queryPool: true });
+    try {
+      await engine.ensureInitialized(alias);
+      const execution = engine.getQueryExecutionContext();
+      const deadline = Date.now() + 10000;
+      while (engine.getQueryExecutionState().actual.dispatch !== 'worker' && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25));
+      expect(engine.getQueryExecutionState().actual.dispatch).toBe('worker');
+      for (const [requestId, projectPath] of [[1, undefined], [2, alias], [3, root]] as const) {
+        const result = await engine.getToolHandler().execute('codegraph_search', { query: 'aliasSymbol', ...(projectPath ? { projectPath } : {}) }, undefined,
+          createQueryRequestContext(execution, 'alias-client', requestId));
+        expect(result.isError).toBeFalsy();
+        expect(result.content[0].text).toContain('app.ts:1');
+      }
+    } finally { await engine.stop(); }
+  }, 30000);
   it.each(['direct', 'writable-fallback', 'shared-daemon', 'read-only-fallback'] as QueryExecutionMode[])
   ('preserves public defaults and actual execution facts through default/explicit routing in %s', async (mode) => {
     const alpha = await fixture('alphaSymbol');

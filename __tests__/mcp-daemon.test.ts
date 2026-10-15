@@ -508,6 +508,7 @@ describe('Shared MCP daemon (issue #411)', () => {
       const server = spawnServer(tempDir, {
         CODEGRAPH_NO_DAEMON: mode === 'direct' ? '1' : '0', CODEGRAPH_QUERY_MODE: 'unlimited',
         CODEGRAPH_QUERY_BUSY_TIMEOUT_MS: 'unlimited', CODEGRAPH_QUERY_POOL_SIZE: '2',
+        CODEGRAPH_MCP_TOOLS: 'explore,node,search,callers,callees,impact,files,status',
         CODEGRAPH_EXPLORE_DEBUG: diagnostic, CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '1000',
       }, ['--path', tempDir]);
       servers.push(server);
@@ -515,9 +516,12 @@ describe('Shared MCP daemon (issue #411)', () => {
       expect((await waitFor(() => findResponse(server.stdout, 1), 10000)).result.serverInfo.name).toBe('codegraph');
       sendMessage(server.child, { jsonrpc: '2.0', id: 2, method: 'tools/list' });
       const listed = await waitFor(() => findResponse(server.stdout, 2), 10000);
-      expect(listed.result.tools.map((tool: any) => tool.name)).toEqual(expect.arrayContaining([
+      // Direct sessions already opened this tiny fixture and retain the existing
+      // three-tool gate; proxies answer the static configured surface locally.
+      const expectedTools = mode === 'direct' ? ['codegraph_explore', 'codegraph_node', 'codegraph_search'] : [
         'codegraph_explore', 'codegraph_node', 'codegraph_search', 'codegraph_callers', 'codegraph_callees', 'codegraph_impact', 'codegraph_files', 'codegraph_status',
-      ]));
+      ];
+      expect(listed.result.tools.map((tool: any) => tool.name).sort()).toEqual(expectedTools.sort());
       for (const [id, projectPath, symbol] of [[3, undefined, 'alphaPolicySymbol'], [4, beta, 'betaPolicySymbol'], [5, undefined, 'alphaPolicySymbol']] as const) {
         sendMessage(server.child, { jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'codegraph_explore', arguments: { query: symbol, ...(projectPath ? { projectPath } : {}) } } });
         const reply = await waitFor(() => findResponse(server.stdout, id), 15000);

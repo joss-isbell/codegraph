@@ -2835,7 +2835,7 @@ export class ToolHandler {
       // need an explicit root on the worker wire without becoming explicit calls.
       const request = requestContext ?? (this.execution ? createQueryRequestContext(this.execution, 'untracked', 'untracked') : undefined);
       const context = request ? routeQueryRequest(request, typeof pathCheck === 'string' ? 'explicit' : 'default',
-        project.getProjectRoot(), realpathSync(getDatabasePath(project.getProjectRoot()))) : undefined;
+        realpathSync(project.getProjectRoot()), realpathSync(getDatabasePath(project.getProjectRoot()))) : undefined;
       // Recover a watcher disabled by prolonged lock contention on the next call.
       // The stale banner remains until the watcher finishes its full scan;
       // frequent calls cannot bypass its cooldown (#1959).
