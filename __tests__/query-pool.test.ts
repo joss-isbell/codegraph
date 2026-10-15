@@ -163,24 +163,30 @@ describe('QueryPool', () => {
   });
 
   it('graceful backstop: a call that can\'t be served in time gets success-shaped busy guidance', async () => {
-    // 1 worker, every call hangs; soft-timeout small → the caller gets guidance,
-    // never a hard error, never a hang.
-    const pool = new QueryPool({ root: '/x', size: 1, softTimeoutMs: 60, createWorker: () => new FakeWorker(() => ({ hang: true })) });
+    // Hold completion beyond the backstop, then let actual execution finish.
+    let complete!: (result: ToolResult) => void;
+    const held = new Promise<ToolResult>(resolve => { complete = resolve; });
+    const pool = new QueryPool({ root: '/x', size: 1, softTimeoutMs: 60, createWorker: () => new FakeWorker(() => ({ wait: held })) });
     const res = await pool.run('codegraph_explore', { query: 'q' });
     expect(res.isError).toBeFalsy();            // NOT an error (abandonment rule)
     expect(res.content[0].text).toMatch(/busy|retry/i);
+    complete(ok('late completion'));
     await pool.destroy();
-  }, 20000);
+  });
 
   it('destroy settles outstanding calls instead of hanging', async () => {
-    const pool = new QueryPool({ root: '/x', size: 1, softTimeoutMs: 10_000, createWorker: () => new FakeWorker(() => ({ hang: true })) });
+    let complete!: (result: ToolResult) => void;
+    const held = new Promise<ToolResult>(resolve => { complete = resolve; });
+    const pool = new QueryPool({ root: '/x', size: 1, softTimeoutMs: 10_000, createWorker: () => new FakeWorker(() => ({ wait: held })) });
     const pending = pool.run('codegraph_explore', { query: 'q' });
     await sleep(5);
-    await pool.destroy();
+    const stopped = pool.destroy();
     const res = await pending; // must resolve, not hang
     expect(res.isError).toBe(true);
     expect(pool.healthy).toBe(false);
-  }, 20000);
+    complete(ok('late completion'));
+    await stopped;
+  });
 
   describe('destroy never terminates a worker still starting up', () => {
     // Terminating a worker while it is still loading its modules can crash the
