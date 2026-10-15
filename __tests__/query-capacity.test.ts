@@ -8,6 +8,8 @@ import * as fs from 'fs';
 import * as os from 'os';
 import { CodeGraph } from '../src';
 import { ToolHandler } from '../src/mcp/tools';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 
 const execution = () => createQueryExecutionContext(resolveQueryPolicy({ poolSize: '2', busyTimeoutMs: 'unlimited' }, 'direct', 8),
   { readOnly: false, writer: true, synchronization: true });
@@ -121,6 +123,22 @@ describe('pooled capacity without a busy timer', () => {
 });
 
 describe('dispatcher keeps configured pooling authoritative', () => {
+  it.each(['initial', 'retry'])('keeps valid explicit reads on real workers after %s default open fails', async mode => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-failed-default-')));
+    const output = path.join(process.env.VALIDATION_OUT ?? root, `failed-default-${mode}.json`);
+    try {
+      await promisify(execFile)(process.execPath, ['--liftoff-only', path.join(__dirname, 'fixtures/query-failed-default.cjs'), root, mode, output],
+        { timeout: 15000, maxBuffer: 1024 * 1024, env: { ...process.env, CODEGRAPH_QUERY_POOL_SIZE: '2' } });
+      const facts = JSON.parse(fs.readFileSync(output, 'utf8'));
+      expect(facts.recognized).toBe(true);
+      expect(facts.defaultLoaded).toBe(false);
+      expect(facts.result.isError).toBeFalsy();
+      expect(facts.result.content[0].text).toContain('survivingExplicitSymbol');
+      expect(facts.state.actual.dispatch).toBe('worker');
+      expect(facts.events.some((event: any) => event.event === 'result')).toBe(true);
+      expect(facts.events.filter((event: any) => event.event === 'spawn').length).toBe(facts.events.filter((event: any) => event.event === 'exit').length);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  }, 20000);
   it.each(['default', 'explicit'])('queues the cold %s project read and keeps status on the owner', async route => {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cold-dispatch-')));
     fs.writeFileSync(path.join(root, 'app.ts'), 'export function coldSymbol() { return 42; }\n');

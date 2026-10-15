@@ -259,7 +259,10 @@ export class MCPEngine {
       if (!res.root) this.toolHandler.setKnownSubprojects(res.candidates, searchFrom);
     }
     const resolvedRoot = res.root;
-    if (!resolvedRoot) return;
+    if (!resolvedRoot) {
+      this.maybeStartPool(null);
+      return;
+    }
     if (res.viaSubScan) this.logSubprojectAdoption(searchFrom, resolvedRoot);
     try {
       // Close any previously failed instance to avoid leaking resources.
@@ -277,6 +280,9 @@ export class MCPEngine {
     } catch (err) {
       // Still failing — caller will try again on the next tool call.
       this.toolHandler.setDefaultOpenFailure(err instanceof WslSharedIndexError ? err : null);
+      // Explicit projects still use workers when the default cannot open.
+      // A rootless pool avoids making that failed default every worker's boot target.
+      this.maybeStartPool(null);
     }
   }
 
@@ -408,6 +414,7 @@ export class MCPEngine {
       process.stderr.write(`[CodeGraph MCP] Failed to open project at ${resolvedRoot}: ${msg}\n`);
       // The agent otherwise hears only "no project loaded" (#995).
       this.toolHandler.setDefaultOpenFailure(err instanceof WslSharedIndexError ? err : null);
+      this.maybeStartPool(null);
     }
   }
 

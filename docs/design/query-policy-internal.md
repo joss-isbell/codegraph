@@ -78,6 +78,10 @@ behavior are unchanged. No installation or live service is changed.
   ready set and terminal failure never select owner-thread execution. Status,
   catch-up, watcher notices and session emission handling stay on the main
   thread. Explicit pool zero remains the ordinary unpooled path.
+- Failed default initialization starts a rootless pool, including the synchronous
+  retry path, so a valid explicit project still receives real worker execution.
+  The unavailable default keeps its existing owner-side guidance; workers do not
+  initialize or repair it as a side effect of serving another project.
 - Finite overrides above 16 are exact safe-integer demand ceilings. Defaults
   remain direct/writable maximum two and daemon cores-minus-one bounded to
   1–16. At most two workers start concurrently; ready workers continue growing
