@@ -7,7 +7,7 @@ import subprocess
 import sys
 
 from events import event, assertion
-from report import consume
+from report import consume, digest
 from runner import write
 
 root = Path(os.environ['BASELINE_ROOT'])
@@ -25,7 +25,12 @@ for name, rejection in [('clean', False), ('unhandled', True)]:
     test_dir.mkdir()
     for file in ['query-tests.mjs', 'query-workspace.mjs']:
         shutil.copyfile(root / 'scripts/validation' / file, adapter_dir / file)
+        assertion(scenario, 'synthetic fixture uses the exact outer-bound actual adapter bytes',
+                  digest(root / 'scripts/validation' / file) == digest(adapter_dir / file), case=name, file=file)
     shutil.copyfile(root / '__tests__/setup-home-sandbox.ts', test_dir / 'setup-home-sandbox.ts')
+    # This deliberately synthetic, non-Git source root binds every fixture byte.
+    # The outer runner separately binds the actual product/adapter Git snapshot.
+    (fixture / 'baseline-source-commit.txt').write_text(os.environ['BASELINE_SOURCE_COMMIT'] + '\n', encoding='utf-8')
     # The single assertion passes in both cases. Only the real Vitest unhandled
     # rejection channel distinguishes the second producer/consumer chain.
     test = "import { it, expect } from 'vitest';\nit('adapter proof assertion', async () => {\n  expect(2 + 2).toBe(4);\n"
@@ -35,7 +40,7 @@ for name, rejection in [('clean', False), ('unhandled', True)]:
     (test_dir / 'adapter.test.ts').write_text(test, encoding='utf-8')
     attempt = out / (name + '-attempt')
     plan = {
-        'output': str(attempt), 'cwd': str(fixture), 'sourceRoot': str(root),
+        'output': str(attempt), 'cwd': str(fixture), 'sourceRoot': str(fixture),
         'deadlineSeconds': 90, 'scenarios': ['query-tests'],
         'command': [sys.executable, str(root / 'scripts/validation/query-tests.py'), '__tests__/adapter.test.ts'],
         'environment': {'BASELINE_ROOT': str(fixture), 'BASELINE_RUNTIME': str(runtime), 'QUERY_EXPECTED_SKIPS': '[]'},
