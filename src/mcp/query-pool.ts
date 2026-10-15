@@ -161,6 +161,7 @@ export class QueryPool {
   private starts = new Map<PoolWorker, { settled: Promise<void>; settle: () => void; timer: NodeJS.Timeout }>();
   private terminations = new Set<Promise<void>>();
   private retirements = new Map<PoolWorker, Promise<void>>();
+  private failedRetirements = new Set<PoolWorker>();
   private destroyPromise: Promise<void> | null = null;
   private nextId = 1;
   private totalCrashes = 0;
@@ -222,8 +223,8 @@ export class QueryPool {
   private unavailable(): ToolResult {
     return { isError: true, content: [{ type: 'text', text: this.destroyed
       ? 'codegraph is shutting down; retry shortly.'
-      : !this.accepting ? 'CodeGraph query pool is draining for handover; retry with its replacement.'
-      : `CodeGraph query worker capacity is unavailable: ${this.failure ?? 'worker failed'}. Retry after correcting the worker failure.` }] };
+      : this.failure ? `CodeGraph query worker capacity is unavailable: ${this.failure}. Retry after correcting the worker failure.`
+      : 'CodeGraph query pool is draining for handover; retry with its replacement.' }] };
   }
 
   private fail(reason: string): void {
@@ -452,6 +453,7 @@ export class QueryPool {
     void termination.then(() => {
       this.terminations.delete(termination);
       this.retirements.delete(worker);
+      this.failedRetirements.delete(worker);
       const job = this.inflight.get(worker);
       if (job?.abandonmentTimer) clearTimeout(job.abandonmentTimer);
       this.inflight.delete(worker);
@@ -464,11 +466,21 @@ export class QueryPool {
       // Keep the ownership record and expose incomplete cleanup. Never pretend
       // a still-owned worker exited, and never let a lost slot escape to main.
       this.cleanupFailure = new Error(`owned worker cleanup incomplete: ${error instanceof Error ? error.message : String(error)}`);
+      this.failedRetirements.add(worker);
       for (const waiter of this.quietWaiters.splice(0)) waiter.reject(this.cleanupFailure);
       if (preservePeers) {
         // One vanished session cannot take healthy shared workers down with it.
         // Retain its slot and rejected retirement for truthful final shutdown.
-        process.stderr.write(`[CodeGraph MCP] Targeted ${this.cleanupFailure.message}; other shared workers remain available.\n`);
+        process.stderr.write(`[CodeGraph MCP] Targeted ${this.cleanupFailure.message}; its slot remains owned, without stopping unrelated workers.\n`);
+        // Failed owned slots cannot be oversubscribed. If every finite slot is
+        // irrecoverably reserved, timer-free queued/new demand must fail rather
+        // than wait forever. Pending successful retirements remain recoverable.
+        if (this.healthy && this.workers.size >= this.maxSize && [...this.workers].every(owned => this.failedRetirements.has(owned))) {
+          this.failure = 'all configured worker slots remain reserved after owned cleanup failed';
+          for (const job of this.queue) this.settle(job, this.unavailable());
+          this.queue = [];
+          this.notifyQuiet();
+        }
       } else this.fail(this.cleanupFailure.message);
     });
     return termination;

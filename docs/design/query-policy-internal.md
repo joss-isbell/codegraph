@@ -160,6 +160,10 @@ behavior are unchanged. No installation or live service is changed.
   surfaced by natural handover and final intentional destroy. Final destroy waits
   for every other owned termination before rejecting, and the engine retains its
   pool ownership reference when cleanup is incomplete.
+  If every finite slot is reserved by failed owned cleanup, there is no usable or
+  recovering capacity: queued and new calls get terminal capacity-unavailable
+  outcomes even with no busy timer. This keeps reserved ownership without
+  oversubscribing the finite ceiling or stranding another session indefinitely.
   Intentional engine shutdown awaits all active/failed owned workers before owner
   database release. Worker identity is the exact owned Worker object, not a process
   name or project registry. Existing PID/creation checks and native process-tree

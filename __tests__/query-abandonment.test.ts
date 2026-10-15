@@ -43,6 +43,53 @@ async function connectSessions(engine: MCPEngine, root: string) {
 }
 
 describe('abandoned pooled requests', () => {
+  it.each([1, 2])('fails queued and new timer-free demand once all %s finite slots have failed owned cleanup', async maximum => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cancel-reserved-')));
+    fs.writeFileSync(path.join(root, 'app.ts'), 'export function cancellationSymbol() { return 1; }\n');
+    const cg = await CodeGraph.init(root); await cg.indexAll(); cg.close();
+    const authority = createQueryExecutionContext(resolveQueryPolicy({ poolSize: String(maximum), busyTimeoutMs: 'unlimited' }, 'shared-daemon', 8),
+      { readOnly: false, writer: true, synchronization: true });
+    const gate = new SharedArrayBuffer(5 * Int32Array.BYTES_PER_ELEMENT), state = new Int32Array(gate);
+    const nativeTeardowns: Array<() => Promise<number>> = [];
+    let rejections = 0, abandonedOutcomes = 0, queuedOutcomes = 0, newOutcomes = 0;
+    const pool = new QueryPool({ root, execution: authority, createWorker: () => {
+      const worker = new Worker(path.join(__dirname, 'fixtures/query-abandonment-worker.cjs'), { workerData: { gate, root, execution: authority } });
+      nativeTeardowns.push(worker.terminate.bind(worker));
+      worker.terminate = () => { rejections++; return Promise.reject(new Error('controlled reserved-slot cleanup failure')); };
+      return worker;
+    } });
+    const controllers = Array.from({ length: maximum }, () => new AbortController());
+    const abandoned = controllers.map((controller, id) => pool.run('codegraph_explore', { query: 'cancellationSymbol' },
+      createQueryRequestContext(authority, `departing-${id}`, 1), controller.signal).then(result => { abandonedOutcomes++; return result; }));
+    try {
+      await until(() => state[2] === maximum);
+      const queued = pool.run('codegraph_explore', { query: 'cancellationSymbol' }, createQueryRequestContext(authority, 'surviving', 1))
+        .then(result => { queuedOutcomes++; return result; });
+      controllers.forEach(controller => controller.abort());
+      expect((await Promise.all(abandoned)).every(result => result.content[0].text.includes('cancelled'))).toBe(true);
+      await until(() => rejections === maximum, 22000);
+      const unavailable = await queued;
+      expect(unavailable.isError).toBe(true); expect(unavailable.content[0].text).toMatch(/capacity.*unavailable/i);
+      const next = await pool.run('codegraph_explore', {}, createQueryRequestContext(authority, 'surviving', 2))
+        .then(result => { newOutcomes++; return result; });
+      expect(next.isError).toBe(true); expect(next.content[0].text).toMatch(/capacity.*unavailable/i);
+      expect(pool.healthy).toBe(false); expect(pool.state).toBe('failed');
+      expect(nativeTeardowns).toHaveLength(maximum); expect(pool.liveWorkers).toBe(maximum);
+      expect(pool.activity).toEqual({ queued: 0, executing: maximum, starting: 0, retiring: maximum });
+      expect(abandonedOutcomes).toBe(maximum); expect(queuedOutcomes).toBe(1); expect(newOutcomes).toBe(1);
+      const stopped = pool.destroy();
+      await expect(stopped).rejects.toThrow('controlled reserved-slot cleanup failure');
+      expect(pool.destroy()).toBe(stopped); expect(rejections).toBe(maximum);
+      expect(pool.liveWorkers).toBe(maximum);
+      record({ scenario: 'all-finite-slots-cleanup-failed', maximum, rejections, abandonedOutcomes, queuedOutcomes, newOutcomes,
+        created: nativeTeardowns.length, retainedWorkers: pool.liveWorkers, retainedActivity: pool.activity, destroyFailed: true });
+    } finally {
+      await Promise.all(nativeTeardowns.map(terminate => terminate()));
+      await pool.destroy().catch(() => undefined);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 30000);
+
   it('gives intentionally stopped synchronous work its provisional drain then awaits its owned worker exit', async () => {
     const gate = new SharedArrayBuffer(5 * Int32Array.BYTES_PER_ELEMENT);
     const state = new Int32Array(gate);
