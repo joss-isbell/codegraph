@@ -26,12 +26,16 @@ afterEach(async () => {
   }
 }, 30000);
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-async function fixture(symbol: string): Promise<string> {
+async function fixture(symbol: string, step: (phase: string) => void = () => {}): Promise<string> {
+  step('fixture-create');
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-readonly-pool-')));
   roots.push(root);
   fs.writeFileSync(path.join(root, 'app.ts'), `export function ${symbol}() { return 1; }\n`);
+  step('fixture-init-start');
   const cg = await CodeGraph.init(root);
-  try { await cg.indexAll(); } finally { cg.close(); }
+  step('fixture-init-complete');
+  try { step('fixture-index-start'); await cg.indexAll(); step('fixture-index-complete'); }
+  finally { cg.close(); step('fixture-close-complete'); }
   return root;
 }
 function observeWorkers() {
@@ -56,18 +60,40 @@ function record(name: string, value: unknown) {
 
 describe('explicit finite read-only query pooling', () => {
   it.each([undefined, '0'])('keeps read-only selection %s unpooled with an inapplicable pool deadline', async poolSize => {
-    const root = await fixture('ordinaryReadOnlySymbol');
+    const started = Date.now();
+    const step = (phase: string, facts: unknown = {}) => {
+      if (process.env.VALIDATION_OUT) fs.appendFileSync(path.join(process.env.VALIDATION_OUT, 'readonly-default-steps.jsonl'),
+        JSON.stringify({ selection: poolSize ?? 'unset', phase, elapsedMs: Date.now() - started, facts }) + '\n');
+    };
+    const root = await fixture('ordinaryReadOnlySymbol', step);
     vi.stubEnv('CODEGRAPH_QUERY_POOL_SIZE', poolSize);
     const observed = observeWorkers();
+    const BuiltGraph: typeof CodeGraph = require('../dist').CodeGraph;
+    const realWatch = BuiltGraph.prototype.watch;
+    const watchCalls: string[] = [];
+    BuiltGraph.prototype.watch = function(options) {
+      watchCalls.push(this.getProjectRoot());
+      return realWatch.call(this, options);
+    };
     const reader = new BuiltEngine({ readOnly: true, queryPool: true, watch: true });
     try {
+      step('reader-init-start');
       await reader.ensureInitialized(root);
+      step('reader-init-complete', { state: reader.getQueryExecutionState(), workers: observed.events, watchCalls });
+      step('reader-query-start');
       const response = await reader.getToolHandler().execute('codegraph_search', { query: 'ordinaryReadOnlySymbol' });
+      step('reader-query-complete');
       expect(response.content[0].text).toContain('app.ts:1');
       expect(reader.getQueryExecutionState().actual).toMatchObject({ dispatch: 'main-thread', concurrency: { kind: 'disabled' }, deadline: { kind: 'inapplicable' }, workers: 0, resourceScope: 'local-engine' });
       expect(observed.events).toEqual([]);
+      expect(watchCalls).toEqual([]);
       expect(fs.existsSync(getWriterPidPath(root))).toBe(false);
-    } finally { await reader.stop(); observed.restore(); }
+    } finally {
+      step('reader-stop-start', { state: reader.getQueryExecutionState(), workers: observed.events, watchCalls });
+      try { await reader.stop(); }
+      finally { observed.restore(); BuiltGraph.prototype.watch = realWatch; }
+      step('reader-stop-complete', { state: reader.getQueryExecutionState(), workers: observed.events, watchCalls, writerLock: fs.existsSync(getWriterPidPath(root)) });
+    }
   });
   it('closes the real read connection when unsuitable SQLite data rejects opening', async () => {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-readonly-open-failure-')));
