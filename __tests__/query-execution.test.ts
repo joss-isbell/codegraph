@@ -115,7 +115,37 @@ describe('real query worker context', () => {
       expect(response.content[0].text).toContain('app.ts:1');
     } finally { await pool.destroy(); }
   }, 30000);
-  it('separates requested policy from actual read-only construction without activating pooling', async () => {
+  it.each(['2', '0'])('applies independent waiting only to an explicitly enabled finite read-only pool (%s)', async (poolSize) => {
+    const alpha = await fixture('alphaSymbol');
+    const beta = await fixture('betaSymbol');
+    vi.stubEnv('CODEGRAPH_QUERY_POOL_SIZE', poolSize);
+    vi.stubEnv('CODEGRAPH_QUERY_BUSY_TIMEOUT_MS', 'unlimited');
+    vi.stubEnv('CODEGRAPH_QUERY_MODE', 'unlimited');
+    const enabled = poolSize === '2';
+    const engine: MCPEngine = new BuiltEngine({ executionMode: 'read-only-fallback', readOnly: true, queryPool: true });
+    try {
+      await engine.ensureInitialized(alpha);
+      expect(engine.getQueryExecutionContext()).toMatchObject({ capability: 'read-only',
+        ownership: { writer: false, synchronization: false }, policy: { source: 'legacy', preset: 'default',
+          concurrency: enabled ? { kind: 'finite', maximum: 2 } : { kind: 'disabled' },
+          deadline: enabled ? { kind: 'absent' } : { kind: 'inapplicable' }, retention: 'ordinary' } });
+      for (const [projectPath, query] of [[undefined, 'alphaSymbol'], [beta, 'betaSymbol'], [undefined, 'alphaSymbol']] as const) {
+        const response = await engine.getToolHandler().execute('codegraph_search', { query, ...(projectPath ? { projectPath } : {}) });
+        expect(response.isError).toBeFalsy();
+        expect(response.content[0].text).toContain('app.ts:1');
+        expect(response.content[0].text).toContain(query);
+      }
+      const state = engine.getQueryExecutionState();
+      expect(state.actual).toMatchObject({ executionMode: 'read-only-fallback', resourceScope: 'local-engine',
+        dispatch: enabled ? 'worker' : 'main-thread',
+        concurrency: enabled ? { kind: 'finite', maximum: 2 } : { kind: 'disabled' },
+        deadline: enabled ? { kind: 'absent' } : { kind: 'inapplicable' }, retention: 'ordinary' });
+      for (const root of [alpha, beta]) expect(fs.existsSync(path.join(root, '.codegraph', 'writer.pid'))).toBe(false);
+      if (process.env.VALIDATION_OUT) fs.appendFileSync(path.join(process.env.VALIDATION_OUT, 'query-execution-facts.jsonl'),
+        JSON.stringify({ mode: 'read-only-fallback', poolSize, alpha, beta, ...state }) + '\n');
+    } finally { await engine.stop(); }
+  }, 30000);
+  it('keeps an unsupported internal unlimited read-only policy unpooled until lifecycle integration', async () => {
     const root = await fixture();
     const policy = resolveQueryPolicy({ mode: 'unlimited' }, 'read-only-fallback', 8);
     const engine: MCPEngine = new BuiltEngine({ readOnly: true, queryPool: true, queryPolicy: policy });

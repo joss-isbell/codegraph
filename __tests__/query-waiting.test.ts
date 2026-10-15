@@ -23,6 +23,8 @@ describe('independent pooled waiting override', () => {
         retention: 'ordinary', classification: 'custom', preset: 'default' });
     }
     expect(resolveLegacyQueryPolicy({ busyTimeoutMs: 'unlimited' }, 'read-only-fallback', 8).deadline).toEqual({ kind: 'inapplicable' });
+    expect(resolveLegacyQueryPolicy({ poolSize: '2', busyTimeoutMs: 'unlimited' }, 'read-only-fallback', 8))
+      .toMatchObject({ concurrency: { kind: 'finite', maximum: 2 }, deadline: { kind: 'absent' }, retention: 'ordinary' });
     expect(resolveLegacyQueryPolicy({ poolSize: '0', busyTimeoutMs: 'unlimited' }, 'direct', 8).deadline).toEqual({ kind: 'inapplicable' });
   });
   it('preserves safe finite timer boundaries and cannot overflow an invalid legacy value into immediate expiry', () => {

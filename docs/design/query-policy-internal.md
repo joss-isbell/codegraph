@@ -152,7 +152,11 @@ replacement suites remain regression evidence. Run all checks with the proved
 `dist`, runtime and both dependency trees. `query-tests.py` uses Vitest 2's Node
 API with an explicit empty workspace, no implicit build and an attempt-local Vite
 cache. Its JSON result must contain every test tail; only predeclared exact
-platform-gated skips are accepted. No held project or installed registry is used.
+platform-gated skips are accepted. A separate diagnostic collection retains
+Vitest's unhandled errors and actual exit state through shutdown; both the full
+report and an empty error collection with exit 0 are required. The actual adapter
+producer/consumer proof accepts a clean run and rejects an unhandled rejection
+even when its test assertion passes. No held project or installed registry is used.
 
 ## Read-only fallback boundary (Issue #11)
 
