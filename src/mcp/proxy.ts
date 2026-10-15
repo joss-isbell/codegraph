@@ -20,6 +20,10 @@
 
 import * as fs from 'fs';
 import * as net from 'net';
+import * as os from 'os';
+import { randomUUID } from 'crypto';
+import { createQueryRequestContext } from './query-context';
+import { requestedQueryPolicy, resolveLegacyQueryPolicy, type ResolvedQueryPolicy } from './query-policy';
 import { HOST_PPID_ENV } from '../extraction/wasm-runtime-flags';
 import { DaemonClientHello, DaemonHello, MAX_HELLO_LINE_BYTES } from './daemon';
 import { EARLY_PPID } from './early-ppid';
@@ -158,6 +162,7 @@ export async function runProxy(
 export async function connectWithHello(
   socketPath: string,
   expectedVersion: string = CodeGraphPackageVersion,
+  prospectivePolicy: ResolvedQueryPolicy = resolveLegacyQueryPolicy(requestedQueryPolicy(process.env), 'shared-daemon', os.cpus().length),
 ): Promise<net.Socket | 'older-version' | 'version-mismatch' | null> {
   if (process.platform !== 'win32' && !fs.existsSync(socketPath)) return null;
   const socket = net.createConnection(socketPath);
@@ -190,7 +195,7 @@ export async function connectWithHello(
     return 'version-mismatch';
   }
   logAttachedDaemon(socketPath, hello);
-  sendClientHello(socket);
+  sendClientHello(socket, prospectivePolicy);
   return socket;
 }
 
@@ -203,9 +208,10 @@ export async function connectWithHello(
  * socket-close lifecycle). `hostPid` mirrors the PPID watchdog: the threaded
  * host pid if set, else our own parent (the host, on a no-relaunch bundle).
  */
-function sendClientHello(socket: net.Socket): void {
+function sendClientHello(socket: net.Socket, queryPolicy: ResolvedQueryPolicy = resolveLegacyQueryPolicy(requestedQueryPolicy(process.env), 'shared-daemon', os.cpus().length)): void {
   const clientHello: DaemonClientHello = {
     codegraph_client: 1,
+    queryPolicy,
     pid: process.pid,
     hostPid: parseHostPpid(process.env[HOST_PPID_ENV]) ?? EARLY_PPID,
   };
@@ -283,6 +289,9 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   // Only the daemon-unavailable fallback below uses it; when the daemon is up,
   // the tracking happens on the daemon's own MCPSession.
   const exploreSession = new ExploreSessionState();
+  // Stable across local-engine retirement/handover; engine generations stay
+  // per engine and request admission stays per invocation, never worker globals.
+  const sessionId = randomUUID();
   const trackInflight = (line: string): void => {
     try {
       const m = JSON.parse(line) as JsonRpc;
@@ -354,7 +363,8 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
       try {
         const local = await ensureEngine();
         const params = (msg.params || {}) as { name: string; arguments?: Record<string, unknown> };
-        const result = await local.getToolHandler().execute(params.name, params.arguments || {}, exploreSession);
+        const context = createQueryRequestContext(local.getQueryExecutionContext(), sessionId, id as string | number);
+        const result = await local.getToolHandler().execute(params.name, params.arguments || {}, exploreSession, context);
         writeClient({ jsonrpc: '2.0', id, result });
         getTelemetry().recordUsage('mcp_tool', params.name, !result.isError, telemetryClient);
       } catch (err) {

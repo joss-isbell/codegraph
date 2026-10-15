@@ -6,6 +6,9 @@
 
 import type CodeGraph from '../index';
 import type { QueryPool } from './query-pool';
+import { createQueryRequestContext, routeQueryRequest, type QueryExecutionContext, type QueryRequestContext } from './query-context';
+// Keep SQLite off the handshake path; this is called only after a graph opens.
+const getDatabasePath = (root: string): string => (require('../db') as typeof import('../db')).getDatabasePath(root);
 import { findNearestCodeGraphRoot, isSameIndexRoot } from '../directory';
 import { WslSharedIndexError } from '../db/wsl-shared-index';
 // Lazy-load the heavy CodeGraph chain off the MCP startup path — see the same
@@ -1965,7 +1968,7 @@ export class ToolHandler {
   // healthy, heavy reads leave the main loop free for the MCP transport.
   private queryPool: QueryPool | null = null;
 
-  constructor(private cg: CodeGraph | null) {}
+  constructor(private cg: CodeGraph | null, private readonly execution?: QueryExecutionContext) {}
 
   /**
    * Engine-only: attach (or detach with null) the worker-thread query pool. The
@@ -2760,6 +2763,7 @@ export class ToolHandler {
     toolName: string,
     args: Record<string, unknown>,
     sessionState?: ExploreSessionState,
+    requestContext?: QueryRequestContext,
   ): Promise<ToolResult> {
     if (this.closing) return this.textResult('This MCP session is closing; retry with a connected session.');
     this.activeCalls++;
@@ -2808,6 +2812,11 @@ export class ToolHandler {
       }
 
       const project = await this.getCodeGraph(args.projectPath as string | undefined);
+      // Carry resolved routing separately from public args. Default calls may
+      // need an explicit root on the worker wire without becoming explicit calls.
+      const request = requestContext ?? (this.execution ? createQueryRequestContext(this.execution, 'untracked', 'untracked') : undefined);
+      const context = request ? routeQueryRequest(request, typeof pathCheck === 'string' ? 'explicit' : 'default',
+        project.getProjectRoot(), getDatabasePath(project.getProjectRoot())) : undefined;
       // Recover a watcher disabled by prolonged lock contention on the next call.
       // The stale banner remains until the watcher finishes its full scan;
       // frequent calls cannot bypass its cooldown (#1959).
@@ -2852,8 +2861,8 @@ export class ToolHandler {
       const projectPath = pooled ? args.projectPath ?? this.cg?.getProjectRoot() : undefined;
       const wasDegraded = project.isWatcherDegraded?.();
       const raw = (pooled && projectPath)
-        ? await this.queryPool!.run(toolName, { ...dispatchArgs, projectPath })
-        : await this.executeReadTool(toolName, dispatchArgs);
+        ? await this.queryPool!.run(toolName, { ...dispatchArgs, projectPath }, context)
+        : await this.executeReadTool(toolName, dispatchArgs, context);
       const answeredFrom = raw._cgAnswerFiles;
       delete raw._cgAnswerFiles;
       if (!raw.isError && answeredFrom && (wasDegraded || project.isWatcherDegraded?.())) {
@@ -2976,9 +2985,17 @@ export class ToolHandler {
    * watched main instance and stay on the main thread. Cross-cutting allowlist +
    * path validation already ran in {@link execute} before routing here.
    */
-  async executeReadTool(toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
+  async executeReadTool(toolName: string, args: Record<string, unknown>, context?: QueryRequestContext): Promise<ToolResult> {
     try {
-      return await this.dispatchTool(toolName, args);
+      // Context is an internal argument, never accepted from MCP tool arguments.
+      // Opening enforcement for read-only pooling follows in #11.
+      if (context && this.execution && context.execution.generation !== this.execution.generation) {
+        throw new Error('Query request belongs to a different engine generation.');
+      }
+      if (context?.project && getDatabasePath(context.project.root) !== context.project.index) {
+        throw new Error('Query request index route changed after admission.');
+      }
+      return await this.dispatchTool(toolName, context?.project ? { ...args, projectPath: context.project.root } : args);
     } catch (err) {
       if (err instanceof NotIndexedError) {
         return this.textResult(err.message);

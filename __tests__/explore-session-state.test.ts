@@ -22,6 +22,8 @@ import CodeGraph from '../src/index';
 import { ToolHandler } from '../src/mcp/tools';
 import { MCPSession } from '../src/mcp/session';
 import type { MCPEngine } from '../src/mcp/engine';
+import { createQueryExecutionContext } from '../src/mcp/query-context';
+import { resolveQueryPolicy } from '../src/mcp/query-policy';
 import type { JsonRpcTransport, JsonRpcRequest, JsonRpcNotification } from '../src/mcp/transport';
 import {
   EXPLORE_EMISSION_KEY,
@@ -436,12 +438,14 @@ describe('sessions sharing a daemon', () => {
         return { content: [{ type: 'text' as const, text: 'ok' }] };
       },
     };
+    const execution = createQueryExecutionContext(resolveQueryPolicy({}, 'read-only-fallback', 8), { readOnly: true, writer: false, synchronization: false });
     const engine = {
       ensureInitialized: async () => { /* already open */ },
       hasDefaultCodeGraph: () => true,
       getProjectPath: () => '/repo/shared',
       retryInitializeSync: () => { /* nothing to retry */ },
       getToolHandler: () => handler,
+      getQueryExecutionContext: () => execution,
     } as unknown as MCPEngine;
 
     const transportA = fakeTransport();

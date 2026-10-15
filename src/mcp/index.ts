@@ -114,7 +114,7 @@ const HANDOVER_CANDIDATE_WAIT_MS = 5_000;
  */
 function readOnlyFallback(holder: string): MCPEngine {
   process.stderr.write(`[CodeGraph MCP] Serving reads in-process without auto-sync: ${holder}.\n`);
-  return new MCPEngine({ readOnly: true });
+  return new MCPEngine({ readOnly: true, executionMode: 'read-only-fallback' });
 }
 
 /**
@@ -159,7 +159,7 @@ function makeFallbackEngine(root: string): MCPEngine {
       installChangedReason(CodeGraphPackageJsonPath, CodeGraphPackageVersion) !== null) {
     return readOnlyFallback('this session\'s CodeGraph install was upgraded or removed; restart the session to use the current one');
   }
-  return new MCPEngine({ writerLockRoot: root, queryPool: true, queryPoolDefaultMax: DIRECT_QUERY_POOL_MAX });
+  return new MCPEngine({ writerLockRoot: root, queryPool: true, queryPoolDefaultMax: DIRECT_QUERY_POOL_MAX, executionMode: 'writable-fallback' });
 }
 
 /**
@@ -546,7 +546,7 @@ export class MCPServer {
       this.writerLockRoot = writerRoot;
     }
 
-    this.engine = new MCPEngine({ queryPool: true, queryPoolDefaultMax: DIRECT_QUERY_POOL_MAX });
+    this.engine = new MCPEngine({ queryPool: true, queryPoolDefaultMax: DIRECT_QUERY_POOL_MAX, executionMode: 'direct' });
     const transport = new StdioTransport({ exitOnClose: false, onClose: () => { void this.stop(); } });
     this.session = new MCPSession(transport, this.engine, {
       explicitProjectPath: this.projectPath,
