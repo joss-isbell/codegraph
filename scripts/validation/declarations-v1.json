@@ -1,0 +1,20 @@
+{
+  "version": "issue-8-declarations-v1",
+  "controlledWorkerSeconds": 120,
+  "lateResultSeconds": 90,
+  "releaseResultSeconds": 47,
+  "clientDeadlineSeconds": 75,
+  "bootstrapSeconds": 600,
+  "buildSeconds": 600,
+  "selectedIntegrationSeconds": 900,
+  "completeRegressionSeconds": 1800,
+  "idleGraceSeconds": 30,
+  "idleObserveSeconds": 45,
+  "drainSeconds": 15,
+  "startupHandshakeSeconds": 15,
+  "cleanupSeconds": 5,
+  "logBytesPerStream": 10485760,
+  "excerptBytes": 8192,
+  "sampleSeconds": 0.25,
+  "meaning": "Experiment and owned-process cleanup bounds; never healthy-query deadlines or product latency promises."
+}
