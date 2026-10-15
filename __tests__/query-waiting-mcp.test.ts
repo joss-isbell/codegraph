@@ -79,6 +79,15 @@ describe('independent unlimited waiting through actual MCP requests', () => {
     let server: net.Server | undefined;
     let client: Client | undefined;
     let daemonPid: number | undefined;
+    const peerEvents: Array<{ event: string; peerId: number; phase: string; code?: string; message?: string; hadError?: boolean }> = [];
+    const peers = new Map<number, { socket: net.Socket; phase: string }>();
+    const serverErrors: string[] = [];
+    const closePeerServer = async () => {
+      if (!server) return;
+      await new Promise<void>((resolve, reject) => server!.close(error => error ? reject(error) : resolve()));
+      server = undefined;
+      await until(() => [...peers.values()].every(peer => peer.phase === 'closed'), 1000);
+    };
     const facts = () => fs.existsSync(observations) ? fs.readFileSync(observations, 'utf8').trim().split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line)) : [];
     try {
       for (const [index, root] of roots.entries()) {
@@ -91,8 +100,30 @@ describe('independent unlimited waiting through actual MCP requests', () => {
         // Existing fallback seam: an owned incompatible handshake with no
         // writer. #16 replaces compatibility behavior and adapts this fixture.
         const socketPath = getDaemonSocketPath(roots[0]);
-        server = net.createServer(socket => socket.end(JSON.stringify({ codegraph: '0.0.0-owned-test', pid: process.pid, socketPath, protocol: 1 }) + '\n'));
-        await new Promise<void>(resolve => server!.listen(socketPath, resolve));
+        server = net.createServer(socket => {
+          const peerId = peers.size + 1;
+          const peer = { socket, phase: 'hello-sending' };
+          peers.set(peerId, peer);
+          peerEvents.push({ event: 'accepted', peerId, phase: peer.phase });
+          // The real client deliberately destroys an incompatible peer. Own
+          // this fixture socket for its whole life: a Unix reset is observable
+          // fixture traffic, while every other error/phase still fails below.
+          socket.on('error', (error: NodeJS.ErrnoException) => peerEvents.push({ event: 'error', peerId,
+            phase: peer.phase, code: error.code, message: error.message }));
+          socket.on('close', hadError => {
+            peerEvents.push({ event: 'closed', peerId, phase: peer.phase, hadError });
+            peer.phase = 'closed';
+          });
+          socket.end(JSON.stringify({ codegraph: '0.0.0-owned-test', pid: process.pid, socketPath, protocol: 1 }) + '\n', () => {
+            peer.phase = 'mismatch-close';
+            peerEvents.push({ event: 'incompatible-hello-sent', peerId, phase: peer.phase });
+          });
+        });
+        server.on('error', error => serverErrors.push(error.message));
+        await new Promise<void>((resolve, reject) => {
+          server!.once('error', reject);
+          server!.listen(socketPath, () => { server!.removeListener('error', reject); resolve(); });
+        });
       }
       client = new Client(roots[0], mode, observations);
       const initialize = await client.request('initialize', { protocolVersion: '2024-11-05', capabilities: {},
@@ -113,9 +144,25 @@ describe('independent unlimited waiting through actual MCP requests', () => {
       expect(result.content[0].text).toContain('app.ts:2');
       expect(result.content[0].text).not.toContain('after admission');
       if (mode === 'shared-daemon') daemonPid = JSON.parse(fs.readFileSync(path.join(roots[0], '.codegraph/daemon.pid'), 'utf8')).pid;
-      if (mode === 'writable-fallback') expect(client.stderr).toContain('serving this session in-process');
+      if (mode === 'writable-fallback') {
+        expect(client.stderr).toContain('version (0.0.0-owned-test)');
+        expect(client.stderr).toContain('serving this session in-process');
+      }
       await client.close();
       if (daemonPid) await until(() => !alive(daemonPid!), 10000);
+      await closePeerServer();
+      expect(serverErrors).toEqual([]);
+      if (mode === 'writable-fallback') {
+        const accepted = peerEvents.filter(event => event.event === 'accepted').map(event => event.peerId);
+        expect(accepted.length).toBeGreaterThan(0);
+        expect(peerEvents.filter(event => event.event === 'incompatible-hello-sent').map(event => event.peerId)).toEqual(accepted);
+        expect(peerEvents.filter(event => event.event === 'closed').map(event => event.peerId).sort()).toEqual([...accepted].sort());
+        for (const error of peerEvents.filter(event => event.event === 'error')) {
+          expect(accepted).toContain(error.peerId);
+          expect(error.phase).toBe('mismatch-close');
+          expect(error.code).toBe('ECONNRESET');
+        }
+      } else expect(peerEvents).toEqual([]);
       const events = facts();
       const spawned = events.filter(event => event.event === 'spawn');
       expect(spawned.length).toBeGreaterThan(0);
@@ -134,11 +181,15 @@ describe('independent unlimited waiting through actual MCP requests', () => {
       if (process.env.VALIDATION_OUT) fs.writeFileSync(path.join(process.env.VALIDATION_OUT, `waiting-${mode}.json`), JSON.stringify({
         mode, clock: 'process.hrtime.bigint', releaseMs: 47000, caseBoundMs: 90000, clientDeadlineMs: 80000, elapsed, roots,
         inputs: roots.map(root => ({ root, source: fs.readFileSync(path.join(root, 'app.ts'), 'utf8') })), events, replies: client.replies,
+        fallbackPeerOwner: { pid: process.pid, purpose: 'incompatible-handshake-fixture', socketPath: getDaemonSocketPath(roots[0]) }, peerEvents, serverErrors,
       }, null, 2));
     } finally {
       if (client && client.child.exitCode === null && client.child.signalCode === null) await client.close();
       if (daemonPid && alive(daemonPid)) await until(() => !alive(daemonPid!), 10000);
-      if (server) await new Promise<void>(resolve => server!.close(() => resolve()));
+      for (const peer of peers.values()) if (!peer.socket.destroyed) peer.socket.destroy();
+      await closePeerServer();
+      if (process.env.VALIDATION_OUT) fs.writeFileSync(path.join(process.env.VALIDATION_OUT, `waiting-${mode}-peers.json`),
+        JSON.stringify({ owner: { pid: process.pid, purpose: 'incompatible-handshake-fixture', socketPath: getDaemonSocketPath(roots[0]) }, peerEvents, serverErrors }, null, 2));
       fs.rmSync(fixture, { recursive: true, force: true });
     }
   }, 90000);
