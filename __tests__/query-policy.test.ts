@@ -76,11 +76,11 @@ describe('internal query policy', () => {
       source: 'legacy', preset: 'default', classification: 'custom', concurrency: { kind: 'finite', maximum: 1000 }, deadline: { kind: 'finite', milliseconds: 1000 }, retention: 'ordinary',
     });
     expect(resolveLegacyQueryPolicy({ mode: 'unlimited', poolSize: 'unlimited', busyTimeoutMs: 'unlimited' }, 'direct', 8)).toMatchObject({
-      concurrency: { kind: 'finite', maximum: 7 }, deadline: { kind: 'absent' }, retention: 'ordinary',
+      concurrency: { kind: 'unlimited' }, deadline: { kind: 'absent' }, retention: 'retire-idle',
     });
     expect(resolveLegacyQueryPolicy({ poolSize: ' ' }, 'direct', 8).deadline.kind).toBe('inapplicable');
     expect(resolveLegacyQueryPolicy({ poolSize: '4' }, 'read-only-fallback', 8)).toMatchObject({ concurrency: { kind: 'finite', maximum: 4 }, deadline: { kind: 'finite', milliseconds: 45000 } });
-    for (const poolSize of [undefined, '', 'malformed', 'unlimited', '0']) {
+    for (const poolSize of [undefined, '', 'malformed', '0']) {
       expect(resolveLegacyQueryPolicy({ poolSize }, 'read-only-fallback', 8)).toMatchObject({ concurrency: { kind: 'disabled' }, deadline: { kind: 'inapplicable' } });
     }
   });

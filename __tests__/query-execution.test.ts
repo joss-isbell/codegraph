@@ -145,14 +145,14 @@ describe('real query worker context', () => {
         JSON.stringify({ mode: 'read-only-fallback', poolSize, alpha, beta, ...state }) + '\n');
     } finally { await engine.stop(); }
   }, 30000);
-  it('keeps an unsupported internal unlimited read-only policy unpooled until lifecycle integration', async () => {
+  it('executes an internal unlimited read-only policy on workers without acquiring writer ownership', async () => {
     const root = await fixture();
     const policy = resolveQueryPolicy({ mode: 'unlimited' }, 'read-only-fallback', 8);
     const engine: MCPEngine = new BuiltEngine({ readOnly: true, queryPool: true, queryPolicy: policy });
     try {
       await engine.ensureInitialized(root);
       expect(engine.getQueryExecutionContext()).toMatchObject({ capability: 'read-only', ownership: { writer: false, synchronization: false }, policy: { concurrency: { kind: 'unlimited' }, deadline: { kind: 'absent' } } });
-      expect(engine.getQueryExecutionState().actual).toMatchObject({ dispatch: 'main-thread', concurrency: { kind: 'disabled' }, deadline: { kind: 'inapplicable' }, retention: 'ordinary', workers: 0 });
+      expect(engine.getQueryExecutionState().actual).toMatchObject({ dispatch: 'worker', concurrency: { kind: 'unlimited' }, deadline: { kind: 'absent' }, retention: 'retire-idle', workers: 1 });
       const response = await engine.getToolHandler().execute('codegraph_search', { query: 'contextSymbol' });
       expect(response.content[0].text).toContain('app.ts:1');
       expect(fs.existsSync(path.join(root, '.codegraph', 'writer.pid'))).toBe(false);

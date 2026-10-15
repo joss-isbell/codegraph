@@ -65,6 +65,9 @@ const CRASH_BUDGET = 12;
  */
 const MAX_CONCURRENT_SPAWN = 2;
 
+/** Internal idle grace v1. Query demand, rather than chat/heartbeat activity, owns it. */
+export const QUERY_IDLE_RETIREMENT_MS = 30_000;
+
 /**
  * How long `destroy()` waits for a worker that is still starting up before
  * terminating it anyway. Terminating a worker while it is still loading its
@@ -176,6 +179,7 @@ export class QueryPool {
   private readonly maxRetries: number;
   private readonly createWorker: () => PoolWorker;
   private readonly startSettleMs: number;
+  private idleRetirementTimers = new Map<PoolWorker, NodeJS.Timeout>();
 
   constructor(opts: QueryPoolOptions) {
     this.root = opts.root;
@@ -355,12 +359,51 @@ export class QueryPool {
       while (this.queue.length && (job = this.queue.shift()) && job.settled) job = undefined;
       if (!job || job.settled) break;
       const w = this.idle.pop()!;
+      this.clearIdleRetirement(w);
       this.inflight.set(w, job);
       try {
         w.postMessage({ type: 'call', id: job.id, toolName: job.toolName, args: job.args, context: job.context });
       } catch {
         this.onWorkerGone(w, 'worker dispatch failed');
       }
+    }
+    this.updateIdleRetirement();
+  }
+
+  private clearIdleRetirement(worker?: PoolWorker): void {
+    for (const [owned, timer] of this.idleRetirementTimers) {
+      if (worker && worker !== owned) continue;
+      clearTimeout(timer);
+      this.idleRetirementTimers.delete(owned);
+    }
+  }
+
+  /** An unused ready peer may retire while another worker remains occupied. */
+  private canRetireIdle(worker: PoolWorker): boolean {
+    return this.execution.policy.retention === 'retire-idle' && this.healthy && this.accepting
+      && this.workers.has(worker) && this.idle.includes(worker)
+      && !this.queue.some(job => !job.settled) && !this.inflight.has(worker)
+      && !this.pendingWorkers.has(worker) && !this.retirements.has(worker);
+  }
+
+  private updateIdleRetirement(): void {
+    for (const worker of this.idleRetirementTimers.keys()) {
+      if (!this.canRetireIdle(worker)) this.clearIdleRetirement(worker);
+    }
+    for (const worker of this.idle) {
+      if (!this.canRetireIdle(worker) || this.idleRetirementTimers.has(worker)) continue;
+      const timer = setTimeout(() => {
+        this.idleRetirementTimers.delete(worker);
+        if (!this.canRetireIdle(worker)) return;
+        // Remove only this dispatchable slot before asynchronous teardown. An
+        // occupied peer keeps executing. Retiring workers remain owned/count
+        // toward finite capacity until actual exit; new demand waits or uses
+        // other free capacity, without reviving this retired worker.
+        this.idle = this.idle.filter(candidate => candidate !== worker);
+        this.retire(worker);
+      }, QUERY_IDLE_RETIREMENT_MS);
+      timer.unref?.();
+      this.idleRetirementTimers.set(worker, timer);
     }
   }
 
@@ -388,6 +431,7 @@ export class QueryPool {
   }
 
   private notifyQuiet(): void {
+    this.updateIdleRetirement();
     if (this.queue.some(job => !job.settled) || this.inflight.size) return;
     for (const waiter of this.quietWaiters.splice(0)) waiter.resolve();
   }
@@ -395,6 +439,7 @@ export class QueryPool {
   /** Routine handover has no execution deadline and never interrupts admitted work. */
   async drainNaturally(): Promise<void> {
     this.accepting = false;
+    this.clearIdleRetirement();
     if (this.cleanupFailure) throw this.cleanupFailure;
     if (this.queue.some(job => !job.settled) || this.inflight.size) {
       await new Promise<void>((resolve, reject) => this.quietWaiters.push({ resolve, reject }));
@@ -526,6 +571,7 @@ export class QueryPool {
     if (this.destroyPromise) return this.destroyPromise;
     this.destroyed = true;
     this.accepting = false;
+    this.clearIdleRetirement();
     const ws = [...this.workers];
     this.idle = [];
     for (const job of [...this.inflight.values(), ...this.queue]) {

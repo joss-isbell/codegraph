@@ -1,10 +1,10 @@
 # Internal query policy and request context (Issue #9)
 
 This is an internal preparation seam. Public startup still uses the original
-permissive numeric parser, finite concurrency, default 45-second pooled busy timer and ordinary
-retention. `CODEGRAPH_QUERY_MODE` does not activate a preset in this change.
+permissive numeric parser and default 45-second pooled busy timer. Independent
+pool and waiting sentinels are available; `CODEGRAPH_QUERY_MODE` does not activate a preset yet.
 Read-only fallback remains unpooled by default; Issue #11 permits an explicitly
-selected positive finite pool. Service compatibility and replacement
+selected positive finite or unlimited pool. Service compatibility and replacement
 behavior are unchanged. No installation or live service is changed.
 
 ## Policy boundary
@@ -22,7 +22,7 @@ behavior are unchanged. No installation or live service is changed.
   shared-daemon defaults use cores minus one bounded to 1–16. Issue #10 removes
   both explicit finite override clamps; supported finite maxima are exact lazy
   demand ceilings. Read-only defaults
-  disable pooling, unless a valid positive finite override explicitly selects
+  disable pooling, unless a valid positive finite or unlimited override explicitly selects
   local read-only workers. `resolvePoolSize` remains the old parser's compatibility seam.
 - Strict resolution uses decimal digits only, trimmed case-sensitive sentinels,
   exact safe pool integers 0–9,007,199,254,740,991 and finite deadlines
@@ -35,13 +35,14 @@ behavior are unchanged. No installation or live service is changed.
   The engine, dispatcher, pool and worker receive the same immutable policy and
   authority. A supplied policy bypasses legacy pool/env reconstruction and caps.
   `QueryPool` represents an absent timer with `null`, never a huge finite timer.
-  Startup pacing remains distinct from the maximum. Unlimited lifecycle proof
-  belongs to the later lifecycle tickets; this interface alone is not acceptance.
+  Startup pacing remains distinct from the maximum. Unlimited pool selection
+  and unused-worker retirement are implemented by #14; the strict public preset
+  and attachment safety remain downstream.
 - `getQueryExecutionState` separates resolution from current construction and
   dispatch: read-only/disabled execution reports main-thread inapplicability.
   A constructed cold/recovering pool reports worker dispatch with `ready:false`;
   permanent failure reports unavailable dispatch and a failed lifecycle, never a
-  main-thread escape. Actual retention remains ordinary until Issue #14. This is an
+  main-thread escape. Actual retention reports the constructed pool's policy. This is an
   internal diagnostics input, not an additional MCP tool or public claim.
 - `connectWithHello` resolves a prospective **shared-daemon** policy, independently
   of a direct/fallback engine, and sends it in the internal client hello. Issue
@@ -244,10 +245,8 @@ even when its test assertion passes. No held project or installed registry is us
   resources rather than a service shared across chats. Existing shared-daemon
   facts identify `shared-project` scope. No additional MCP diagnostic or knob was
   added.
-- Read-only activation remains finite-only in `maybeStartPool`. A supplied
-  internal unlimited policy remains represented as requested/resolved, while
-  actual execution stays unpooled. #14/#15 own lifting this guard once the
-  unlimited lifecycle/preset is complete. Public unlimited preset uptake,
+- Read-only activation supports explicitly selected finite and unlimited pools.
+  Unset/default and explicit zero remain unpooled. Public unlimited preset uptake,
   cancellation/drain and service compatibility remain downstream.
 - Real worker/SQLite tests cover cold default, same/other explicit and rootless
   routes, directory aliases, session emission stripping/isolation, genuine CLI
@@ -257,3 +256,39 @@ even when its test assertion passes. No held project or installed registry is us
   open inode replacement; Windows cannot unlink an open database and uses the
   ordinary platform guard. All checks use the proved supervisor and receipt
   consumer; no live held index or installed service is touched.
+
+## Independent unlimited pool and idle retirement (Issue #14)
+
+- `CODEGRAPH_QUERY_POOL_SIZE=unlimited` independently selects pooled execution
+  without a configured worker or admission maximum in direct, writable fallback,
+  read-only fallback and shared-daemon modes. The existing finite busy timer
+  remains unless its independent override removes it. Finite counts, deliberate
+  zero and ordinary defaults retain their meanings; no huge eager allocation or
+  replacement fixed concurrency ceiling is introduced. At most two cold workers
+  start simultaneously, and each readiness event permits further demand growth.
+- The internal idle grace version 1 is 30 seconds per ready unused worker,
+  observed by 45 seconds in real-worker acceptance. Each worker's actual last
+  completion/readiness starts its own grace. An unused peer can retire while
+  another healthy query continues indefinitely. Open chats, status polling and
+  protocol heartbeats neither cancel nor reset an unused worker's grace.
+- Only dispatchable idle workers retire. Queued live demand reuses needed idle
+  workers before retiring them; starting, executing and retrying work stays owned.
+  A caller's finite expiry does not make synchronous execution idle. Cancellation
+  retains the separate targeted abandonment contract from #12. Routine handover
+  drains without imposing the idle grace as a query deadline.
+- Each retiring worker leaves the dispatchable set before asynchronous teardown,
+  but remains counted and owned through verified exit. Finite reserved slots
+  cannot be oversubscribed. New demand queues for readiness or safely grows other
+  available capacity; retired workers cannot run duplicate jobs or resurrect.
+  Cleanup rejection stays visible, retains ownership and follows the existing
+  failure contract. Windows readiness/startup protection remains in force.
+- Retirement follows the unlimited pool override or the internal unlimited
+  preset, including a finite override that makes that preset custom. Removing
+  only the busy timer preserves ordinary retention. No retirement knob is added.
+  Real worker counts establish release of query workers, not RAM savings or a
+  fixed active-resource bound. Demand can grow CPU and memory use, and a later
+  query pays the observed cold-worker startup cost.
+- Reader retirement/recreation preserves read-only authority and leaves the
+  owner connection, writer lock, native watching and synchronization available.
+  Normal shared chats reuse one project engine/pool; exceptional fallback engines
+  retain local ownership and are not represented as shared across chats.
