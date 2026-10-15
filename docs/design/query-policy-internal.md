@@ -3,7 +3,8 @@
 This is an internal preparation seam. Public startup still uses the original
 permissive parser, finite concurrency, 45-second pooled busy timer and ordinary
 retention. `CODEGRAPH_QUERY_MODE` does not activate a preset in this change.
-Read-only fallback remains unpooled. Service compatibility and replacement
+Read-only fallback remains unpooled by default; Issue #11 permits an explicitly
+selected positive finite pool. Service compatibility and replacement
 behavior are unchanged. No installation or live service is changed.
 
 ## Policy boundary
@@ -18,7 +19,8 @@ behavior are unchanged. No installation or live service is changed.
   shared-daemon defaults use cores minus one bounded to 1–16. Issue #10 removes
   both explicit finite override clamps; supported finite maxima are exact lazy
   demand ceilings. Read-only defaults
-  disable pooling. `resolvePoolSize` remains the old parser's compatibility seam.
+  disable pooling, unless a valid positive finite override explicitly selects
+  local read-only workers. `resolvePoolSize` remains the old parser's compatibility seam.
 - Strict resolution uses decimal digits only, trimmed case-sensitive sentinels,
   exact safe pool integers 0–9,007,199,254,740,991 and finite deadlines
   1,000–2,147,483,647 ms. An explicitly disabled pool has an inapplicable deadline;
@@ -67,10 +69,10 @@ behavior are unchanged. No installation or live service is changed.
   beneath an indexed ancestor. A valid replacement at the same own index keeps
   the existing reopen behavior. Responses carry context only on the internal worker
   envelope; MCP results expose no request/session/ownership side channel.
-- Workers receive read-only capability for Issue #11's enforced read-only opener.
-  This ticket does not enable public read-only pooling or change existing worker
-  opening behavior. Main-thread read-only default and explicit routes continue
-  through the engine's existing read-only project lifecycle.
+- Workers receive read-only capability. Default worker opens and every lazy
+  explicit-project open enforce it; replacement opens preserve the connection's
+  capability. Main-thread read-only default and explicit routes continue through
+  the engine's read-only project lifecycle.
 
 ## Worker readiness and capacity boundary (Issue #10)
 
@@ -121,3 +123,36 @@ replacement suites remain regression evidence. Run all checks with the proved
 API with an explicit empty workspace, no implicit build and an attempt-local Vite
 cache. Its JSON result must contain every test tail; only predeclared exact
 platform-gated skips are accepted. No held project or installed registry is used.
+
+## Read-only fallback boundary (Issue #11)
+
+- The existing finite pool-size setting now selects read-only workers explicitly.
+  Unset/malformed/nonapplicable selections stay unpooled; zero keeps main-thread
+  reads and an inapplicable pool deadline. Legacy permissive numeric parsing
+  remains until #15. A constructed finite pool remains authoritative while cold
+  or recovering, using #10's timer-independent failure contract.
+- A read-only engine's default, explicit, lazy worker and replacement connections
+  stay read-only. It acquires no writer/synchronization lease, starts no watcher,
+  performs no catch-up, migration, bulk-load repair or WAL maintenance, and does
+  not repair a missing or outdated `.codegraph/.gitignore`. Ordinary writable
+  validation still repairs that metadata. Rejected native database opens close
+  their opened handle and do not retry with writable authority.
+- Internal execution facts identify `read-only-fallback`, read-only capability,
+  absent writer/synchronization ownership and `local-engine` resource scope.
+  These fallback resources belong to each local engine; they are exceptional
+  resources rather than a service shared across chats. Existing shared-daemon
+  facts identify `shared-project` scope. No additional MCP diagnostic or knob was
+  added.
+- Read-only activation remains finite-only in `maybeStartPool`. A supplied
+  internal unlimited policy remains represented as requested/resolved, while
+  actual execution stays unpooled. #14/#15 own lifting this guard once the
+  unlimited lifecycle/preset is complete. Public unlimited preset uptake,
+  cancellation/drain and service compatibility remain downstream.
+- Real worker/SQLite tests cover cold default, same/other explicit and rootless
+  routes, directory aliases, session emission stripping/isolation, genuine CLI
+  service-unavailable fallback beside a live native-watching writer, unchanged
+  schema/content/WAL/ancillary metadata during reader-only intervals and owner
+  changes before and after reader cleanup. POSIX replacement tests exercise live
+  open inode replacement; Windows cannot unlink an open database and uses the
+  ordinary platform guard. All checks use the proved supervisor and receipt
+  consumer; no live held index or installed service is touched.

@@ -127,7 +127,7 @@ function waitFor<T>(
   predicate: () => T | undefined | null | false,
   timeoutMs: number,
   pollMs = 25,
-  label = '',
+  label: string | (() => string) = '',
 ): Promise<T> {
   return new Promise((resolve, reject) => {
     const started = Date.now();
@@ -139,7 +139,8 @@ function waitFor<T>(
         // Name the wait: an async stack loses the await site, so an unlabeled
         // timeout can't tell WHICH step flaked (the #662 test's recurring
         // timeout was undiagnosable for exactly this reason).
-        return reject(new Error(`Timed out after ${timeoutMs}ms${label ? ` waiting for: ${label}` : ''}`));
+        const detail = typeof label === 'function' ? label() : label;
+        return reject(new Error(`Timed out after ${timeoutMs}ms${detail ? ` waiting for: ${detail}` : ''}`));
       }
       setTimeout(tick, pollMs);
     };
@@ -281,7 +282,10 @@ describe('Shared MCP daemon (issue #411)', () => {
     const first = spawnServer(tempDir, env);
     servers.push(first);
     sendInitialize(first.child, `file://${tempDir}`, 1);
-    const firstResp = await waitFor(() => findResponse(first.stdout, 1), 10000);
+    const firstResp = await waitFor(() => findResponse(first.stdout, 1), 10000, 25,
+      () => 'first initialize; ' + JSON.stringify({ root: realRoot, pid: first.child.pid,
+        exitCode: first.child.exitCode, signal: first.child.signalCode, stdout: first.stdout,
+        stderr: first.stderr, daemonPid: readLockPid(realRoot), daemonLog: readDaemonLog(realRoot) }));
     expect(firstResp.result.serverInfo.name).toBe('codegraph');
 
     // The launcher is a PROXY (not the daemon itself) — that's the detach fix.
@@ -305,7 +309,10 @@ describe('Shared MCP daemon (issue #411)', () => {
     const second = spawnServer(tempDir, env);
     servers.push(second);
     sendInitialize(second.child, `file://${tempDir}`, 2);
-    const secondResp = await waitFor(() => findResponse(second.stdout, 2), 10000);
+    const secondResp = await waitFor(() => findResponse(second.stdout, 2), 10000, 25,
+      () => 'second initialize; ' + JSON.stringify({ root: realRoot, pid: second.child.pid,
+        exitCode: second.child.exitCode, signal: second.child.signalCode, stdout: second.stdout,
+        stderr: second.stderr, daemonPid: readLockPid(realRoot), daemonLog: readDaemonLog(realRoot) }));
     expect(secondResp.result.serverInfo.name).toBe('codegraph');
     await waitFor(() => second.stderr.some((l) => l.includes('Attached to shared daemon')), 8000);
 
@@ -542,7 +549,7 @@ describe('Shared MCP daemon (issue #411)', () => {
       if (daemonPid) expect(await waitProcessExit(daemonPid, 10000)).toBe(true);
       if (mode === 'read-only-fallback') {
         expect(server.stderr.some(line => line.includes('Serving reads in-process without auto-sync:'))).toBe(true);
-        expect(server.stderr.some(line => line.includes('Query pool:'))).toBe(false);
+        expect(server.stderr.some(line => line.includes('Query pool: up to 2 worker thread(s) for concurrent reads (local read-only fallback; no writer or auto-sync ownership)'))).toBe(true);
         expect(fs.readFileSync(path.join(realRoot, '.codegraph', 'codegraph.db'))).toEqual(beforeAlpha);
         expect(fs.readFileSync(path.join(beta, '.codegraph', 'codegraph.db'))).toEqual(beforeBeta);
         expect(readLockPid(realRoot)).toBe(process.pid);

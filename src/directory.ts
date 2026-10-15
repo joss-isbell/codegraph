@@ -1069,7 +1069,7 @@ export function ensureSubdirectory(projectRoot: string, subdirName: string): str
 /**
  * Check if the .codegraph directory has valid structure
  */
-export function validateDirectory(projectRoot: string): {
+export function validateDirectory(projectRoot: string, options: { readOnly?: boolean } = {}): {
   valid: boolean;
   errors: string[];
 } {
@@ -1085,6 +1085,10 @@ export function validateDirectory(projectRoot: string): {
     errors.push('.codegraph exists but is not a directory');
     return { valid: false, errors };
   }
+
+  // Concurrent readers must leave even ancillary index repairs to the owner.
+  // A missing/stale ignore file does not prevent reading an existing database.
+  if (options.readOnly) return { valid: true, errors };
 
   // Auto-repair / upgrade .gitignore (non-critical file). A missing one is
   // recreated; a stale pre-wildcard default that never ignored daemon.pid is
