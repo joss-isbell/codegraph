@@ -430,6 +430,9 @@ export class QueryPool {
       if (this.softTimeoutMs !== null) {
         job.softTimer = setTimeout(() => {
           if (!job.settled) this.settle(job, busyGuidance(Date.now() - job.enqueuedAt));
+          // The last queued caller can expire while natural handover waits.
+          // Inflight execution still prevents quiet, even after its caller settles.
+          this.notifyQuiet();
         }, this.softTimeoutMs);
         job.softTimer.unref?.();
       }

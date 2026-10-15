@@ -6,7 +6,8 @@ const graph = CodeGraph.openSync(workerData.root, { readOnly: true });
 const handler = new ToolHandler(graph, workerData.execution);
 const observe = value => parentPort.postMessage({ type: 'observation', threadId, ...value });
 observe({ event: 'opened', root: graph.getProjectRoot(), readOnly: true });
-parentPort.postMessage({ type: 'ready', ok: true });
+if (workerData.readyDelay) setTimeout(() => parentPort.postMessage({ type: 'ready', ok: true }), workerData.readyDelay);
+else parentPort.postMessage({ type: 'ready', ok: true });
 parentPort.on('message', async message => {
   if (message.type !== 'call') return;
   observe({ event: 'start', id: message.id, context: message.context });

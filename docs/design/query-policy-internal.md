@@ -154,6 +154,8 @@ behavior are unchanged. No installation or live service is changed.
   duration. Database connections and writer ownership remain until execution and
   owned worker exit complete. An incomplete stop remains owned and is reported as
   incomplete; healthy work needing an interruption requires a new decision.
+  Expiry of the last queued caller wakes a natural-drain waiter; expiry of an
+  executing caller still leaves that waiter pending until execution or owned exit.
 - `QUERY_CLEANUP_BOUNDS` version 1 declares provisional engineering bounds:
   **15 s drain after abandonment or intentional targeted shutdown**, a **distinct
   15 s startup-handshake allowance**, and **5 s final worker-exit cleanup**. These

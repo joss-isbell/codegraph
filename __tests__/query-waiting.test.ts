@@ -87,7 +87,11 @@ describe('independent pooled waiting override', () => {
       await vi.advanceTimersByTimeAsync(1);
       expect((await pending).isError).toBeFalsy();
       expect(pool.activity.executing).toBe(1);
-    } finally { await pool.destroy(); }
+    } finally {
+      // Caller expiry retains execution; release controlled work before teardown.
+      for (const call of worker.calls) worker.complete(call.id);
+      await pool.destroy();
+    }
   });
   it('counts queue and execution together without resetting the admission timer on dispatch', async () => {
     vi.useFakeTimers(); vi.setSystemTime(0);
@@ -105,7 +109,11 @@ describe('independent pooled waiting override', () => {
       await vi.advanceTimersByTimeAsync(600);
       expect((await queued).content[0].text).toContain('1.000s after admission');
       expect(pool.activity.executing).toBe(1);
-    } finally { await pool.destroy(); }
+    } finally {
+      // Caller expiry retains execution; release controlled work before teardown.
+      for (const call of worker.calls) worker.complete(call.id);
+      await pool.destroy();
+    }
   });
   it('never executes an expired queued caller and ignores repeated late results while the next call owns the slot', async () => {
     vi.useFakeTimers(); vi.setSystemTime(0);
