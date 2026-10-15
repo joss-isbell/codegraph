@@ -76,6 +76,9 @@ const MAX_CONCURRENT_SPAWN = 2;
  */
 const WORKER_START_SETTLE_MS = 15_000;
 
+/** Provisional engineering bounds v1; never applied to healthy routine handover. */
+export const QUERY_CLEANUP_BOUNDS = Object.freeze({ version: 1, drainMs: 15_000, startupMs: WORKER_START_SETTLE_MS, cleanupMs: 5_000 });
+
 /** Shape of a message a worker posts back (ready handshake or a tool result). */
 interface WorkerMessage {
   type?: string;
@@ -94,6 +97,8 @@ interface Job {
   settled: boolean;
   enqueuedAt: number;
   softTimer?: NodeJS.Timeout;
+  detachAbort?: () => void;
+  abandonmentTimer?: NodeJS.Timeout;
 }
 
 export interface QueryPoolOptions {
@@ -154,10 +159,15 @@ export class QueryPool {
   // WORKER_START_SETTLE_MS).
   private starts = new Map<PoolWorker, { settled: Promise<void>; settle: () => void; timer: NodeJS.Timeout }>();
   private terminations = new Set<Promise<void>>();
+  private retirements = new Map<PoolWorker, Promise<void>>();
+  private failedRetirements = new Set<PoolWorker>();
   private destroyPromise: Promise<void> | null = null;
   private nextId = 1;
   private totalCrashes = 0;
   private destroyed = false;
+  private accepting = true;
+  private quietWaiters: Array<{ resolve: () => void; reject: (error: Error) => void }> = [];
+  private cleanupFailure: Error | null = null;
   private failure: string | null = null;
   private readonly root: string | null;
   private readonly maxSize: number;
@@ -199,8 +209,8 @@ export class QueryPool {
     return !this.destroyed && this.failure === null;
   }
 
-  get state(): 'accepting' | 'failed' | 'destroyed' {
-    return this.destroyed ? 'destroyed' : this.failure ? 'failed' : 'accepting';
+  get state(): 'accepting' | 'draining' | 'failed' | 'destroyed' {
+    return this.destroyed ? 'destroyed' : this.failure ? 'failed' : this.accepting ? 'accepting' : 'draining';
   }
 
   /** Immutable ownership facts, including execution whose caller already expired. */
@@ -212,7 +222,8 @@ export class QueryPool {
   private unavailable(): ToolResult {
     return { isError: true, content: [{ type: 'text', text: this.destroyed
       ? 'codegraph is shutting down; retry shortly.'
-      : `CodeGraph query worker capacity is unavailable: ${this.failure ?? 'worker failed'}. Retry after correcting the worker failure.` }] };
+      : this.failure ? `CodeGraph query worker capacity is unavailable: ${this.failure}. Retry after correcting the worker failure.`
+      : 'CodeGraph query pool is draining for handover; retry with its replacement.' }] };
   }
 
   private fail(reason: string): void {
@@ -220,12 +231,10 @@ export class QueryPool {
     this.failure = reason;
     for (const job of [...this.inflight.values(), ...this.queue]) this.settle(job, this.unavailable());
     const workers = [...this.workers];
-    this.workers.clear();
-    this.pendingWorkers.clear();
-    this.inflight.clear();
     this.idle = [];
     this.queue = [];
     for (const worker of workers) this.retire(worker);
+    this.notifyQuiet();
   }
 
   /**
@@ -270,6 +279,7 @@ export class QueryPool {
     if (!m || !this.workers.has(w)) return; // ignore late messages from retired workers
     if (m.type === 'ready') {
       if (!this.pendingWorkers.delete(w)) return; // already handled this handshake
+      if (this.retirements.has(w) || !this.healthy) return;
       if (m.ok !== true) {
         this.onWorkerGone(w); // failed opens consume the same budget as crashes
         return;
@@ -283,9 +293,11 @@ export class QueryPool {
       // A late/duplicate/wrong-id result cannot release a different job's slot.
       if (!job || m.id !== job.id || !m.result) return;
       this.inflight.delete(w);
-      this.idle.push(w);
+      if (job.abandonmentTimer) clearTimeout(job.abandonmentTimer);
+      if (!this.retirements.has(w) && this.healthy) this.idle.push(w);
       this.settle(job, m.result);
       this.drain();
+      this.notifyQuiet();
     }
   }
 
@@ -293,6 +305,7 @@ export class QueryPool {
   // retry its in-flight job once; a job that keeps crashing workers fails
   // gracefully so it can't loop the pool forever.
   private onWorkerGone(w: PoolWorker, reason = 'worker failed to open its project'): void {
+    if (this.retirements.has(w)) return; // intentional retirement is not a capacity crash
     if (!this.workers.has(w)) return; // already handled (error+exit both fire)
     this.workers.delete(w);
     this.pendingWorkers.delete(w);
@@ -300,6 +313,7 @@ export class QueryPool {
     this.totalCrashes++;
     const job = this.inflight.get(w);
     this.inflight.delete(w);
+    if (job?.abandonmentTimer) clearTimeout(job.abandonmentTimer);
     this.retire(w);
     if (this.totalCrashes >= CRASH_BUDGET) {
       if (job) this.settle(job, { isError: true, content: [{ type: 'text', text: `CodeGraph query worker capacity is unavailable: ${reason}; recovery exhausted.` }] });
@@ -316,6 +330,7 @@ export class QueryPool {
       }
     }
     this.drain();
+    this.notifyQuiet();
   }
 
   private drain(): void {
@@ -353,23 +368,71 @@ export class QueryPool {
     if (job.settled) return; // already answered (by backstop or worker)
     job.settled = true;
     if (job.softTimer) clearTimeout(job.softTimer);
+    job.detachAbort?.();
     job.resolve(result);
   }
 
+  private abandon(job: Job): void {
+    this.settle(job, { content: [{ type: 'text', text: 'CodeGraph request cancelled or abandoned.' }] });
+    this.queue = this.queue.filter(candidate => candidate !== job);
+    const worker = [...this.inflight].find(([, current]) => current === job)?.[0];
+    if (worker && !job.abandonmentTimer && !this.destroyed) {
+      // Cancellation settles delivery, not execution. Only this abandoned
+      // worker is retired after its drain allowance; shared peers keep running.
+      job.abandonmentTimer = setTimeout(() => {
+        if (this.inflight.get(worker) === job) this.retire(worker, true);
+      }, QUERY_CLEANUP_BOUNDS.drainMs);
+      job.abandonmentTimer.unref?.();
+    }
+    this.notifyQuiet();
+  }
+
+  private notifyQuiet(): void {
+    if (this.queue.some(job => !job.settled) || this.inflight.size) return;
+    for (const waiter of this.quietWaiters.splice(0)) waiter.resolve();
+  }
+
+  /** Routine handover has no execution deadline and never interrupts admitted work. */
+  async drainNaturally(): Promise<void> {
+    this.accepting = false;
+    if (this.cleanupFailure) throw this.cleanupFailure;
+    if (this.queue.some(job => !job.settled) || this.inflight.size) {
+      await new Promise<void>((resolve, reject) => this.quietWaiters.push({ resolve, reject }));
+    }
+    await this.destroy();
+  }
+
+  /** Abandon only this engine generation's session; occupied slots stay owned. */
+  cancelSession(sessionId: string): void {
+    for (const job of [...this.queue, ...this.inflight.values()]) {
+      if (job.context?.sessionId === sessionId && job.context.execution.generation === this.execution.generation) {
+        this.abandon(job);
+      }
+    }
+    this.queue = this.queue.filter(job => !job.settled);
+  }
+
   /** Run a read tool on the pool. Always resolves (never rejects). */
-  run(toolName: string, args: Record<string, unknown>, context?: QueryRequestContext): Promise<ToolResult> {
-    if (!this.healthy) return Promise.resolve(this.unavailable());
+  run(toolName: string, args: Record<string, unknown>, context?: QueryRequestContext, signal?: AbortSignal): Promise<ToolResult> {
+    if (!this.healthy || !this.accepting) return Promise.resolve(this.unavailable());
     return new Promise<ToolResult>((resolve) => {
       const job: Job = {
         id: this.nextId++, toolName, args, context, resolve,
         retries: 0, settled: false, enqueuedAt: Date.now(),
       };
+      const aborted = () => this.abandon(job);
+      signal?.addEventListener('abort', aborted, { once: true });
+      job.detachAbort = () => signal?.removeEventListener('abort', aborted);
+      if (signal?.aborted) { this.abandon(job); return; }
       // This optional timer starts once on admission, spanning queue and actual
       // execution. Retry keeps the same timer. Expiry answers only the caller;
       // an executing worker stays occupied until completion or safe teardown.
       if (this.softTimeoutMs !== null) {
         job.softTimer = setTimeout(() => {
           if (!job.settled) this.settle(job, busyGuidance(Date.now() - job.enqueuedAt));
+          // The last queued caller can expire while natural handover waits.
+          // Inflight execution still prevents quiet, even after its caller settles.
+          this.notifyQuiet();
         }, this.softTimeoutMs);
         job.softTimer.unref?.();
       }
@@ -386,10 +449,46 @@ export class QueryPool {
     start.settle();
   }
 
-  private retire(worker: PoolWorker): void {
+  private retire(worker: PoolWorker, preservePeers = false): Promise<void> {
+    const prior = this.retirements.get(worker);
+    if (prior) return prior;
     const termination = this.terminateStarted(worker);
+    this.retirements.set(worker, termination);
     this.terminations.add(termination);
-    void termination.finally(() => this.terminations.delete(termination));
+    void termination.then(() => {
+      this.terminations.delete(termination);
+      this.retirements.delete(worker);
+      this.failedRetirements.delete(worker);
+      const job = this.inflight.get(worker);
+      if (job?.abandonmentTimer) clearTimeout(job.abandonmentTimer);
+      this.inflight.delete(worker);
+      this.workers.delete(worker);
+      this.pendingWorkers.delete(worker);
+      this.idle = this.idle.filter(candidate => candidate !== worker);
+      this.notifyQuiet();
+      this.drain();
+    }, error => {
+      // Keep the ownership record and expose incomplete cleanup. Never pretend
+      // a still-owned worker exited, and never let a lost slot escape to main.
+      this.cleanupFailure = new Error(`owned worker cleanup incomplete: ${error instanceof Error ? error.message : String(error)}`);
+      this.failedRetirements.add(worker);
+      for (const waiter of this.quietWaiters.splice(0)) waiter.reject(this.cleanupFailure);
+      if (preservePeers) {
+        // One vanished session cannot take healthy shared workers down with it.
+        // Retain its slot and rejected retirement for truthful final shutdown.
+        process.stderr.write(`[CodeGraph MCP] Targeted ${this.cleanupFailure.message}; its slot remains owned, without stopping unrelated workers.\n`);
+        // Failed owned slots cannot be oversubscribed. If every finite slot is
+        // irrecoverably reserved, timer-free queued/new demand must fail rather
+        // than wait forever. Pending successful retirements remain recoverable.
+        if (this.healthy && this.workers.size >= this.maxSize && [...this.workers].every(owned => this.failedRetirements.has(owned))) {
+          this.failure = 'all configured worker slots remain reserved after owned cleanup failed';
+          for (const job of this.queue) this.settle(job, this.unavailable());
+          this.queue = [];
+          this.notifyQuiet();
+        }
+      } else this.fail(this.cleanupFailure.message);
+    });
+    return termination;
   }
 
   /**
@@ -408,28 +507,45 @@ export class QueryPool {
       clearTimeout(cap);
     }
     this.startSettled(w);
-    try { await w.terminate(); } catch { /* already gone */ }
+    let cleanup: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([Promise.resolve(w.terminate()), new Promise<never>((_, reject) => {
+        cleanup = setTimeout(() => reject(new Error('owned worker did not exit within provisional 5s cleanup allowance')), QUERY_CLEANUP_BOUNDS.cleanupMs);
+        cleanup.unref?.();
+      })]);
+    } finally { clearTimeout(cleanup); }
   }
 
   /**
-   * Terminate all workers and answer any outstanding calls gracefully. A worker
-   * still starting up is terminated once it has started (see
-   * WORKER_START_SETTLE_MS); outstanding calls are answered first.
+   * Intentional shutdown: settle delivery, preserve actual occupancy for the
+   * provisional drain, then terminate owned workers after the distinct startup
+   * handshake allowance and await bounded final cleanup. Routine handover must
+   * use drainNaturally(), which has no healthy-execution deadline.
    */
   destroy(): Promise<void> {
     if (this.destroyPromise) return this.destroyPromise;
     this.destroyed = true;
+    this.accepting = false;
     const ws = [...this.workers];
-    this.workers.clear();
-    this.pendingWorkers.clear();
     this.idle = [];
     for (const job of [...this.inflight.values(), ...this.queue]) {
       this.settle(job, { isError: true, content: [{ type: 'text', text: 'codegraph is shutting down; retry shortly.' }] });
     }
-    this.inflight.clear();
     this.queue = [];
-    for (const worker of ws) this.retire(worker);
-    this.destroyPromise = Promise.all([...this.terminations]).then(() => undefined);
+    this.destroyPromise = (async () => {
+      if (this.inflight.size && !this.cleanupFailure) {
+        let drain: NodeJS.Timeout | undefined;
+        await Promise.race([new Promise<void>((resolve, reject) => this.quietWaiters.push({ resolve, reject })), new Promise<void>(resolve => {
+          drain = setTimeout(resolve, QUERY_CLEANUP_BOUNDS.drainMs); drain.unref?.();
+        })]).catch(() => { /* known incomplete retirement; still stop the other owned workers */ });
+        clearTimeout(drain);
+      }
+      for (const worker of ws) this.retire(worker);
+      const outcomes = await Promise.allSettled([...this.terminations]);
+      const incomplete = outcomes.find((outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected');
+      if (incomplete) throw incomplete.reason;
+      this.notifyQuiet();
+    })();
     return this.destroyPromise;
   }
 }

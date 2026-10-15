@@ -123,6 +123,8 @@ export class MCPSession {
    */
   private readonly exploreSession = new ExploreSessionState();
   private readonly sessionId = randomUUID();
+  private closed = false;
+  private readonly requests = new Map<string | number, { controller: AbortController; commit?: () => void }>();
 
   constructor(
     private transport: JsonRpcTransport,
@@ -130,6 +132,7 @@ export class MCPSession {
     opts: MCPSessionOptions = {},
   ) {
     this.explicitProjectPath = opts.explicitProjectPath ?? null;
+    this.transport.onClose?.(() => this.endSession());
   }
 
   /**
@@ -145,7 +148,16 @@ export class MCPSession {
    * other sessions) or call `process.exit` (the daemon decides when to exit).
    */
   stop(): void {
+    this.endSession();
     this.transport.stop();
+  }
+
+  private endSession(): void {
+    if (this.closed) return;
+    this.closed = true;
+    for (const request of this.requests.values()) request.controller.abort();
+    this.requests.clear();
+    this.engine.cancelQuerySession(this.sessionId);
   }
 
   /** Underlying transport — exposed for daemon-side close hooks. */
@@ -163,8 +175,18 @@ export class MCPSession {
   }
 
   private async handleMessage(message: JsonRpcRequest | JsonRpcNotification): Promise<void> {
+    if (this.closed) return;
     const isRequest = 'id' in message;
     switch (message.method) {
+      case 'notifications/cancelled': {
+        if (isRequest) break;
+        const id = (message.params as { requestId?: unknown } | undefined)?.requestId;
+        if (typeof id === 'string' || typeof id === 'number') {
+          this.requests.get(id)?.controller.abort();
+          this.requests.delete(id);
+        }
+        break;
+      }
       case 'initialize':
         if (isRequest) await this.handleInitialize(message as JsonRpcRequest);
         break;
@@ -286,40 +308,57 @@ export class MCPSession {
   }
 
   private async handleToolsCall(request: JsonRpcRequest): Promise<void> {
-    const params = request.params as {
-      name: string;
-      arguments?: Record<string, unknown>;
-    };
+    if (this.requests.has(request.id)) return; // duplicate live ids cannot produce two answers
+    const lifetime = { controller: new AbortController(), commit: undefined as (() => void) | undefined };
+    this.requests.set(request.id, lifetime);
+    try {
+      const params = request.params as {
+        name: string;
+        arguments?: Record<string, unknown>;
+      };
 
-    if (!params || !params.name) {
-      this.transport.sendError(request.id, ErrorCodes.InvalidParams, 'Missing tool name');
-      return;
+      if (!params || !params.name) {
+        this.transport.sendError(request.id, ErrorCodes.InvalidParams, 'Missing tool name');
+        return;
+      }
+
+      const toolName = params.name;
+      const toolArgs = params.arguments || {};
+      const context = createQueryRequestContext(this.engine.getQueryExecutionContext(), this.sessionId, request.id);
+
+      const tool = tools.find((t) => t.name === toolName);
+      if (!tool) {
+        this.transport.sendError(
+          request.id,
+          ErrorCodes.InvalidParams,
+          `Unknown tool: ${toolName}`,
+        );
+        return;
+      }
+
+      if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] toolsCall ${toolName} id=${String(request.id)} pre-init\n`);
+      await this.retryInitIfNeeded();
+      if (lifetime.controller.signal.aborted || this.closed) return;
+
+      if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] toolsCall ${toolName} id=${String(request.id)} dispatch\n`);
+      const result = await this.engine.getToolHandler().execute(toolName, toolArgs, this.exploreSession, context, {
+        signal: lifetime.controller.signal, deferDelivery: commit => { lifetime.commit = commit; },
+      });
+      if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] toolsCall ${toolName} id=${String(request.id)} done\n`);
+      if (this.closed || lifetime.controller.signal.aborted || this.requests.get(request.id) !== lifetime) return;
+      const delivered = this.transport.sendResult(request.id, result);
+      if (delivered === false) return;
+      lifetime.commit?.();
+      // After the reply is on the wire — telemetry must never delay a tool
+      // response (in-memory increment only; see src/telemetry).
+      getTelemetry().recordUsage('mcp_tool', toolName, !result.isError, this.clientInfo);
+    } catch (error) {
+      if (!this.closed && !lifetime.controller.signal.aborted && this.requests.get(request.id) === lifetime) {
+        this.transport.sendError(request.id, ErrorCodes.InternalError, error instanceof Error ? error.message : String(error));
+      }
+    } finally {
+      if (this.requests.get(request.id) === lifetime) this.requests.delete(request.id);
     }
-
-    const toolName = params.name;
-    const toolArgs = params.arguments || {};
-    const context = createQueryRequestContext(this.engine.getQueryExecutionContext(), this.sessionId, request.id);
-
-    const tool = tools.find((t) => t.name === toolName);
-    if (!tool) {
-      this.transport.sendError(
-        request.id,
-        ErrorCodes.InvalidParams,
-        `Unknown tool: ${toolName}`,
-      );
-      return;
-    }
-
-    if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] toolsCall ${toolName} id=${String(request.id)} pre-init\n`);
-    await this.retryInitIfNeeded();
-
-    if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] toolsCall ${toolName} id=${String(request.id)} dispatch\n`);
-    const result = await this.engine.getToolHandler().execute(toolName, toolArgs, this.exploreSession, context);
-    if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] toolsCall ${toolName} id=${String(request.id)} done\n`);
-    this.transport.sendResult(request.id, result);
-    // After the reply is on the wire — telemetry must never delay a tool
-    // response (in-memory increment only; see src/telemetry).
-    getTelemetry().recordUsage('mcp_tool', toolName, !result.isError, this.clientInfo);
   }
 
   /**

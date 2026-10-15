@@ -2783,7 +2783,9 @@ export class ToolHandler {
     args: Record<string, unknown>,
     sessionState?: ExploreSessionState,
     requestContext?: QueryRequestContext,
+    lifetime?: import('./query-context').QueryRequestLifetime,
   ): Promise<ToolResult> {
+    if (lifetime?.signal.aborted) return this.textResult('CodeGraph request cancelled or abandoned.');
     if (this.closing) return this.textResult('This MCP session is closing; retry with a connected session.');
     this.activeCalls++;
     try {
@@ -2799,6 +2801,7 @@ export class ToolHandler {
         const gate = this.catchUpGate;
         await this.awaitCatchUpGate(gate);
       }
+      if (lifetime?.signal.aborted) return this.textResult('CodeGraph request cancelled or abandoned.');
       // Honor the optional tool allowlist (CODEGRAPH_MCP_TOOLS): a trimmed
       // surface rejects ablated tools defensively even if a client cached them.
       if (!this.isToolAllowed(toolName)) {
@@ -2831,6 +2834,7 @@ export class ToolHandler {
       }
 
       const project = await this.getCodeGraph(args.projectPath as string | undefined);
+      if (lifetime?.signal.aborted) return this.textResult('CodeGraph request cancelled or abandoned.');
       // Carry resolved routing separately from public args. Default calls may
       // need an explicit root on the worker wire without becoming explicit calls.
       const request = requestContext ?? (this.execution ? createQueryRequestContext(this.execution, 'untracked', 'untracked') : undefined);
@@ -2866,6 +2870,7 @@ export class ToolHandler {
       // structured-clone boundary into a worker, where a closure or a handler
       // field could not follow.
       const dispatchArgs = this.withSessionView(toolName, args, sessionState);
+      if (lifetime?.signal.aborted) return this.textResult('CodeGraph request cancelled or abandoned.');
       // The default may have appeared after the workers started. Pass the
       // main thread's current root explicitly; with no root or projectPath,
       // keep the main handler's workspace-specific not-indexed guidance.
@@ -2873,7 +2878,7 @@ export class ToolHandler {
       const projectPath = project.getProjectRoot();
       const wasDegraded = project.isWatcherDegraded?.();
       const raw = pooled
-        ? await this.queryPool!.run(toolName, { ...dispatchArgs, projectPath }, context)
+        ? await this.queryPool!.run(toolName, { ...dispatchArgs, projectPath }, context, lifetime?.signal)
         : await this.executeReadTool(toolName, dispatchArgs, context);
       const answeredFrom = raw._cgAnswerFiles;
       delete raw._cgAnswerFiles;
@@ -2901,7 +2906,7 @@ export class ToolHandler {
       // Record + STRIP before anything else touches the result: the emission is
       // internal bookkeeping and must never reach the client, whether or not a
       // caller passed session state.
-      const result = this.takeExploreEmission(raw, sessionState);
+      const result = this.takeExploreEmission(raw, lifetime?.signal.aborted ? undefined : sessionState, lifetime);
       const withWorktree = this.withWorktreeNotice(result, args.projectPath as string | undefined);
       return this.withStalenessNotice(withWorktree, args.projectPath as string | undefined);
     } catch (err) {
@@ -2972,14 +2977,18 @@ export class ToolHandler {
   private takeExploreEmission(
     result: ToolResult,
     sessionState: ExploreSessionState | undefined,
+    lifetime?: import('./query-context').QueryRequestLifetime,
   ): ToolResult {
     const emission = result?.[EXPLORE_EMISSION_KEY];
     if (emission === undefined) return result;
     delete result[EXPLORE_EMISSION_KEY];
     if (sessionState) {
-      try {
-        sessionState.record(emission);
-      } catch { /* bookkeeping only — never fail a served call */ }
+      const commit = () => {
+        if (lifetime?.signal.aborted) return;
+        try { sessionState.record(emission); } catch { /* bookkeeping only */ }
+      };
+      if (lifetime?.deferDelivery) lifetime.deferDelivery(commit);
+      else commit();
     }
     return result;
   }

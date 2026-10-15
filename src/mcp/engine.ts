@@ -184,6 +184,17 @@ export class MCPEngine {
   /** Internal resolved request, capability and ownership identity; no public diagnostic claim. */
   getQueryExecutionContext(): QueryExecutionContext { return this.execution; }
 
+  /** Session disappearance never stops shared peers, only that session's jobs. */
+  cancelQuerySession(sessionId: string): void { this.queryPool?.cancelSession(sessionId); }
+
+  /** Routine fallback handover waits indefinitely for admitted healthy execution. */
+  async drain(): Promise<void> {
+    this.closed = true; // no initialization/pool resurrection during handover
+    if (this.initPromise) await this.initPromise;
+    await this.queryPool?.drainNaturally();
+    await this.stop();
+  }
+
   /** Internal construction facts for later diagnostics; resolution is not uptake. */
   getQueryExecutionState() {
     const pool = this.queryPool;
@@ -311,8 +322,10 @@ export class MCPEngine {
     // after, and exiting while a worker is still starting up can crash the
     // process.
     this.toolHandler.setQueryPool(null);
-    const poolDown = this.queryPool ? this.queryPool.destroy() : Promise.resolve();
-    this.queryPool = null;
+    const stoppingPool = this.queryPool;
+    const poolDown = stoppingPool ? stoppingPool.destroy().then(() => {
+      if (this.queryPool === stoppingPool) this.queryPool = null;
+    }) : Promise.resolve();
     const measurementsDown = endFreshnessMeasurements();
     const drained = this.toolHandler.closeAll();
     this.stopPromise = Promise.all([drained, poolDown, measurementsDown]).then(async () => {

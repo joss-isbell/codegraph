@@ -105,8 +105,9 @@ behavior are unchanged. No installation or live service is changed.
   completion or worker teardown. `activity.queued` counts only unsettled callers,
   `starting` counts readiness waits and `retiring` counts awaited owned teardown.
   Jobs already retain immutable per-request/session/generation context, and all
-  caller outcomes share one idempotent settlement path. Cancellation, natural
-  drain and idle retirement are not implemented here.
+  caller outcomes share one idempotent settlement path. Issue #12 extends these
+  observations with `draining`, cancellation and natural drain; idle retirement
+  remains Issue #14.
 - Results must match both the owned Worker object and its current job id.
   Duplicate readiness, stale/duplicate results and error/exit races cannot free
   another job's slot or deliver a second outcome. Expired jobs are never retried.
@@ -114,6 +115,72 @@ behavior are unchanged. No installation or live service is changed.
   retains the Windows startup handshake/grace before termination. The real
   worker crash fixture collects before self-exit; failed initialization closes
   any connection it already opened.
+
+## Request abandonment and handover (Issue #12)
+
+- The immutable worker envelope retains engine generation, session, request and
+  admission identities. Owner-only `QueryRequestLifetime` carries an AbortSignal
+  separately; it is never cloned into a worker or stored in session-global state.
+  Queued cancellation removes work; executing cancellation settles its caller
+  once while the actual synchronous execution continues occupying its worker.
+  Retry never replays a settled request. Late or duplicate results cannot release
+  another job's slot or produce another response.
+- Built-in stdio and socket transports notify session end exactly once on EOF,
+  error, close or explicit stop. `MCPSession` handles the actual wire notification
+  `notifications/cancelled` with `params.requestId`; a notification gets no reply.
+  Session end also abandons that session's already-answered but still-executing
+  work. A shared peer's requests, workers and explore history remain independent.
+  After a shared explicit-project activation gate finishes, the owner checks the
+  request lifetime again before status measurement, watcher recovery or dispatch;
+  cancellation does not cancel the shared project activation itself.
+  The tests inject that protocol notification at the socket/stdio seam and observe
+  real disconnects. They do not establish which signal any particular host's Stop
+  button sends. Unpooled synchronous work cannot receive a new event-loop signal
+  until the synchronous call yields; this adds no host cancellation guarantee.
+- Source emission is stripped from results on the owner, and its session-history
+  commit is deferred until a live transport accepts the response for writing.
+  Cancellation, a rejected write or session end discards that commit. There is no
+  delivery acknowledgement from the MCP client; acceptance means handed to the
+  connected transport, not proof the remote host consumed the bytes.
+- The local-handshake proxy owns lifetimes for buffered, local and forwarded
+  requests. Cancellation removes pending/inflight replay entries and aborts local
+  dispatch. Closed and superseded socket attachments cannot deliver responses.
+  Late results from a cancelled forwarded call are discarded, and daemon loss
+  replays only still-live requests. Shutdown aborts these lifetimes before stopping
+  its owned engines, so neither work nor an engine can resurrect after shutdown.
+- Routine writable/read-only fallback handover stops new admission to the old
+  engine and waits for admitted local calls and actual worker execution to finish
+  naturally. `QueryPool.drainNaturally()` has no execution timer or promised drain
+  duration. Database connections and writer ownership remain until execution and
+  owned worker exit complete. An incomplete stop remains owned and is reported as
+  incomplete; healthy work needing an interruption requires a new decision.
+  Expiry of the last queued caller wakes a natural-drain waiter; expiry of an
+  executing caller still leaves that waiter pending until execution or owned exit.
+- `QUERY_CLEANUP_BOUNDS` version 1 declares provisional engineering bounds:
+  **15 s drain after abandonment or intentional targeted shutdown**, a **distinct
+  15 s startup-handshake allowance**, and **5 s final worker-exit cleanup**. These
+  are not query deadlines. Abandoned synchronous execution gets a targeted worker
+  retirement after its drain; another session's worker is not terminated. Capacity
+  stays accounted for through actual completion or verified owned-worker exit.
+  If targeted abandonment teardown rejects, the unexited worker and its finite
+  slot remain owned. Healthy peers continue; the known incomplete teardown is
+  surfaced by natural handover and final intentional destroy. Final destroy waits
+  for every other owned termination before rejecting, and the engine retains its
+  pool ownership reference when cleanup is incomplete.
+  If every finite slot is reserved by failed owned cleanup, there is no usable or
+  recovering capacity: queued and new calls get terminal capacity-unavailable
+  outcomes even with no busy timer. This keeps reserved ownership without
+  oversubscribing the finite ceiling or stranding another session indefinitely.
+  Intentional engine shutdown awaits all active/failed owned workers before owner
+  database release. Worker identity is the exact owned Worker object, not a process
+  name or project registry. Existing PID/creation checks and native process-tree
+  ownership remain with the qualified Windows/Linux supervisor. No global service
+  stop, new cancellation setting or public cancellation tool is added.
+- Real SQLite workers prove cancellation, late completion, stuck targeted cleanup
+  and healthy writable/read-only handover beyond the provisional drain interval
+  with an internally absent busy timer. Host deadlines remain independent. Native
+  Windows and Linux receipts, original failures, final worker exits and cleanup
+  tails are retained; source or bound artifact changes invalidate an attempt.
 
 ## Independent waiting boundary (Issue #13)
 

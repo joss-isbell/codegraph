@@ -16,6 +16,13 @@ export interface QueryRequestContext {
   readonly project: Readonly<{ route: 'default' | 'explicit'; root: string; index: string }> | null;
 }
 
+/** Owner-only lifetime, deliberately separate from the clone-safe worker context. */
+export interface QueryRequestLifetime {
+  readonly signal: AbortSignal;
+  /** The session commits history only after handing a response to its live transport. */
+  deferDelivery?: (commit: () => void) => void;
+}
+
 export function createQueryExecutionContext(policy: ResolvedQueryPolicy,
   authority: { readOnly: boolean; writer: boolean; synchronization: boolean }): QueryExecutionContext {
   return immutable({ generation: randomUUID(), policy, capability: authority.readOnly ? 'read-only' : 'read-write',
