@@ -6,6 +6,20 @@ const record = value => fs.appendFileSync(process.env.QUERY_UNLIMITED_OBSERVATIO
   JSON.stringify({ monotonicNs: process.hrtime.bigint().toString(), pid: process.pid,
     threadId: threads.threadId, ...value }) + '\n');
 if (threads.isMainThread) {
+  // Observe delivered main-thread history without changing emission or results.
+  const { ExploreSessionState } = require('../../dist/mcp/explore-session-state');
+  const originalRecord = ExploreSessionState.prototype.record;
+  const identities = new WeakMap();
+  let nextIdentity = 0;
+  ExploreSessionState.prototype.record = function(emission) {
+    const result = originalRecord.call(this, emission);
+    if (result) {
+      if (!identities.has(this)) identities.set(this, `${process.pid}:${++nextIdentity}`);
+      record({ event: 'session-history', historyId: identities.get(this), projectRoot: result.projectRoot,
+        query: result.query, index: result.index });
+    }
+    return result;
+  };
   const OriginalWorker = threads.Worker;
   threads.Worker = class extends OriginalWorker {
     constructor(file, options) {

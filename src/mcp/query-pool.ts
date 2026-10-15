@@ -10,9 +10,9 @@
  * connection) restores true multi-core parallelism and an idle main loop.
  *
  * Properties:
- *   - lazy growth: one warm worker on construct, grows to `size` on demand, so a
- *     single-agent session pays for one connection and a 10-subagent burst grows
- *     to the core budget.
+ *   - lazy growth: one warm worker on construct, then demand grows toward the
+ *     resolved finite maximum or without a configured maximum in unlimited
+ *     selection. Readiness paces cold starts without capping active demand.
  *   - crash recovery: a dead worker is respawned and its in-flight call retried
  *     once; a poison call that keeps crashing fails gracefully (never wedges the
  *     pool). A crash budget trips a circuit breaker (`healthy` → false) so the
@@ -400,7 +400,9 @@ export class QueryPool {
         // toward finite capacity until actual exit; new demand waits or uses
         // other free capacity, without reviving this retired worker.
         this.idle = this.idle.filter(candidate => candidate !== worker);
-        this.retire(worker);
+        // Background release has the same peer-isolated ownership contract as
+        // targeted abandoned work: a rejected teardown reserves only this slot.
+        this.retire(worker, true);
       }, QUERY_IDLE_RETIREMENT_MS);
       timer.unref?.();
       this.idleRetirementTimers.set(worker, timer);
@@ -519,7 +521,7 @@ export class QueryPool {
       this.failedRetirements.add(worker);
       for (const waiter of this.quietWaiters.splice(0)) waiter.reject(this.cleanupFailure);
       if (preservePeers) {
-        // One vanished session cannot take healthy shared workers down with it.
+        // One abandoned or idle peer cannot take healthy shared workers down.
         // Retain its slot and rejected retirement for truthful final shutdown.
         process.stderr.write(`[CodeGraph MCP] Targeted ${this.cleanupFailure.message}; its slot remains owned, without stopping unrelated workers.\n`);
         // Failed owned slots cannot be oversubscribed. If every finite slot is

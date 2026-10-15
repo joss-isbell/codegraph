@@ -87,13 +87,14 @@ describe('independent unlimited concurrency through actual MCP', () => {
     let observer: ReturnType<typeof createDatabase>['db'] | undefined;
     let daemonPid: number | undefined;
     let disappearingSession: any;
+    const routeProbes: any[] = [];
     const events = (): any[] => fs.existsSync(observations) ? fs.readFileSync(observations, 'utf8').split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line)) : [];
     const activeWorkers = () => events().filter(event => event.event === 'spawn').length - events().filter(event => event.event === 'exit').length;
     const resultText = (result: any, symbol: string) => { expect(result.isError).toBeFalsy(); expect(result.content[0].text).toContain(symbol); expect(result.content[0].text).toContain('app.ts:1'); };
     try {
-      for (const root of roots) {
+      for (const [index, root] of roots.entries()) {
         fs.mkdirSync(root);
-        fs.writeFileSync(path.join(root, 'app.ts'), 'export function overlapSymbol() { return 42; }\n');
+        fs.writeFileSync(path.join(root, 'app.ts'), `export function overlapSymbol() { return 42; }\nexport function ${index ? 'beta' : 'alpha'}RouteSymbol() { return ${index}; }\n`);
         const graph = await CodeGraph.init(root); try { await graph.indexAll(); } finally { graph.close(); }
       }
       if (mode === 'read-only-fallback') {
@@ -110,18 +111,34 @@ describe('independent unlimited concurrency through actual MCP', () => {
       const client = new Client(roots[0], mode, observations, release); clients.push(client);
       const initialize = () => client.request('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'unlimited-proof', version: '1' }, rootUri: pathToFileURL(roots[0]).href });
       expect((await initialize()).serverInfo.name).toBe('codegraph');
+      const probeRoutes = async (stage: 'before' | 'after') => {
+        for (const index of [0, 1, 0]) {
+          const query = `${index ? 'beta' : 'alpha'}RouteSymbol`;
+          const projectPath = index ? roots[index] : undefined;
+          const search = await client.query(query, projectPath);
+          expect(search.isError).toBeFalsy();
+          expect(search.content[0].text).toContain(query); expect(search.content[0].text).toContain('app.ts:2');
+          expect(search.content[0].text).not.toContain(`${index ? 'alpha' : 'beta'}RouteSymbol`);
+          const explore = await client.request('tools/call', { name: 'codegraph_explore', arguments: { query,
+            ...(projectPath ? { projectPath } : {}) } });
+          expect(explore.isError).toBeFalsy(); expect(explore.content[0].text).toContain('app.ts');
+          expect(explore.content[0].text).not.toContain(`${index ? 'alpha' : 'beta'}RouteSymbol`);
+          routeProbes.push({ stage, route: index ? 'explicit' : 'default', root: roots[index], query, search, explore });
+        }
+      };
+      await probeRoutes('before');
       const wave = Array.from({ length: 20 }, (_, i) => client.query('overlapSymbol', i % 2 ? roots[1] : undefined));
       // Catch all pending outcomes from the moment they are created.
       const resultsPromise = Promise.all(wave);
       void resultsPromise.catch(() => {}); // retained for the awaited assertion/cleanup, never an unobserved rejection
       await until(() => events().filter(event => event.event === 'call-start' && event.query === 'overlapSymbol').length === 20, 30000,
         () => `${activeWorkers()} workers; ${client.stderr}`);
-      const overlapping = events().filter(event => event.event === 'call-start');
+      const overlapping = events().filter(event => event.event === 'call-start' && event.query === 'overlapSymbol');
       expect(new Set(overlapping.map(event => `${event.pid}:${event.threadId}`)).size).toBe(20);
       fs.writeFileSync(release, 'release controlled delivery to ordinary SQLite handler');
       const results = await resultsPromise;
       for (const result of results) resultText(result, 'overlapSymbol');
-      expect(client.replies.filter(reply => reply.result?.content)).toHaveLength(20);
+      expect(client.replies.filter(reply => reply.result?.content)).toHaveLength(26);
       if (mode === 'shared-daemon') {
         daemonPid = JSON.parse(fs.readFileSync(path.join(roots[0], '.codegraph/daemon.pid'), 'utf8')).pid;
         const peer = new Client(roots[0], mode, observations, release); clients.push(peer);
@@ -198,6 +215,7 @@ describe('independent unlimited concurrency through actual MCP', () => {
         expect(departed.replies.filter(reply => reply.result?.content)).toHaveLength(0);
         disappearingSession = { departedPid: departed.child.pid, departedQueryReplies: 0, survivorResults, overlapAfterZero: 21 };
       }
+      await probeRoutes('after');
       fs.writeFileSync(path.join(roots[0], 'live.ts'), 'export function afterIdleNativeSymbol() { return 3; }\n');
       if (owners.length) await until(() => owners[0].searchNodes('afterIdleNativeSymbol').length === 1, 10000);
       let fresh: any;
@@ -213,10 +231,27 @@ describe('independent unlimited concurrency through actual MCP', () => {
       await settleLosingCandidates(roots[0], () => process.pid);
       expect(activeWorkers()).toBe(0);
       const final = events();
+      let startingAll = 0, peakStartingAll = 0;
+      for (const event of final) {
+        if (event.event === 'spawn') peakStartingAll = Math.max(peakStartingAll, ++startingAll);
+        if (event.event === 'ready') startingAll--;
+      }
+      expect(peakStartingAll).toBeLessThanOrEqual(2); expect(startingAll).toBe(0);
+      const history = final.filter(event => event.event === 'session-history');
+      expect(history).toHaveLength(6);
+      expect(new Set(history.map(event => event.historyId)).size).toBe(1);
+      expect(history.map(event => event.projectRoot)).toEqual([roots[0], roots[1], roots[0], roots[0], roots[1], roots[0]]);
+      expect(history.map(event => event.index)).toEqual([1, 1, 2, 3, 2, 4]);
+      const routedStarts = final.filter(event => event.event === 'call-start' && /^(alpha|beta)RouteSymbol$/.test(event.query));
+      expect(routedStarts).toHaveLength(12);
+      for (const event of routedStarts) {
+        const index = event.query === 'betaRouteSymbol' ? 1 : 0;
+        expect(event.context.project).toEqual({ route: index ? 'explicit' : 'default', root: roots[index], index: getDatabasePath(roots[index]) });
+      }
       expect(final.filter(event => event.event === 'exit')).toHaveLength(final.filter(event => event.event === 'spawn').length);
       if (process.env.VALIDATION_OUT) fs.writeFileSync(path.join(process.env.VALIDATION_OUT, `unlimited-${mode}.json`), JSON.stringify({
         mode, roots, releaseControl: 'owned file gates actual worker input; real built SQLite handler produces output', demand: 20,
-        peakOverlap: 20, peakStarting, idleGraceMs: 30000, idleObservationBoundMs: 45000, polls,
+        peakOverlap: 20, peakStarting, peakStartingAll, routeProbes, idleGraceMs: 30000, idleObservationBoundMs: 45000, polls,
         idleObservedMs, readonlyBefore, disappearingSession,
         events: final, results, replies: clients.map(client => client.replies), stderr: clients.map(client => client.stderr),
       }, null, 2));

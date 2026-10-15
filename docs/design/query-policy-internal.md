@@ -280,8 +280,11 @@ even when its test assertion passes. No held project or installed registry is us
   but remains counted and owned through verified exit. Finite reserved slots
   cannot be oversubscribed. New demand queues for readiness or safely grows other
   available capacity; retired workers cannot run duplicate jobs or resurrect.
-  Cleanup rejection stays visible, retains ownership and follows the existing
-  failure contract. Windows readiness/startup protection remains in force.
+  Cleanup rejection stays visible and reserves that worker's slot while unrelated
+  healthy work and session history continue. If every finite slot is reserved by
+  failed cleanup, queued/new demand settles unavailable rather than waiting
+  forever or escaping the pool; known cleanup failure rejects natural handover
+  and final destruction truthfully. Windows startup protection remains in force.
 - Retirement follows the unlimited pool override or the internal unlimited
   preset, including a finite override that makes that preset custom. Removing
   only the busy timer preserves ordinary retention. No retirement knob is added.
