@@ -170,7 +170,7 @@ describe('QueryPool', () => {
     expect(res.isError).toBeFalsy();            // NOT an error (abandonment rule)
     expect(res.content[0].text).toMatch(/busy|retry/i);
     await pool.destroy();
-  });
+  }, 20000);
 
   it('destroy settles outstanding calls instead of hanging', async () => {
     const pool = new QueryPool({ root: '/x', size: 1, softTimeoutMs: 10_000, createWorker: () => new FakeWorker(() => ({ hang: true })) });
@@ -180,7 +180,7 @@ describe('QueryPool', () => {
     const res = await pending; // must resolve, not hang
     expect(res.isError).toBe(true);
     expect(pool.healthy).toBe(false);
-  });
+  }, 20000);
 
   describe('destroy never terminates a worker still starting up', () => {
     // Terminating a worker while it is still loading its modules can crash the
@@ -337,6 +337,8 @@ describe('QueryPool', () => {
       expect(workers).toHaveLength(13);
       expect(pool.healthy).toBe(false);
       expect(pool.ready).toBe(false);
+      // Failed capacity remains owned until its termination promise completes.
+      await pool.destroy();
       expect(pool.liveWorkers).toBe(0);
       for (const result of await Promise.all(calls)) {
         expect(result.isError).toBe(true);
@@ -530,9 +532,10 @@ describe('MCP query pool with real projects (#1465)', () => {
     const calls = Array.from({ length: 6 }, () => pool!.run('codegraph_explore', { query: 'alphaSymbol' }));
     const workers = (pool as unknown as { workers: Set<import('worker_threads').Worker> }).workers;
     const exits = [...workers].map((worker) => new Promise<void>((resolve) => worker.once('exit', () => resolve())));
-    activeEngine.stop();
+    const stopped = activeEngine.stop();
     const results = await Promise.all(calls);
     await Promise.all(exits);
+    await stopped; // exit listeners can run before the pool's ownership cleanup
     expect(results.every((r) => r.content[0].text.includes('shutting down'))).toBe(true);
     expect(pool!.liveWorkers).toBe(0);
     expect(pool!.healthy).toBe(false);

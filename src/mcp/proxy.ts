@@ -39,7 +39,7 @@ import { ExploreSessionState } from './explore-session-state';
 import { getTelemetry, ClientInfo } from '../telemetry';
 import { installMainThreadWatchdog, WatchdogHandle } from './liveness-watchdog';
 import type { MCPEngine } from './engine';
-import { WORKER_START_SETTLE_MS } from '../worker-teardown';
+import { QUERY_CLEANUP_BOUNDS } from './query-pool';
 
 /** Default poll cadence for the PPID watchdog (same as the direct server). */
 const DEFAULT_PPID_POLL_MS = 5000;
@@ -56,11 +56,11 @@ const DEFAULT_DAEMON_RETRY_MAX_MS = 300_000;
 /**
  * Longest the proxy waits, once it is shutting down, for its in-process engines
  * to stop before exiting anyway. An engine's stop waits up to
- * {@link WORKER_START_SETTLE_MS} for a query worker still starting up (exiting
- * mid-start can crash the process on Windows); this bounds a stop that never
- * settles (#2311).
+ * the distinct startup allowance for a query worker still starting up (exiting
+ * mid-start can crash the process on Windows), after the abandoned drain and
+ * before final cleanup. These provisional v1 bounds never apply to handover.
  */
-const SHUTDOWN_BACKSTOP_MS = WORKER_START_SETTLE_MS + 5_000;
+const SHUTDOWN_BACKSTOP_MS = QUERY_CLEANUP_BOUNDS.drainMs + QUERY_CLEANUP_BOUNDS.startupMs + QUERY_CLEANUP_BOUNDS.cleanupMs;
 
 /**
  * Env var that opts INTO the "attached to shared daemon" log line. Off by
@@ -285,6 +285,7 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   // new session starts), these would otherwise hang forever; we re-serve them
   // in-process so the host always gets a reply.
   const inflight = new Map<unknown, string>();
+  const requests = new Map<unknown, { line: string; controller: AbortController; commit?: () => void }>();
   // Explore call history for the ONE host connection this proxy serves (CG-17).
   // Only the daemon-unavailable fallback below uses it; when the daemon is up,
   // the tracking happens on the daemon's own MCPSession.
@@ -292,6 +293,12 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   // Stable across local-engine retirement/handover; engine generations stay
   // per engine and request admission stays per invocation, never worker globals.
   const sessionId = randomUUID();
+  const liveLine = (line: string): boolean => {
+    try {
+      const message = JSON.parse(line) as JsonRpc;
+      return message.id === undefined || !message.method || message.method === 'initialize' || requests.get(message.id)?.line === line;
+    } catch { return true; }
+  };
   const trackInflight = (line: string): void => {
     try {
       const m = JSON.parse(line) as JsonRpc;
@@ -301,11 +308,17 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
     } catch { /* unparseable — nothing we could re-serve anyway */ }
   };
 
-  const writeClient = (obj: JsonRpc | string): void => {
-    try { process.stdout.write((typeof obj === 'string' ? obj : JSON.stringify(obj)) + '\n'); } catch { /* host gone */ }
+  const writeClient = (obj: JsonRpc | string): boolean => {
+    if (shuttingDown || process.stdout.destroyed || process.stdout.writableEnded) return false;
+    try {
+      process.stdout.write((typeof obj === 'string' ? obj : JSON.stringify(obj)) + '\n');
+      return true; // stream backpressure still means the write was accepted
+    } catch { return false; }
   };
   const shutdown = (): void => {
     if (shuttingDown) return; shuttingDown = true;
+    for (const request of requests.values()) request.controller.abort();
+    requests.clear(); inflight.clear(); pending.length = 0;
     try { livenessWatchdog?.stop(); } catch { /* ignore */ }
     if (retryTimer) clearTimeout(retryTimer);
     try { daemonSocket?.destroy(); } catch { /* ignore */ }
@@ -316,10 +329,17 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
     // until one of the two exits it.
     setTimeout(() => {
       process.stderr.write(`[CodeGraph MCP] In-process engine did not stop within ${SHUTDOWN_BACKSTOP_MS}ms; exiting anyway.\n`);
-      process.exit(0);
+      process.exit(1);
     }, SHUTDOWN_BACKSTOP_MS);
-    const stopping = [engine, ...retiring].map((e) => Promise.resolve().then(() => e?.stop()));
-    void Promise.allSettled(stopping).then(() => process.exit(0));
+    const stopping = [engine, ...retiring].map((e) => Promise.resolve().then(() => {
+      e?.cancelQuerySession?.(sessionId);
+      return e?.stop();
+    }));
+    void Promise.allSettled(stopping).then(results => {
+      const incomplete = results.filter(result => result.status === 'rejected');
+      for (const result of incomplete) process.stderr.write(`[CodeGraph MCP] Intentional cleanup incomplete: ${String(result.reason)}.\n`);
+      process.exit(incomplete.length ? 1 : 0);
+    });
   };
   // Resolves the engine a call was started on, so a call in flight while the
   // engine is being retired still finishes on it.
@@ -336,16 +356,22 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   };
   // Stop the in-process engine once the calls it is serving have answered.
   // Stopping it releases the writer lock if it held one.
-  const retireEngine = async (): Promise<void> => {
+  const retireEngine = async (): Promise<boolean> => {
     const retired = engine;
     engine = null;
     engineReady = null;
     if (retired) retiring.add(retired);
     try {
       await Promise.allSettled([...localCalls]);
-      try { await retired?.stop(); } catch { /* best-effort */ }
-    } finally {
+      if (retired) {
+        if (retired.drain) await retired.drain();
+        else await retired.stop();
+      }
       if (retired) retiring.delete(retired);
+      return true;
+    } catch (error) {
+      process.stderr.write(`[CodeGraph MCP] Fallback handover incomplete; owned engine retained: ${error instanceof Error ? error.message : String(error)}.\n`);
+      return false;
     }
   };
   // Daemon-unavailable fallback: serve a client message in-process.
@@ -359,27 +385,53 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   const serveLocally = async (line: string): Promise<void> => {
     let msg: JsonRpc; try { msg = JSON.parse(line) as JsonRpc; } catch { return; }
     const id = msg.id;
+    const request = requests.get(id);
+    if (shuttingDown || !liveLine(line) || request?.controller.signal.aborted) return;
     if (msg.method === 'tools/call' && id !== undefined) {
       try {
         const local = await ensureEngine();
+        if (shuttingDown || !liveLine(line) || request?.controller.signal.aborted) return;
         const params = (msg.params || {}) as { name: string; arguments?: Record<string, unknown> };
         const context = createQueryRequestContext(local.getQueryExecutionContext(), sessionId, id as string | number);
-        const result = await local.getToolHandler().execute(params.name, params.arguments || {}, exploreSession, context);
-        writeClient({ jsonrpc: '2.0', id, result });
+        const result = await local.getToolHandler().execute(params.name, params.arguments || {}, exploreSession, context, request ? {
+          signal: request.controller.signal, deferDelivery: commit => { request.commit = commit; },
+        } : undefined);
+        if (shuttingDown || !liveLine(line) || request?.controller.signal.aborted) return;
+        const delivered = writeClient({ jsonrpc: '2.0', id, result });
+        requests.delete(id);
+        if (!delivered) return;
+        request?.commit?.();
         getTelemetry().recordUsage('mcp_tool', params.name, !result.isError, telemetryClient);
       } catch (err) {
+        if (shuttingDown || !liveLine(line) || request?.controller.signal.aborted) return;
         writeClient({ jsonrpc: '2.0', id, error: { code: -32603, message: err instanceof Error ? err.message : String(err) } });
+        requests.delete(id);
       }
     } else if (msg.method === 'ping' && id !== undefined) {
       writeClient({ jsonrpc: '2.0', id, result: {} });
+      requests.delete(id);
     } else if (id !== undefined && msg.method !== 'initialize') {
       // A request we can't serve in-process (and the daemon is gone) — answer
       // with an error rather than let the host hang on a reply that won't come.
       writeClient({ jsonrpc: '2.0', id, error: { code: -32603, message: 'CodeGraph daemon unavailable' } });
+      requests.delete(id);
     }
     // initialize already answered locally; notifications (initialized) need no reply.
   };
   const routeToDaemon = (line: string): void => {
+    if (shuttingDown) return;
+    try {
+      const message = JSON.parse(line) as JsonRpc;
+      if (message.method === 'notifications/cancelled') {
+        const id = (message.params as { requestId?: unknown } | undefined)?.requestId;
+        requests.get(id)?.controller.abort();
+        requests.delete(id); inflight.delete(id);
+        for (let i = pending.length - 1; i >= 0; i--) if (!liveLine(pending[i]!)) pending.splice(i, 1);
+      } else if (message.id !== undefined && message.method && message.method !== 'initialize') {
+        if (requests.has(message.id)) return;
+        requests.set(message.id, { line, controller: new AbortController() });
+      }
+    } catch { /* preserve ordinary malformed-message handling */ }
     if (daemonStatus === 'ready' && daemonSocket) {
       trackInflight(line);
       if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] proxy->daemon ${line.slice(0, 80)}\n`);
@@ -473,7 +525,7 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   };
   // Every buffered call binds to the engine now, so a later retirement waits for all of them.
   const serveBufferedLocally = (): void => {
-    for (const line of pending.splice(0)) void handleLocally(line);
+    for (const line of pending.splice(0)) if (liveLine(line)) void handleLocally(line);
   };
   const scheduleDaemonRetry = (): void => {
     if (shuttingDown || retryTimer || retryBaseMs <= 0) return;
@@ -491,7 +543,7 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
     const handover = engine !== null && !engine.isReadOnly();
     if (handover) {
       daemonStatus = 'connecting';
-      await retireEngine();
+      if (!await retireEngine()) { daemonStatus = 'failed'; return; }
     }
     const socket = await connectDaemon();
     if (shuttingDown) return;
@@ -514,6 +566,7 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
     let sockBuf = '';
     socket.setEncoding('utf8');
     socket.on('data', (chunk: string) => {
+      if (shuttingDown || daemonSocket !== socket) return; // a retired attachment cannot answer a replacement
       sockBuf += chunk;
       let idx: number;
       while ((idx = sockBuf.indexOf('\n')) !== -1) {
@@ -524,10 +577,13 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
         try { resp = JSON.parse(line) as JsonRpc; } catch { /* not JSON — relay verbatim */ }
         if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] daemon->proxy ${line.slice(0, 80)}\n`);
         if (resp && resp.id !== undefined && ('result' in resp || 'error' in resp)) {
-          inflight.delete(resp.id); // answered — no longer in flight
           // Suppress the daemon's reply to the initialize we forwarded to prime it
           // (the client already got the local handshake response).
           if (clientInitId !== undefined && resp.id === clientInitId) continue;
+          const forwarded = inflight.get(resp.id);
+          if (!forwarded || !liveLine(forwarded)) continue; // cancelled/duplicate/old-generation response
+          inflight.delete(resp.id);
+          requests.delete(resp.id);
         }
         writeClient(line);
       }
@@ -547,7 +603,7 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
       );
       const orphaned = [...inflight.values()];
       inflight.clear();
-      for (const line of orphaned) void handleLocally(line);
+      for (const line of orphaned) if (liveLine(line)) void handleLocally(line);
       // A link that stayed up past the longest wait starts the backoff over; one
       // that keeps dropping right after it attaches keeps backing off.
       if (Date.now() - attachedAt >= retryMaxMs) retryDelayMs = retryBaseMs;
@@ -562,6 +618,7 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
       try { socket.write(clientInitLine + '\n'); } catch { /* close path */ }
     }
     for (const line of pending) {
+      if (!liveLine(line)) continue;
       trackInflight(line);
       if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] proxy-flush ${line.slice(0, 80)}\n`);
       try { socket.write(line + '\n'); } catch { /* ignore */ }

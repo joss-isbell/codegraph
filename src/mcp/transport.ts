@@ -77,8 +77,9 @@ export interface JsonRpcTransport {
   send(response: JsonRpcResponse): void;
   notify(method: string, params?: unknown): void;
   request(method: string, params?: unknown, timeoutMs?: number): Promise<unknown>;
-  sendResult(id: string | number, result: unknown): void;
+  sendResult(id: string | number, result: unknown): boolean | void;
   sendError(id: string | number | null, code: number, message: string, data?: unknown): void;
+  onClose?(handler: () => void): void;
 }
 
 /**
@@ -97,9 +98,24 @@ abstract class LineBasedJsonRpcTransport implements JsonRpcTransport {
   }>();
   protected nextRequestId = 1;
   protected stopped = false;
+  private closeHandlers: Array<() => void> = [];
+
+  onClose(handler: () => void): void {
+    if (this.stopped) handler();
+    else this.closeHandlers.push(handler);
+  }
+
+  protected finish(reason: string): void {
+    if (this.stopped) return;
+    this.stopped = true;
+    this.rejectPending(reason);
+    for (const handler of this.closeHandlers.splice(0)) {
+      try { handler(); } catch { /* a dead connection cannot stop shared capacity */ }
+    }
+  }
 
   abstract start(handler: MessageHandler): void;
-  protected abstract write(line: string): void;
+  protected abstract write(line: string): boolean | void;
   protected abstract idPrefix(): string;
   abstract stop(): void;
 
@@ -128,8 +144,9 @@ abstract class LineBasedJsonRpcTransport implements JsonRpcTransport {
     });
   }
 
-  send(response: JsonRpcResponse): void {
-    this.write(JSON.stringify(response));
+  send(response: JsonRpcResponse): boolean {
+    if (this.stopped) return false;
+    return this.write(JSON.stringify(response)) !== false;
   }
 
   notify(method: string, params?: unknown): void {
@@ -137,8 +154,9 @@ abstract class LineBasedJsonRpcTransport implements JsonRpcTransport {
     this.write(JSON.stringify(notification));
   }
 
-  sendResult(id: string | number, result: unknown): void {
-    this.send({ jsonrpc: '2.0', id, result });
+  sendResult(id: string | number, result: unknown): boolean {
+    if (this.stopped) return false;
+    return this.send({ jsonrpc: '2.0', id, result });
   }
 
   sendError(id: string | number | null, code: number, message: string, data?: unknown): void {
@@ -160,6 +178,7 @@ abstract class LineBasedJsonRpcTransport implements JsonRpcTransport {
    * Handle an incoming line of JSON. Both transports feed lines here.
    */
   protected async handleLine(line: string): Promise<void> {
+    if (this.stopped) return;
     const trimmed = line.trim();
     if (!trimmed) return;
 
@@ -304,6 +323,7 @@ export class StdioTransport extends LineBasedJsonRpcTransport {
     const onStreamEnd = (): void => {
       if (closed) return;
       closed = true;
+      this.finish('Stdin closed');
       try { process.stdin.destroy(); } catch { /* already gone */ }
       this.opts.onClose();
       if (this.opts.exitOnClose) {
@@ -316,16 +336,17 @@ export class StdioTransport extends LineBasedJsonRpcTransport {
 
   stop(): void {
     if (this.stopped) return;
-    this.stopped = true;
-    this.rejectPending('Transport stopped');
+    this.finish('Transport stopped');
     if (this.rl) {
       this.rl.close();
       this.rl = null;
     }
   }
 
-  protected write(line: string): void {
+  protected write(line: string): boolean {
+    if (this.stopped || process.stdout.destroyed || process.stdout.writableEnded) return false;
     process.stdout.write(line + '\n');
+    return true; // write(false) is queued backpressure, not a rejected delivery
   }
 
   protected idPrefix(): string {
@@ -343,20 +364,12 @@ export class StdioTransport extends LineBasedJsonRpcTransport {
  */
 export class SocketTransport extends LineBasedJsonRpcTransport {
   private buffer = '';
-  private closeHandlers: Array<() => void> = [];
 
   constructor(private socket: Socket, private prefix: string = 'cg-sock') {
     super();
   }
 
-  /**
-   * Register a callback fired exactly once when the socket closes (from either
-   * side). Used by the daemon to decrement its connected-clients refcount.
-   */
-  onClose(handler: () => void): void {
-    this.closeHandlers.push(handler);
-  }
-
+  /** Attach a session to the socket; inherited onClose fires once from either side. */
   start(handler: MessageHandler): void {
     this.messageHandler = handler;
 
@@ -395,8 +408,7 @@ export class SocketTransport extends LineBasedJsonRpcTransport {
 
   stop(): void {
     if (this.stopped) return;
-    this.stopped = true;
-    this.rejectPending('Transport stopped');
+    this.finish('Transport stopped');
     if (!this.socket.destroyed) {
       this.socket.end();
       this.socket.destroy();
@@ -414,10 +426,10 @@ export class SocketTransport extends LineBasedJsonRpcTransport {
     }
   }
 
-  protected write(line: string): void {
-    if (!this.socket.destroyed) {
-      this.socket.write(line + '\n');
-    }
+  protected write(line: string): boolean {
+    if (this.stopped || this.socket.destroyed || this.socket.writableEnded) return false;
+    this.socket.write(line + '\n');
+    return true;
   }
 
   protected idPrefix(): string {
@@ -425,12 +437,6 @@ export class SocketTransport extends LineBasedJsonRpcTransport {
   }
 
   private handleSocketClose(): void {
-    if (this.stopped) return;
-    this.stopped = true;
-    this.rejectPending('Socket closed');
-    for (const h of this.closeHandlers) {
-      try { h(); } catch { /* never let a close-handler take the daemon down */ }
-    }
-    this.closeHandlers = [];
+    this.finish('Socket closed');
   }
 }
