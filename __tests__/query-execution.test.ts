@@ -3,12 +3,13 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { Worker } from 'worker_threads';
+import { execFileSync } from 'child_process';
 import { CodeGraph, getDatabasePath } from '../src';
 import { createQueryExecutionContext, createQueryRequestContext, routeQueryRequest } from '../src/mcp/query-context';
-import { resolveQueryPolicy } from '../src/mcp/query-policy';
-import { QueryPool } from '../src/mcp/query-pool';
+import { resolveQueryPolicy, type QueryExecutionMode } from '../src/mcp/query-policy';
 import type { MCPEngine } from '../src/mcp/engine';
 const BuiltEngine: typeof import('../src/mcp/engine').MCPEngine = require('../dist/mcp/engine.js').MCPEngine;
+const BuiltQueryPool: typeof import('../src/mcp/query-pool').QueryPool = require('../dist/mcp/query-pool.js').QueryPool;
 
 const roots: string[] = [];
 afterEach(() => { vi.unstubAllEnvs(); for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
@@ -27,14 +28,65 @@ function message(worker: Worker, type: string): Promise<any> {
     worker.once('error', reject);
   });
 }
+async function linkedFixture(): Promise<string> {
+  const parent = await fixture('ancestorSymbol');
+  fs.writeFileSync(path.join(parent, '.gitignore'), '.codegraph*\nlinked/\n');
+  const git = (...args: string[]): void => { execFileSync('git', ['-C', parent, ...args], { stdio: 'pipe' }); };
+  git('init');
+  git('add', 'app.ts', '.gitignore');
+  git('-c', 'user.name=Query fixture', '-c', 'user.email=query@example.invalid', 'commit', '-m', 'fixture');
+  const linked = path.join(parent, 'linked');
+  git('worktree', 'add', '--detach', linked, 'HEAD');
+  fs.writeFileSync(path.join(linked, 'app.ts'), 'export function ownSymbol() { return 1; }\n');
+  const cg = await CodeGraph.init(linked);
+  try { await cg.indexAll(); } finally { cg.close(); }
+  return linked;
+}
 
 describe('real query worker context', () => {
+  it.each(['direct', 'writable-fallback', 'shared-daemon', 'read-only-fallback'] as QueryExecutionMode[])
+  ('preserves public defaults and actual execution facts through default/explicit routing in %s', async (mode) => {
+    const alpha = await fixture('alphaSymbol');
+    const beta = await fixture('betaSymbol');
+    vi.stubEnv('CODEGRAPH_QUERY_POOL_SIZE', undefined);
+    vi.stubEnv('CODEGRAPH_QUERY_MODE', 'unlimited');
+    vi.stubEnv('CODEGRAPH_QUERY_BUSY_TIMEOUT_MS', 'unlimited');
+    const readOnly = mode === 'read-only-fallback';
+    const engine: MCPEngine = new BuiltEngine({ executionMode: mode, readOnly, queryPool: true });
+    try {
+      await engine.ensureInitialized(alpha);
+      const execution = engine.getQueryExecutionContext();
+      const maximum = Math.max(1, Math.min(os.cpus().length - 1, mode === 'shared-daemon' ? 16 : 2));
+      expect(execution).toMatchObject({ capability: readOnly ? 'read-only' : 'read-write',
+        ownership: { writer: !readOnly, synchronization: !readOnly }, policy: { source: 'legacy', preset: 'default',
+          executionMode: mode, concurrency: readOnly ? { kind: 'disabled' } : { kind: 'finite', maximum },
+          deadline: readOnly ? { kind: 'inapplicable' } : { kind: 'finite', milliseconds: 45000 }, retention: 'ordinary' } });
+      if (!readOnly) {
+        const deadline = Date.now() + 10000;
+        while (engine.getQueryExecutionState().actual.dispatch !== 'worker' && Date.now() < deadline) {
+          await new Promise(resolve => setTimeout(resolve, 25));
+        }
+      }
+      for (const [requestId, projectPath, query] of [[1, undefined, 'alphaSymbol'], [2, beta, 'betaSymbol'], [3, undefined, 'alphaSymbol']] as const) {
+        const request = createQueryRequestContext(execution, `mode-${mode}`, requestId);
+        const result = await engine.getToolHandler().execute('codegraph_search', { query, ...(projectPath ? { projectPath } : {}) }, undefined, request);
+        expect(result.isError).toBeFalsy();
+        expect(result.content[0].text).toContain('app.ts:1');
+      }
+      const state = engine.getQueryExecutionState();
+      expect(state.actual).toMatchObject({ executionMode: mode, dispatch: readOnly ? 'main-thread' : 'worker',
+        concurrency: readOnly ? { kind: 'disabled' } : { kind: 'finite', maximum },
+        deadline: readOnly ? { kind: 'inapplicable' } : { kind: 'finite', milliseconds: 45000 }, retention: 'ordinary' });
+      if (readOnly) for (const root of [alpha, beta]) expect(fs.existsSync(path.join(root, '.codegraph', 'writer.pid'))).toBe(false);
+      if (process.env.VALIDATION_OUT) fs.appendFileSync(path.join(process.env.VALIDATION_OUT, 'query-execution-facts.jsonl'), JSON.stringify({ mode, alpha, beta, ...state }) + '\n');
+    } finally { await engine.stop(); }
+  }, 30000);
   it('constructs from the resolved exact policy without rereading or clamping legacy environment inputs', async () => {
     const root = await fixture();
     const execution = createQueryExecutionContext(resolveQueryPolicy({ poolSize: '23', busyTimeoutMs: 'unlimited' }, 'direct', 8), { readOnly: false, writer: true, synchronization: true });
     vi.stubEnv('CODEGRAPH_QUERY_POOL_SIZE', '0');
     vi.stubEnv('CODEGRAPH_QUERY_BUSY_TIMEOUT_MS', '1000');
-    const pool = new QueryPool({ root, execution });
+    const pool = new BuiltQueryPool({ root, execution });
     try {
       expect(pool.size).toBe(23);
       expect(pool.execution.policy.deadline).toEqual({ kind: 'absent' });
@@ -85,6 +137,48 @@ describe('real query worker context', () => {
       expect(response.result.content[0].text).toContain('betaSymbol');
       expect(response.result.content[0].text).toContain('app.ts:1');
       expect(response.context.project).toEqual({ route: 'explicit', root: beta, index: getDatabasePath(beta) });
+    } finally { await worker.terminate(); }
+  }, 30000);
+  it.each(['missing', 'invalid'] as const)('fails closed when a linked worktree admitted own index becomes %s', async (change) => {
+    const root = await linkedFixture();
+    expect(fs.statSync(path.join(root, '.git')).isFile()).toBe(true);
+    const execution = createQueryExecutionContext(resolveQueryPolicy({}, 'direct', 8), { readOnly: false, writer: true, synchronization: true });
+    const context = routeQueryRequest(createQueryRequestContext(execution, 'linked-client', 1), 'explicit', root, getDatabasePath(root));
+    // A cold worker has no own-index handle to prevent removal on Windows.
+    const worker = new Worker(path.resolve(__dirname, '../dist/mcp/query-worker.js'), { workerData: { root: null, execution } });
+    try {
+      expect((await message(worker, 'ready')).ok).toBe(true);
+      fs.rmSync(path.dirname(getDatabasePath(root)), { recursive: true });
+      if (change === 'invalid') {
+        fs.mkdirSync(path.dirname(getDatabasePath(root)));
+        fs.writeFileSync(getDatabasePath(root), 'a replacement that is not a SQLite database');
+      }
+      const result = message(worker, 'result');
+      worker.postMessage({ type: 'call', id: 1, toolName: 'codegraph_search', args: { query: 'ancestorSymbol' }, context });
+      const response = await result;
+      expect(response.result.isError).toBeFalsy();
+      expect(response.result.content[0].text).toContain('admitted');
+      expect(response.result.content[0].text).not.toContain('app.ts:1');
+      expect(response.context).toEqual(context);
+    } finally { await worker.terminate(); }
+  }, 30000);
+  it('accepts a valid replacement at the same admitted own index', async () => {
+    const root = await fixture('oldSymbol');
+    const execution = createQueryExecutionContext(resolveQueryPolicy({}, 'direct', 8), { readOnly: false, writer: true, synchronization: true });
+    const context = routeQueryRequest(createQueryRequestContext(execution, 'replacement-client', 1), 'default', root, getDatabasePath(root));
+    fs.rmSync(path.dirname(getDatabasePath(root)), { recursive: true });
+    fs.writeFileSync(path.join(root, 'app.ts'), 'export function replacementSymbol() { return 1; }\n');
+    const cg = await CodeGraph.init(root);
+    try { await cg.indexAll(); } finally { cg.close(); }
+    const worker = new Worker(path.resolve(__dirname, '../dist/mcp/query-worker.js'), { workerData: { root: null, execution } });
+    try {
+      expect((await message(worker, 'ready')).ok).toBe(true);
+      const result = message(worker, 'result');
+      worker.postMessage({ type: 'call', id: 1, toolName: 'codegraph_search', args: { query: 'replacementSymbol' }, context });
+      const response = await result;
+      expect(response.result.isError).toBeFalsy();
+      expect(response.result.content[0].text).toContain('app.ts:1');
+      expect(response.context).toEqual(context);
     } finally { await worker.terminate(); }
   }, 30000);
 });

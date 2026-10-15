@@ -313,24 +313,23 @@ describe('stopOlderDaemon', () => {
 });
 
 /**
- * A CodeGraph install of `version`: this build's dist/, hard-linked file by
- * file (copied where a link is refused), next to a package.json of that version
- * and a link to this checkout's node_modules.
+ * A CodeGraph install of `version`: an independent copy of this build's dist/,
+ * next to a package.json of that version and a link to this checkout's modules.
+ * Hard links emit metadata writes on the source files on Windows; copies keep
+ * the tested build immutable while the temporary installs come and go.
  */
 function makeInstall(version: string): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), `cg-install-${version}-`));
-  const linkTree = (from: string, to: string): void => {
+  const copyTree = (from: string, to: string): void => {
     fs.mkdirSync(to, { recursive: true });
     for (const entry of fs.readdirSync(from, { withFileTypes: true })) {
       const source = path.join(from, entry.name);
       const target = path.join(to, entry.name);
-      if (entry.isDirectory()) linkTree(source, target);
-      else {
-        try { fs.linkSync(source, target); } catch { fs.copyFileSync(source, target); }
-      }
+      if (entry.isDirectory()) copyTree(source, target);
+      else fs.copyFileSync(source, target);
     }
   };
-  linkTree(DIST, path.join(dir, 'dist'));
+  copyTree(DIST, path.join(dir, 'dist'));
   fs.symlinkSync(NODE_MODULES, path.join(dir, 'node_modules'), 'junction');
   fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: '@colbymchenry/codegraph', version }) + '\n');
   return dir;

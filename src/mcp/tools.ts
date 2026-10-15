@@ -7,9 +7,9 @@
 import type CodeGraph from '../index';
 import type { QueryPool } from './query-pool';
 import { createQueryRequestContext, routeQueryRequest, type QueryExecutionContext, type QueryRequestContext } from './query-context';
-// Keep SQLite off the handshake path; this is called only after a graph opens.
-const getDatabasePath = (root: string): string => (require('../db') as typeof import('../db')).getDatabasePath(root);
-import { findNearestCodeGraphRoot, isSameIndexRoot } from '../directory';
+import { findNearestCodeGraphRoot, getCodeGraphDir, isInitialized, isSameIndexRoot } from '../directory';
+// Path derivation does not load the heavy database module on the handshake path.
+const getDatabasePath = (root: string): string => joinPath(getCodeGraphDir(root), 'codegraph.db');
 import { WslSharedIndexError } from '../db/wsl-shared-index';
 // Lazy-load the heavy CodeGraph chain off the MCP startup path — see the same
 // helper in engine.ts. ToolHandler must load to answer tools/list (static
@@ -127,7 +127,7 @@ function wslSharedIndexGuidance(err: WslSharedIndexError): string {
 export { PathRefusalError } from '../errors';
 import { PathRefusalError } from '../errors';
 import { indexedHashInput } from '../file-limits';
-import { resolve as resolvePath, relative as relativePath } from 'path';
+import { resolve as resolvePath, relative as relativePath, join as joinPath } from 'path';
 
 /** Maximum output length to prevent context bloat (characters) */
 const MAX_OUTPUT_LENGTH = 15000;
@@ -2290,6 +2290,25 @@ export class ToolHandler {
     return cg;
   }
 
+  /** An admitted route is already resolved: never walk to an ancestor again. */
+  private getAdmittedCodeGraph(project: NonNullable<QueryRequestContext['project']>): CodeGraph {
+    let ownIndex = false;
+    try {
+      ownIndex = realpathSync(project.root) === project.root
+        && realpathSync(getDatabasePath(project.root)) === project.index
+        && isInitialized(project.root);
+    } catch { /* Missing or inaccessible own index is recoverable, never an ancestor route. */ }
+    if (!ownIndex) {
+      throw new NotIndexedError(
+        `The admitted project at ${project.root} no longer has its verified own codegraph index. ` +
+        'This call cannot use an ancestor index instead. Retry after its own index is available; ' +
+        'otherwise use your built-in tools (Read/Grep/Glob) for this project.'
+      );
+    }
+    // Same-root valid database replacement retains the ordinary reopen behavior.
+    return this.openProjectRoot(project.root, project.root);
+  }
+
   /**
    * The open CodeGraph for an index root the up-walk resolved: the default
    * instance, a cached one, or a newly opened (and cached) one.
@@ -2816,7 +2835,7 @@ export class ToolHandler {
       // need an explicit root on the worker wire without becoming explicit calls.
       const request = requestContext ?? (this.execution ? createQueryRequestContext(this.execution, 'untracked', 'untracked') : undefined);
       const context = request ? routeQueryRequest(request, typeof pathCheck === 'string' ? 'explicit' : 'default',
-        project.getProjectRoot(), getDatabasePath(project.getProjectRoot())) : undefined;
+        project.getProjectRoot(), realpathSync(getDatabasePath(project.getProjectRoot()))) : undefined;
       // Recover a watcher disabled by prolonged lock contention on the next call.
       // The stale banner remains until the watcher finishes its full scan;
       // frequent calls cannot bypass its cooldown (#1959).
@@ -2992,10 +3011,8 @@ export class ToolHandler {
       if (context && this.execution && context.execution.generation !== this.execution.generation) {
         throw new Error('Query request belongs to a different engine generation.');
       }
-      if (context?.project && getDatabasePath(context.project.root) !== context.project.index) {
-        throw new Error('Query request index route changed after admission.');
-      }
-      return await this.dispatchTool(toolName, context?.project ? { ...args, projectPath: context.project.root } : args);
+      const admitted = context?.project ? this.getAdmittedCodeGraph(context.project) : undefined;
+      return await this.dispatchTool(toolName, context?.project ? { ...args, projectPath: context.project.root } : args, admitted);
     } catch (err) {
       if (err instanceof NotIndexedError) {
         return this.textResult(err.message);
@@ -3020,15 +3037,15 @@ export class ToolHandler {
    * on the main thread in {@link execute} and never reaches here. May throw
    * NotIndexed/PathRefusal, which {@link executeReadTool} classifies.
    */
-  private async dispatchTool(toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
+  private async dispatchTool(toolName: string, args: Record<string, unknown>, admitted?: CodeGraph): Promise<ToolResult> {
     switch (toolName) {
-      case 'codegraph_search': return await this.handleSearch(args);
-      case 'codegraph_callers': return await this.handleCallers(args);
-      case 'codegraph_callees': return await this.handleCallees(args);
-      case 'codegraph_impact': return await this.handleImpact(args);
-      case 'codegraph_explore': return await this.handleExplore(args);
-      case 'codegraph_node': return await this.handleNode(args);
-      case 'codegraph_files': return await this.handleFiles(args);
+      case 'codegraph_search': return await this.handleSearch(args, admitted);
+      case 'codegraph_callers': return await this.handleCallers(args, admitted);
+      case 'codegraph_callees': return await this.handleCallees(args, admitted);
+      case 'codegraph_impact': return await this.handleImpact(args, admitted);
+      case 'codegraph_explore': return await this.handleExplore(args, admitted);
+      case 'codegraph_node': return await this.handleNode(args, admitted);
+      case 'codegraph_files': return await this.handleFiles(args, admitted);
       default: return this.errorResult(`Unknown tool: ${toolName}`);
     }
   }
@@ -3036,11 +3053,11 @@ export class ToolHandler {
   /**
    * Handle codegraph_search
    */
-  private async handleSearch(args: Record<string, unknown>): Promise<ToolResult> {
+  private async handleSearch(args: Record<string, unknown>, admitted?: CodeGraph): Promise<ToolResult> {
     const query = this.validateString(args.query, 'query');
     if (typeof query !== 'string') return query;
 
-    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const cg = admitted ?? this.getCodeGraph(args.projectPath as string | undefined);
     const rawKind = args.kind as string | undefined;
     // The schema enum says 'type' (what agents naturally reach for); the
     // NodeKind is 'type_alias'. Without the mapping, kind: "type" silently
@@ -3096,11 +3113,11 @@ export class ToolHandler {
   /**
    * Handle codegraph_callers
    */
-  private async handleCallers(args: Record<string, unknown>): Promise<ToolResult> {
+  private async handleCallers(args: Record<string, unknown>, admitted?: CodeGraph): Promise<ToolResult> {
     const symbol = this.validateString(args.symbol, 'symbol');
     if (typeof symbol !== 'string') return symbol;
 
-    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const cg = admitted ?? this.getCodeGraph(args.projectPath as string | undefined);
     const limit = clamp((args.limit as number) || 20, 1, 100);
     const fileFilter = typeof args.file === 'string' ? args.file : undefined;
 
@@ -3179,11 +3196,11 @@ export class ToolHandler {
   /**
    * Handle codegraph_callees
    */
-  private async handleCallees(args: Record<string, unknown>): Promise<ToolResult> {
+  private async handleCallees(args: Record<string, unknown>, admitted?: CodeGraph): Promise<ToolResult> {
     const symbol = this.validateString(args.symbol, 'symbol');
     if (typeof symbol !== 'string') return symbol;
 
-    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const cg = admitted ?? this.getCodeGraph(args.projectPath as string | undefined);
     const limit = clamp((args.limit as number) || 20, 1, 100);
     const fileFilter = typeof args.file === 'string' ? args.file : undefined;
 
@@ -3259,11 +3276,11 @@ export class ToolHandler {
   /**
    * Handle codegraph_impact
    */
-  private async handleImpact(args: Record<string, unknown>): Promise<ToolResult> {
+  private async handleImpact(args: Record<string, unknown>, admitted?: CodeGraph): Promise<ToolResult> {
     const symbol = this.validateString(args.symbol, 'symbol');
     if (typeof symbol !== 'string') return symbol;
 
-    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const cg = admitted ?? this.getCodeGraph(args.projectPath as string | undefined);
     const depth = clamp((args.depth as number) || 2, 1, 10);
     const fileFilter = typeof args.file === 'string' ? args.file : undefined;
 
@@ -4012,14 +4029,14 @@ export class ToolHandler {
    * `getExploreOutputBudget` — see #185 for why a fixed 35k cap was a
    * tax on small projects while earning its keep on large ones.
    */
-  private async handleExplore(args: Record<string, unknown>): Promise<ToolResult> {
+  private async handleExplore(args: Record<string, unknown>, admitted?: CodeGraph): Promise<ToolResult> {
     const rawQuery = this.validateString(args.query, 'query');
     if (typeof rawQuery !== 'string') return rawQuery;
     // One normalization point so the flow-builder, relevance search, and
     // ranking all see the same canonical spelling (Erlang `mod:fn/arity`).
     const query = normalizeQuerySpelling(rawQuery);
 
-    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const cg = admitted ?? this.getCodeGraph(args.projectPath as string | undefined);
     const projectRoot = cg.getProjectRoot();
 
     // Resolve adaptive output budget from project size. Falls back to the
@@ -7537,8 +7554,8 @@ export class ToolHandler {
   /**
    * Handle codegraph_node
    */
-  private async handleNode(args: Record<string, unknown>): Promise<ToolResult> {
-    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+  private async handleNode(args: Record<string, unknown>, admitted?: CodeGraph): Promise<ToolResult> {
+    const cg = admitted ?? this.getCodeGraph(args.projectPath as string | undefined);
     // Default to false to minimize context usage
     const includeCode = args.includeCode === true;
     const fileHint = typeof args.file === 'string' && args.file.trim() ? args.file.trim() : undefined;
@@ -8105,8 +8122,8 @@ export class ToolHandler {
   /**
    * Handle codegraph_files - get project file structure from the index
    */
-  private async handleFiles(args: Record<string, unknown>): Promise<ToolResult> {
-    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+  private async handleFiles(args: Record<string, unknown>, admitted?: CodeGraph): Promise<ToolResult> {
+    const cg = admitted ?? this.getCodeGraph(args.projectPath as string | undefined);
     const pathFilter = args.path as string | undefined;
     const pattern = args.pattern as string | undefined;
     const format = (args.format as 'tree' | 'flat' | 'grouped') || 'tree';

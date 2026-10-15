@@ -55,8 +55,12 @@ behavior are unchanged. No installation or live service is changed.
   root/index plus `default`/`explicit` origin. Worker-wire `projectPath` does not
   change that origin. Queued jobs retain the context across retries. The worker
   freezes its cloned context, verifies engine generation, and executes against
-  the admitted project rather than reinterpreting a mutable wire path. A changed
-  index route fails closed. Responses carry context only on the internal worker
+  the admitted project rather than reinterpreting a mutable wire path. Every
+  read handler receives the verified own-root connection directly, without
+  another nearest-index walk. Missing/invalid own indexes or a changed canonical
+  root/index fail closed with recoverable guidance, including linked worktrees
+  beneath an indexed ancestor. A valid replacement at the same own index keeps
+  the existing reopen behavior. Responses carry context only on the internal worker
   envelope; MCP results expose no request/session/ownership side channel.
 - Workers receive read-only capability for Issue #11's enforced read-only opener.
   This ticket does not enable public read-only pooling or change existing worker
