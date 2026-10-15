@@ -23,9 +23,12 @@
 
 import { parentPort, workerData } from 'worker_threads';
 import type { ToolResult } from './tools';
+import type { QueryExecutionContext, QueryRequestContext } from './query-context';
+import { immutable } from './query-policy';
 
 interface WorkerInit {
   root: string | null;
+  execution?: QueryExecutionContext;
 }
 
 interface CallMessage {
@@ -33,6 +36,7 @@ interface CallMessage {
   id: number;
   toolName: string;
   args: Record<string, unknown>;
+  context?: QueryRequestContext;
 }
 
 // Mirror the engine's lazy-require of the heavy CodeGraph + tools chain. This
@@ -44,7 +48,7 @@ const loadToolHandler = (): typeof import('./tools').ToolHandler =>
 
 if (parentPort) {
   const port = parentPort;
-  const { root } = workerData as WorkerInit;
+  const { root, execution } = immutable(workerData as WorkerInit);
 
   // Open the default project's READ connection once, if present. Other repos are
   // opened lazily on first cross-project (projectPath) call by the ToolHandler's
@@ -54,7 +58,7 @@ if (parentPort) {
   let initError: string | null = null;
   try {
     const cg = root ? loadCodeGraph().openSync(root) : null;
-    handler = new (loadToolHandler())(cg);
+    handler = new (loadToolHandler())(cg, execution);
   } catch (err) {
     initError = err instanceof Error ? err.message : String(err);
   }
@@ -69,6 +73,7 @@ if (parentPort) {
   });
 
   const serve = async (msg: CallMessage): Promise<void> => {
+    const context = msg.context ? immutable(msg.context) : undefined;
     // Test-only crash hook so the pool's worker-recovery path is exercisable
     // deterministically. Gated behind an env flag only the suite sets — inert in
     // normal operation (and `__test_crash__` isn't a real tool name anyway).
@@ -79,6 +84,7 @@ if (parentPort) {
       port.postMessage({
         type: 'result',
         id: msg.id,
+        context,
         result: errorResult(`codegraph worker could not open the project: ${initError}`),
       });
       return;
@@ -86,12 +92,13 @@ if (parentPort) {
     try {
       // executeReadTool already classifies NotIndexed/PathRefusal/internal errors
       // into a ToolResult and never throws — the catch is belt-and-suspenders.
-      const result: ToolResult = await handler.executeReadTool(msg.toolName, msg.args);
-      port.postMessage({ type: 'result', id: msg.id, result });
+      const result: ToolResult = await handler.executeReadTool(msg.toolName, msg.args, context);
+      port.postMessage({ type: 'result', id: msg.id, result, context });
     } catch (err) {
       port.postMessage({
         type: 'result',
         id: msg.id,
+        context,
         result: errorResult(err instanceof Error ? err.message : String(err)),
       });
     }

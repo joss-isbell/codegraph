@@ -17,7 +17,9 @@ import { resolveServerRoot } from '../directory';
 import { ToolHandler } from './tools';
 import { WslSharedIndexError } from '../db/wsl-shared-index';
 import { assertNoRebuild, releaseWriterLock, tryAcquireWriterLock, writerLockHeldMessage } from './writer-lock';
-import { QueryPool, resolvePoolSize } from './query-pool';
+import { QueryPool } from './query-pool';
+import { immutable, requestedQueryPolicy, resolveLegacyQueryPolicy, type QueryExecutionMode, type ResolvedQueryPolicy } from './query-policy';
+import { createQueryExecutionContext, type QueryExecutionContext } from './query-context';
 import { endFreshnessMeasurements } from './index-freshness';
 import { acquireProject, ProjectLease } from './project-lifecycle';
 
@@ -34,6 +36,9 @@ const loadCodeGraph = (): typeof import('../index').default =>
 const RETRY_SUBSCAN_TTL_MS = 5_000;
 
 export interface MCPEngineOptions {
+  /** Internal common boundary. Public callers continue to use the legacy adapter. */
+  queryPolicy?: ResolvedQueryPolicy;
+  executionMode?: QueryExecutionMode;
   /** Serve existing index contents without syncing, watching, or claiming a writer slot. */
   readOnly?: boolean;
   /**
@@ -86,7 +91,8 @@ export class MCPEngine {
   // Retained synchronization ownership for each cached explicit project.
   private explicitProjects = new Map<CodeGraph, ProjectLease>();
   private defaultLease: ProjectLease | null = null;
-  private opts: Required<Omit<MCPEngineOptions, 'writerLockRoot' | 'queryPoolDefaultMax'>> & Pick<MCPEngineOptions, 'queryPoolDefaultMax'>;
+  private opts: Required<Pick<MCPEngineOptions, 'readOnly' | 'watch' | 'queryPool'>>;
+  private readonly execution: QueryExecutionContext;
   private closed = false;
   private stopPromise: Promise<void> | null = null;
   // Off-loop read-tool pool. Workers each hold their own WAL read connections;
@@ -94,8 +100,15 @@ export class MCPEngine {
   private queryPool: QueryPool | null = null;
 
   constructor(opts: MCPEngineOptions = {}) {
-    this.opts = { readOnly: opts.readOnly ?? false, watch: opts.watch ?? true, queryPool: opts.queryPool ?? false, queryPoolDefaultMax: opts.queryPoolDefaultMax };
-    this.toolHandler = new ToolHandler(null);
+    const mode = opts.executionMode ?? opts.queryPolicy?.executionMode ?? (opts.readOnly ? 'read-only-fallback' : 'shared-daemon');
+    this.opts = { readOnly: opts.readOnly ?? mode === 'read-only-fallback', watch: opts.watch ?? true, queryPool: opts.queryPool ?? false };
+    if ((opts.queryPolicy && opts.queryPolicy.executionMode !== mode) || (mode === 'read-only-fallback') !== this.opts.readOnly) {
+      throw new Error('Query policy execution mode and engine capability must agree.');
+    }
+    const policy = opts.queryPolicy ?? resolveLegacyQueryPolicy(requestedQueryPolicy(process.env), mode, os.cpus().length,
+      { poolEnabled: this.opts.queryPool, defaultMaximum: opts.queryPoolDefaultMax });
+    this.execution = createQueryExecutionContext(policy, { readOnly: this.opts.readOnly, writer: !this.opts.readOnly, synchronization: !this.opts.readOnly });
+    this.toolHandler = new ToolHandler(null, this.execution);
     this.toolHandler.setProjectLifecycle({
       open: (root, open) => {
         // Explicit projects and read-only fallbacks also hold SQLite handles.
@@ -137,18 +150,15 @@ export class MCPEngine {
    */
   private maybeStartPool(root: string | null): void {
     if (this.opts.readOnly || !this.opts.queryPool || this.queryPool || this.closed) return;
-    const envSize = process.env.CODEGRAPH_QUERY_POOL_SIZE;
-    let size = resolvePoolSize(envSize, os.cpus().length);
-    if ((envSize === undefined || envSize === '') && this.opts.queryPoolDefaultMax !== undefined) {
-      size = Math.min(size, this.opts.queryPoolDefaultMax);
-    }
-    if (size <= 0) {
+    const concurrency = this.execution.policy.concurrency;
+    if (concurrency.kind === 'disabled') {
       process.stderr.write('[CodeGraph MCP] Query pool disabled (CODEGRAPH_QUERY_POOL_SIZE=0); serving reads in-process.\n');
       return;
     }
     try {
-      this.queryPool = new QueryPool({ root, size });
+      this.queryPool = new QueryPool({ root, execution: this.execution });
       this.toolHandler.setQueryPool(this.queryPool);
+      const size = concurrency.kind === 'finite' ? concurrency.maximum : 'unlimited';
       process.stderr.write(`[CodeGraph MCP] Query pool: up to ${size} worker thread(s) for concurrent reads.\n`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -171,6 +181,24 @@ export class MCPEngine {
   /** Whether this engine only reads: no watcher, no sync, no writer slot. */
   isReadOnly(): boolean {
     return this.opts.readOnly;
+  }
+
+  /** Internal resolved request, capability and ownership identity; no public diagnostic claim. */
+  getQueryExecutionContext(): QueryExecutionContext { return this.execution; }
+
+  /** Internal construction facts for later diagnostics; resolution is not uptake. */
+  getQueryExecutionState() {
+    const pool = this.queryPool;
+    const pooled = !!(pool?.healthy && pool.ready);
+    return immutable({ execution: this.execution, actual: {
+      executionMode: this.execution.policy.executionMode,
+      dispatch: pooled ? 'worker' as const : 'main-thread' as const,
+      concurrency: pooled ? this.execution.policy.concurrency : { kind: 'disabled' as const },
+      deadline: pooled ? this.execution.policy.deadline : { kind: 'inapplicable' as const },
+      // Retirement is represented in the resolved contract; lifecycle #14
+      // implements it. Do not claim the requested behavior is already active.
+      retention: 'ordinary' as const, workers: pool?.liveWorkers ?? 0,
+    } });
   }
 
   /** Project root that the engine resolved on first init (null if none). */

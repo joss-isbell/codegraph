@@ -482,6 +482,78 @@ describe('Shared MCP daemon (issue #411)', () => {
     }
   }, 30000);
 
+  it.each(['direct', 'shared-daemon', 'writable-fallback', 'read-only-fallback'] as const)
+  ('preserves default and explicit project results and session history in %s (#9)', async (mode) => {
+    fs.writeFileSync(path.join(tempDir, 'app.ts'), 'export function alphaPolicySymbol() { return 42; }\n');
+    const alpha = await CodeGraph.open(tempDir);
+    try { await alpha.indexAll(); } finally { alpha.close(); }
+    const beta = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-policy-beta-')));
+    fs.writeFileSync(path.join(beta, 'app.ts'), 'export function betaPolicySymbol() { return 24; }\n');
+    const betaGraph = await CodeGraph.init(beta);
+    try { await betaGraph.indexAll(); } finally { betaGraph.close(); }
+    const beforeAlpha = fs.readFileSync(path.join(realRoot, '.codegraph', 'codegraph.db'));
+    const beforeBeta = fs.readFileSync(path.join(beta, '.codegraph', 'codegraph.db'));
+    const diagnostic = path.join(tempDir, '.policy-session-history.jsonl');
+    let miniServer: net.Server | undefined;
+    if (mode.endsWith('fallback')) {
+      const socketPath = getDaemonSocketPath(realRoot);
+      miniServer = net.createServer(socket => socket.end(JSON.stringify({ codegraph: '0.0.0-mismatch', pid: process.pid, socketPath, protocol: 1 }) + '\n'));
+      await new Promise<void>(resolve => miniServer!.listen(socketPath, resolve));
+      if (mode === 'read-only-fallback') {
+        fs.writeFileSync(path.join(realRoot, '.codegraph', 'daemon.pid'), JSON.stringify({ pid: process.pid, version: '0.0.0-mismatch', socketPath, startedAt: Date.now() }));
+        fs.writeFileSync(path.join(realRoot, '.codegraph', 'writer.pid'), JSON.stringify({ pid: process.pid, mode: 'daemon', startedAt: Date.now() }));
+      }
+    }
+    try {
+      const server = spawnServer(tempDir, {
+        CODEGRAPH_NO_DAEMON: mode === 'direct' ? '1' : '0', CODEGRAPH_QUERY_MODE: 'unlimited',
+        CODEGRAPH_QUERY_BUSY_TIMEOUT_MS: 'unlimited', CODEGRAPH_QUERY_POOL_SIZE: '2',
+        CODEGRAPH_MCP_TOOLS: 'explore,node,search,callers,callees,impact,files,status',
+        CODEGRAPH_EXPLORE_DEBUG: diagnostic, CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '1000',
+      }, ['--path', tempDir]);
+      servers.push(server);
+      sendInitialize(server.child, `file://${tempDir}`, 1);
+      expect((await waitFor(() => findResponse(server.stdout, 1), 10000)).result.serverInfo.name).toBe('codegraph');
+      sendMessage(server.child, { jsonrpc: '2.0', id: 2, method: 'tools/list' });
+      const listed = await waitFor(() => findResponse(server.stdout, 2), 10000);
+      // Direct sessions already opened this tiny fixture and retain the existing
+      // three-tool gate; proxies answer the static configured surface locally.
+      const expectedTools = mode === 'direct' ? ['codegraph_explore', 'codegraph_node', 'codegraph_search'] : [
+        'codegraph_explore', 'codegraph_node', 'codegraph_search', 'codegraph_callers', 'codegraph_callees', 'codegraph_impact', 'codegraph_files', 'codegraph_status',
+      ];
+      expect(listed.result.tools.map((tool: any) => tool.name).sort()).toEqual(expectedTools.sort());
+      for (const [id, projectPath, symbol] of [[3, undefined, 'alphaPolicySymbol'], [4, beta, 'betaPolicySymbol'], [5, undefined, 'alphaPolicySymbol']] as const) {
+        sendMessage(server.child, { jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'codegraph_explore', arguments: { query: symbol, ...(projectPath ? { projectPath } : {}) } } });
+        const reply = await waitFor(() => findResponse(server.stdout, id), 15000);
+        expect(reply.error).toBeUndefined();
+        expect(reply.result.isError).toBeFalsy();
+        expect(reply.result.content[0].text).toContain(`function ${symbol}`);
+        expect(reply.result).not.toHaveProperty('_cgExploreEmission');
+        expect(reply.result).not.toHaveProperty('context');
+      }
+      const reports = fs.readFileSync(diagnostic, 'utf8').trim().split(/\r?\n/).map(line => JSON.parse(line));
+      expect(reports.map(report => report.session.callIndex)).toEqual([1, 1, 2]);
+      expect(reports[2].session.priorCalls).toBe(1);
+      expect(reports[2].session.priorFiles.length).toBeGreaterThan(0);
+      const daemonPid = mode === 'shared-daemon' ? readLockPid(realRoot) : null;
+      const exited = once(server.child, 'exit');
+      server.child.stdin.end();
+      await exited;
+      if (daemonPid) expect(await waitProcessExit(daemonPid, 10000)).toBe(true);
+      if (mode === 'read-only-fallback') {
+        expect(server.stderr.some(line => line.includes('Serving reads in-process without auto-sync:'))).toBe(true);
+        expect(server.stderr.some(line => line.includes('Query pool:'))).toBe(false);
+        expect(fs.readFileSync(path.join(realRoot, '.codegraph', 'codegraph.db'))).toEqual(beforeAlpha);
+        expect(fs.readFileSync(path.join(beta, '.codegraph', 'codegraph.db'))).toEqual(beforeBeta);
+        expect(readLockPid(realRoot)).toBe(process.pid);
+      }
+      expect(server.stderr.some(line => line.includes('up to unlimited'))).toBe(false);
+    } finally {
+      if (miniServer) await new Promise<void>(resolve => miniServer!.close(() => resolve()));
+      await fs.promises.rm(beta, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    }
+  }, 45000);
+
   it('clears a stale (dead-pid) lockfile and a fresh daemon takes over', async () => {
     // Plant a lockfile pointing at a definitely-dead pid + the real socket path.
     fs.writeFileSync(

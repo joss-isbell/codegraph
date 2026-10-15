@@ -27,6 +27,8 @@ import { Worker } from 'worker_threads';
 import * as path from 'path';
 import * as os from 'os';
 import type { ToolResult } from './tools';
+import { createQueryExecutionContext, type QueryExecutionContext, type QueryRequestContext } from './query-context';
+import { requestedQueryPolicy, resolveLegacyQueryPolicy, resolveLegacyPoolSize } from './query-policy';
 
 /** Compiled sibling — `query-worker.js` lives next to this file in `dist/mcp/`. */
 const WORKER_FILE = path.join(__dirname, 'query-worker.js');
@@ -46,11 +48,6 @@ export interface PoolWorker {
 }
 
 /** Default linger before a queued call is answered with busy-guidance. */
-const DEFAULT_BUSY_TIMEOUT_MS = 45_000; // < the ~60s MCP client request timeout
-
-/** Hard ceiling on pool size regardless of core count / env. */
-const MAX_POOL_SIZE = 16;
-
 /**
  * Total worker deaths before the pool declares itself unhealthy and the caller
  * reverts to in-process dispatch. High enough to ride out a few transient
@@ -92,6 +89,7 @@ interface Job {
   id: number;
   toolName: string;
   args: Record<string, unknown>;
+  context?: QueryRequestContext;
   resolve: (r: ToolResult) => void;
   retries: number;
   settled: boolean;
@@ -100,6 +98,8 @@ interface Job {
 }
 
 export interface QueryPoolOptions {
+  /** Engine-resolved immutable policy/authority; bypasses every legacy env parser. */
+  execution?: QueryExecutionContext;
   /** Default project root each worker opens at spawn, or null for per-call projects. */
   root: string | null;
   /** Max worker threads. Defaults to `clamp(cores-1, 1, 16)`. */
@@ -122,20 +122,7 @@ export interface QueryPoolOptions {
  * frees the transport and lets responses flush incrementally.
  */
 export function resolvePoolSize(envVal: string | undefined, cpuCount: number): number {
-  if (envVal !== undefined && envVal !== '') {
-    const n = Number(envVal);
-    if (Number.isFinite(n) && n >= 0) return Math.min(Math.floor(n), MAX_POOL_SIZE);
-    // non-numeric / negative → fall through to the default
-  }
-  return Math.max(1, Math.min(cpuCount - 1, MAX_POOL_SIZE));
-}
-
-function resolveBusyTimeoutMs(): number {
-  const raw = process.env.CODEGRAPH_QUERY_BUSY_TIMEOUT_MS;
-  if (raw === undefined || raw === '') return DEFAULT_BUSY_TIMEOUT_MS;
-  const n = Number(raw);
-  if (!Number.isFinite(n) || n < 1000) return DEFAULT_BUSY_TIMEOUT_MS;
-  return Math.floor(n);
+  return resolveLegacyPoolSize(envVal, cpuCount);
 }
 
 /** Success-shaped overload guidance (NEVER isError — see the abandonment rule). */
@@ -172,17 +159,26 @@ export class QueryPool {
   private destroyed = false;
   private readonly root: string | null;
   private readonly maxSize: number;
-  private readonly softTimeoutMs: number;
+  private readonly softTimeoutMs: number | null;
+  readonly execution: QueryExecutionContext;
   private readonly maxRetries: number;
   private readonly createWorker: () => PoolWorker;
   private readonly startSettleMs: number;
 
   constructor(opts: QueryPoolOptions) {
     this.root = opts.root;
-    this.maxSize = Math.max(1, Math.min(opts.size ?? Math.max(1, os.cpus().length - 1), MAX_POOL_SIZE));
-    this.softTimeoutMs = opts.softTimeoutMs ?? resolveBusyTimeoutMs();
+    // Standalone legacy callers retain the old parser and constructor cap.
+    // Engine callers always supply one already-resolved context; no env reread.
+    this.execution = opts.execution ?? createQueryExecutionContext(resolveLegacyQueryPolicy({ ...requestedQueryPolicy(process.env),
+      poolSize: String(Math.max(1, Math.min(opts.size ?? Math.max(1, os.cpus().length - 1), 16))),
+      ...(opts.softTimeoutMs !== undefined ? { busyTimeoutMs: String(opts.softTimeoutMs) } : {}),
+    }, 'shared-daemon', os.cpus().length), { readOnly: false, writer: false, synchronization: false });
+    const { concurrency, deadline } = this.execution.policy;
+    if (concurrency.kind === 'disabled') throw new Error('Disabled query policy must execute on the main thread, without a QueryPool.');
+    this.maxSize = concurrency.kind === 'finite' ? concurrency.maximum : Infinity;
+    this.softTimeoutMs = opts.execution ? (deadline.kind === 'finite' ? deadline.milliseconds : null) : opts.softTimeoutMs ?? (deadline.kind === 'finite' ? deadline.milliseconds : null);
     this.maxRetries = opts.maxRetries ?? 1;
-    this.createWorker = opts.createWorker ?? (() => new Worker(WORKER_FILE, { workerData: { root: this.root } }));
+    this.createWorker = opts.createWorker ?? (() => new Worker(WORKER_FILE, { workerData: { root: this.root, execution: this.execution } }));
     this.startSettleMs = opts.startSettleMs ?? WORKER_START_SETTLE_MS;
     this.spawnOne(); // one eager warm worker, ready for the first call
   }
@@ -306,7 +302,7 @@ export class QueryPool {
       if (!job || job.settled) break;
       const w = this.idle.pop()!;
       this.inflight.set(w, job);
-      w.postMessage({ type: 'call', id: job.id, toolName: job.toolName, args: job.args });
+      w.postMessage({ type: 'call', id: job.id, toolName: job.toolName, args: job.args, context: job.context });
     }
   }
 
@@ -318,19 +314,21 @@ export class QueryPool {
   }
 
   /** Run a read tool on the pool. Always resolves (never rejects). */
-  run(toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
+  run(toolName: string, args: Record<string, unknown>, context?: QueryRequestContext): Promise<ToolResult> {
     return new Promise<ToolResult>((resolve) => {
       const job: Job = {
-        id: this.nextId++, toolName, args, resolve,
+        id: this.nextId++, toolName, args, context, resolve,
         retries: 0, settled: false, enqueuedAt: Date.now(),
       };
       // Don't let the caller wait past softTimeoutMs. The worker may still be
       // busy (we can't cancel synchronous CPU), but the CLIENT gets a prompt,
       // success-shaped "retry" instead of a hard timeout.
-      job.softTimer = setTimeout(() => {
-        if (!job.settled) this.settle(job, busyGuidance(Date.now() - job.enqueuedAt));
-      }, this.softTimeoutMs);
-      job.softTimer.unref?.();
+      if (this.softTimeoutMs !== null) {
+        job.softTimer = setTimeout(() => {
+          if (!job.settled) this.settle(job, busyGuidance(Date.now() - job.enqueuedAt));
+        }, this.softTimeoutMs);
+        job.softTimer.unref?.();
+      }
       this.queue.push(job);
       this.drain();
     });

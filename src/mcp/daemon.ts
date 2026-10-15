@@ -181,6 +181,8 @@ export interface DaemonHello {
  * client's first JSON-RPC message.
  */
 export interface DaemonClientHello {
+  /** Prospective shared-mode resolution; compatibility enforcement waits for #16. */
+  queryPolicy?: import('./query-policy').ResolvedQueryPolicy;
   codegraph_client: 1;
   pid: number;             // the proxy process's own pid
   hostPid: number | null;  // the MCP host pid (past any launcher shim), if known
@@ -239,7 +241,7 @@ export class Daemon {
     // serialize and starve the MCP transport (clients time out). Direct mode
     // (one stdio client) leaves the pool off; `CODEGRAPH_QUERY_POOL_SIZE=0`
     // disables it here too.
-    this.engine = new MCPEngine({ queryPool: true });
+    this.engine = new MCPEngine({ queryPool: true, executionMode: 'shared-daemon' });
     this.engine.setProjectPathHint(projectRoot);
   }
 

@@ -13,6 +13,8 @@
  */
 
 import * as path from 'path';
+import { randomUUID } from 'crypto';
+import { createQueryRequestContext } from './query-context';
 import { JsonRpcRequest, JsonRpcNotification, JsonRpcTransport, ErrorCodes } from './transport';
 import { MCPEngine } from './engine';
 import { tools } from './tools';
@@ -120,6 +122,7 @@ export class MCPSession {
    * the session — a reconnecting client starts clean.
    */
   private readonly exploreSession = new ExploreSessionState();
+  private readonly sessionId = randomUUID();
 
   constructor(
     private transport: JsonRpcTransport,
@@ -295,6 +298,7 @@ export class MCPSession {
 
     const toolName = params.name;
     const toolArgs = params.arguments || {};
+    const context = createQueryRequestContext(this.engine.getQueryExecutionContext(), this.sessionId, request.id);
 
     const tool = tools.find((t) => t.name === toolName);
     if (!tool) {
@@ -310,7 +314,7 @@ export class MCPSession {
     await this.retryInitIfNeeded();
 
     if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] toolsCall ${toolName} id=${String(request.id)} dispatch\n`);
-    const result = await this.engine.getToolHandler().execute(toolName, toolArgs, this.exploreSession);
+    const result = await this.engine.getToolHandler().execute(toolName, toolArgs, this.exploreSession, context);
     if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] toolsCall ${toolName} id=${String(request.id)} done\n`);
     this.transport.sendResult(request.id, result);
     // After the reply is on the wire — telemetry must never delay a tool
