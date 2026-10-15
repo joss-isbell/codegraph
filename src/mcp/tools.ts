@@ -2349,7 +2349,7 @@ export class ToolHandler {
       }
     }
 
-    const open = () => loadCodeGraph().openSync(canonicalRoot);
+    const open = () => loadCodeGraph().openSync(canonicalRoot, { readOnly: this.execution?.capability === 'read-only' });
     const cg = this.projectLifecycle?.open(canonicalRoot, open) ?? open();
     this.projectCache.set(canonicalRoot, cg);
     this.projectUsedAt.set(canonicalRoot, Date.now());
@@ -3009,7 +3009,7 @@ export class ToolHandler {
   async executeReadTool(toolName: string, args: Record<string, unknown>, context?: QueryRequestContext): Promise<ToolResult> {
     try {
       // Context is an internal argument, never accepted from MCP tool arguments.
-      // Opening enforcement for read-only pooling follows in #11.
+      // All opens use the engine capability, including a worker's lazy projects.
       if (context && this.execution && context.execution.generation !== this.execution.generation) {
         throw new Error('Query request belongs to a different engine generation.');
       }

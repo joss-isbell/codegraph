@@ -113,8 +113,8 @@ const HANDOVER_CANDIDATE_WAIT_MS = 5_000;
  * the same as a healthy one in the logs.
  */
 function readOnlyFallback(holder: string): MCPEngine {
-  process.stderr.write(`[CodeGraph MCP] Serving reads in-process without auto-sync: ${holder}.\n`);
-  return new MCPEngine({ readOnly: true, executionMode: 'read-only-fallback' });
+  process.stderr.write(`[CodeGraph MCP] Serving reads in-process without auto-sync: ${holder}; local read-only fallback resources are not shared across chats.\n`);
+  return new MCPEngine({ readOnly: true, queryPool: true, executionMode: 'read-only-fallback' });
 }
 
 /**
