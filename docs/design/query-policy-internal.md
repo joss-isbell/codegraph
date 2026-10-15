@@ -72,8 +72,6 @@ behavior are unchanged. No installation or live service is changed.
   opening behavior. Main-thread read-only default and explicit routes continue
   through the engine's existing read-only project lifecycle.
 
-## Validation boundary
-
 ## Worker readiness and capacity boundary (Issue #10)
 
 - A pool's presence owns every validated read. Cold starts, a recovering empty
