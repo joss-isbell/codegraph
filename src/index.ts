@@ -385,7 +385,7 @@ export class CodeGraph {
     }
 
     // Validate directory structure
-    const validation = validateDirectory(resolvedRoot);
+    const validation = validateDirectory(resolvedRoot, { readOnly: options.readOnly });
     if (!validation.valid) {
       throw new Error(`Invalid CodeGraph directory: ${validation.errors.join(', ')}`);
     }
@@ -393,9 +393,9 @@ export class CodeGraph {
     // Open database
     const dbPath = getDatabasePath(resolvedRoot);
     const db = DatabaseConnection.open(dbPath, { readOnly: options.readOnly });
-    const queries = new QueryBuilder(db.getDb());
-
-    const instance = new CodeGraph(db, queries, resolvedRoot);
+    let instance: CodeGraph;
+    try { instance = new CodeGraph(db, new QueryBuilder(db.getDb()), resolvedRoot); }
+    catch (err) { db.close(); throw err; }
 
     // Sync if requested
     if (options.sync && !options.readOnly) {
@@ -470,7 +470,7 @@ export class CodeGraph {
     }
 
     // Validate directory structure
-    const validation = validateDirectory(resolvedRoot);
+    const validation = validateDirectory(resolvedRoot, { readOnly: options.readOnly });
     if (!validation.valid) {
       throw new Error(`Invalid CodeGraph directory: ${validation.errors.join(', ')}`);
     }
@@ -478,9 +478,8 @@ export class CodeGraph {
     // Open database
     const dbPath = getDatabasePath(resolvedRoot);
     const db = DatabaseConnection.open(dbPath, { readOnly: options.readOnly });
-    const queries = new QueryBuilder(db.getDb());
-
-    return new CodeGraph(db, queries, resolvedRoot);
+    try { return new CodeGraph(db, new QueryBuilder(db.getDb()), resolvedRoot); }
+    catch (err) { db.close(); throw err; }
   }
 
   /**

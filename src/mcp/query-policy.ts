@@ -105,7 +105,12 @@ export function resolveLegacyQueryPolicy(requested: RequestedQueryPolicy, execut
   let size = resolveLegacyPoolSize(requested.poolSize, cpuCount);
   const defaultMaximum = options.defaultMaximum ?? (executionMode === 'shared-daemon' ? 16 : 2);
   if (requested.poolSize === undefined || requested.poolSize === '') size = Math.min(size, defaultMaximum);
-  if (options.poolEnabled === false || executionMode === 'read-only-fallback') size = 0;
+  // Read-only fallback has no ordinary pool. Only an applicable explicit
+  // positive finite selection opts these exceptional local readers in.
+  const explicitReadOnlyPool = requested.poolSize !== undefined && requested.poolSize !== ''
+    && Number.isFinite(Number(requested.poolSize)) && Number(requested.poolSize) > 0
+    && Number.isSafeInteger(Math.floor(Number(requested.poolSize)));
+  if (options.poolEnabled === false || (executionMode === 'read-only-fallback' && !explicitReadOnlyPool)) size = 0;
   const n = Number(requested.busyTimeoutMs);
   const milliseconds = requested.busyTimeoutMs !== undefined && requested.busyTimeoutMs !== '' && Number.isFinite(n) && n >= 1000 ? Math.floor(n) : QUERY_BUSY_TIMEOUT_MS;
   return immutable({ requested: { ...requested }, executionMode, defaults, preset: 'default', source: 'legacy',
