@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { Worker } from 'worker_threads';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -10,6 +10,8 @@ import { SocketTransport } from '../src/mcp/transport';
 import { QueryPool } from '../src/mcp/query-pool';
 import { createQueryExecutionContext, createQueryRequestContext } from '../src/mcp/query-context';
 import { resolveQueryPolicy } from '../src/mcp/query-policy';
+import { MCPEngine } from '../src/mcp/engine';
+import * as freshness from '../src/mcp/index-freshness';
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 async function until(check: () => boolean, timeout = 5000): Promise<void> {
@@ -21,6 +23,24 @@ const execution = () => createQueryExecutionContext(resolveQueryPolicy({ poolSiz
 const record = (facts: unknown) => {
   if (process.env.VALIDATION_OUT) fs.appendFileSync(path.join(process.env.VALIDATION_OUT, 'abandonment-facts.jsonl'), JSON.stringify(facts) + '\n');
 };
+
+async function connectSessions(engine: MCPEngine, root: string) {
+  const sessions: MCPSession[] = [];
+  const server = net.createServer(socket => {
+    const session = new MCPSession(new SocketTransport(socket), engine, { explicitProjectPath: root });
+    sessions.push(session); session.start();
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const sockets = [0, 1].map(() => net.createConnection((server.address() as net.AddressInfo).port, '127.0.0.1'));
+  const output = ['', ''];
+  sockets.forEach((socket, index) => socket.on('data', chunk => { output[index] += chunk; }));
+  await until(() => sessions.length === 2);
+  return { sessions, output, send: (index: number, message: object) => sockets[index].write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n'),
+    close: async () => {
+      sockets.forEach(socket => socket.destroy()); sessions.forEach(session => session.stop());
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    } };
+}
 
 describe('abandoned pooled requests', () => {
   it('gives intentionally stopped synchronous work its provisional drain then awaits its owned worker exit', async () => {
@@ -161,6 +181,106 @@ describe('abandoned pooled requests', () => {
 });
 
 describe('actual MCP cancellation and disconnect', () => {
+  it('keeps another shared session and its history alive when targeted owned termination rejects', async () => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cancel-reject-')));
+    fs.writeFileSync(path.join(root, 'app.ts'), 'export function cancellationSymbol() { return 1; }\n');
+    const cg = await CodeGraph.init(root); await cg.indexAll(); cg.close();
+    const { MCPEngine: BuiltEngine } = require('../dist/mcp/engine');
+    const engine = new BuiltEngine({ watch: false, queryPolicy: resolveQueryPolicy({ poolSize: '2', busyTimeoutMs: 'unlimited' }, 'shared-daemon', 8) });
+    await engine.ensureInitialized(root);
+    const gates = [new SharedArrayBuffer(5 * Int32Array.BYTES_PER_ELEMENT), new SharedArrayBuffer(5 * Int32Array.BYTES_PER_ELEMENT)];
+    const states = gates.map(gate => new Int32Array(gate));
+    const workers: Worker[] = [];
+    let nativeTerminate!: () => Promise<number>, rejected = 0, exits = 0;
+    const pool = new QueryPool({ root, execution: engine.getQueryExecutionContext(), createWorker: () => {
+      const index = workers.length;
+      const worker = new Worker(path.join(__dirname, 'fixtures/query-abandonment-worker.cjs'), { workerData: { gate: gates[index], root, execution: engine.getQueryExecutionContext() } });
+      workers.push(worker); worker.on('exit', () => { exits++; });
+      if (index === 0) {
+        nativeTerminate = worker.terminate.bind(worker);
+        worker.terminate = () => { rejected++; return Promise.reject(new Error('controlled owned termination rejection')); };
+      }
+      return worker;
+    } });
+    engine.getToolHandler().setQueryPool(pool);
+    const connection = await connectSessions(engine, root);
+    const request = (id: number) => ({ id, method: 'tools/call', params: { name: 'codegraph_explore', arguments: { query: 'cancellationSymbol' } } });
+    try {
+      connection.send(0, request(1)); await until(() => states[0][2] === 1);
+      connection.send(1, request(1)); await until(() => states[1][2] === 1);
+      connection.send(0, { method: 'notifications/cancelled', params: { requestId: 1 } });
+      await until(() => rejected === 1, 22000);
+      expect(pool.healthy).toBe(true);
+      expect(pool.activity).toEqual({ queued: 0, executing: 2, starting: 0, retiring: 1 });
+      expect(pool.liveWorkers).toBe(2); expect(exits).toBe(0);
+      connection.send(1, request(2)); await until(() => pool.activity.queued === 1);
+      expect(workers).toHaveLength(2); // the unexited retirement still owns its finite slot
+      Atomics.store(states[1], 3, 1); Atomics.notify(states[1], 3);
+      await until(() => connection.output[1].split('\n').filter(Boolean).length === 2);
+      expect(connection.output[0]).toBe('');
+      expect(connection.output[1]).toContain('cancellationSymbol');
+      expect(connection.sessions[0].getExploreSessionState().view().projects).toHaveLength(0);
+      expect(connection.sessions[1].getExploreSessionState().view().projects[0].callCount).toBe(2);
+      // A known teardown failure is an explicit handover failure, not an
+      // unbounded wait for healthy execution or permission to stop its peers.
+      await expect(pool.drainNaturally()).rejects.toThrow('owned worker cleanup incomplete');
+      expect(exits).toBe(0);
+      const stopped = pool.destroy();
+      await expect(stopped).rejects.toThrow('controlled owned termination rejection');
+      expect(pool.destroy()).toBe(stopped);
+      expect(exits).toBe(1); expect(rejected).toBe(1);
+      expect(pool.liveWorkers).toBe(1);
+      expect(pool.activity).toEqual({ queued: 0, executing: 1, starting: 0, retiring: 1 });
+      record({ scenario: 'targeted-cleanup-rejected', rejected, peerResponses: 2, peerHistory: 2, victimHistory: 0,
+        exits, retainedWorkers: pool.liveWorkers, retainedActivity: pool.activity, destroyFailed: true, naturalHandoverFailed: true });
+    } finally {
+      await connection.close();
+      // This test owns the injected rejection; explicitly use its saved native
+      // teardown for fixture cleanup, without claiming the pool's stop passed.
+      if (nativeTerminate) await nativeTerminate();
+      await pool.destroy().catch(() => undefined); await engine.stop();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 35000);
+
+  it('does not start cancelled status measurement after explicit project activation while a peer completes', async () => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cancel-activation-')));
+    const explicit = path.join(root, 'explicit'); fs.mkdirSync(explicit);
+    for (const project of [root, explicit]) {
+      fs.writeFileSync(path.join(project, 'app.ts'), 'export function cancellationSymbol() { return 1; }\n');
+      const cg = await CodeGraph.init(project); await cg.indexAll(); cg.close();
+    }
+    const engine = new MCPEngine({ watch: false, queryPolicy: resolveQueryPolicy({ poolSize: '0' }, 'direct', 8) });
+    await engine.ensureInitialized(root);
+    let release!: () => void, entered = false;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    engine.getToolHandler().setProjectLifecycle({ open: (_root, open) => open(),
+      activate: async cg => { entered = true; await gate; await cg.sync(); }, release: cg => { cg.close(); } });
+    const measurement = vi.spyOn(freshness, 'measurePendingChanges');
+    const connection = await connectSessions(engine, root);
+    try {
+      connection.send(0, { id: 1, method: 'tools/call', params: { name: 'codegraph_status', arguments: { projectPath: explicit } } });
+      await until(() => entered);
+      connection.send(1, { id: 1, method: 'tools/call', params: { name: 'codegraph_explore', arguments: { projectPath: explicit, query: 'cancellationSymbol' } } });
+      connection.send(0, { method: 'notifications/cancelled', params: { requestId: 1 } });
+      await sleep(50); release();
+      await until(() => connection.output[1].includes('cancellationSymbol'));
+      expect(measurement).not.toHaveBeenCalled();
+      expect(connection.output[0]).toBe('');
+      expect(connection.sessions[0].getExploreSessionState().view().projects).toHaveLength(0);
+      expect(connection.sessions[1].getExploreSessionState().view().projects[0].callCount).toBe(1);
+      // Call through the real status measurement once to prove the observation
+      // detects its owner seam, with no mock SQLite or moved status authority.
+      connection.send(1, { id: 2, method: 'tools/call', params: { name: 'codegraph_status', arguments: { projectPath: explicit } } });
+      await until(() => connection.output[1].includes('Changes since index'), 12000);
+      expect(measurement).toHaveBeenCalledTimes(1);
+      record({ scenario: 'activation-cancelled-status', cancelledMeasurements: 0, peerMeasurements: 1, peerHistory: 1, victimHistory: 0 });
+    } finally {
+      release(); measurement.mockRestore(); await connection.close(); await engine.stop();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 20000);
+
   it.each(['running-cancel', 'queued-cancel', 'running-disconnect', 'queued-disconnect', 'session-stop'])
   ('suppresses %s delivery and history while the other shared session with the same id survives', async signal => {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cancel-socket-')));

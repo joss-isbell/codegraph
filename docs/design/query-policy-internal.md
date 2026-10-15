@@ -125,6 +125,9 @@ behavior are unchanged. No installation or live service is changed.
   `notifications/cancelled` with `params.requestId`; a notification gets no reply.
   Session end also abandons that session's already-answered but still-executing
   work. A shared peer's requests, workers and explore history remain independent.
+  After a shared explicit-project activation gate finishes, the owner checks the
+  request lifetime again before status measurement, watcher recovery or dispatch;
+  cancellation does not cancel the shared project activation itself.
   The tests inject that protocol notification at the socket/stdio seam and observe
   real disconnects. They do not establish which signal any particular host's Stop
   button sends. Unpooled synchronous work cannot receive a new event-loop signal
@@ -152,6 +155,11 @@ behavior are unchanged. No installation or live service is changed.
   are not query deadlines. Abandoned synchronous execution gets a targeted worker
   retirement after its drain; another session's worker is not terminated. Capacity
   stays accounted for through actual completion or verified owned-worker exit.
+  If targeted abandonment teardown rejects, the unexited worker and its finite
+  slot remain owned. Healthy peers continue; the known incomplete teardown is
+  surfaced by natural handover and final intentional destroy. Final destroy waits
+  for every other owned termination before rejecting, and the engine retains its
+  pool ownership reference when cleanup is incomplete.
   Intentional engine shutdown awaits all active/failed owned workers before owner
   database release. Worker identity is the exact owned Worker object, not a process
   name or project registry. Existing PID/creation checks and native process-tree

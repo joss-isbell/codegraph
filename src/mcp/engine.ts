@@ -316,8 +316,10 @@ export class MCPEngine {
     // after, and exiting while a worker is still starting up can crash the
     // process.
     this.toolHandler.setQueryPool(null);
-    const poolDown = this.queryPool ? this.queryPool.destroy() : Promise.resolve();
-    this.queryPool = null;
+    const stoppingPool = this.queryPool;
+    const poolDown = stoppingPool ? stoppingPool.destroy().then(() => {
+      if (this.queryPool === stoppingPool) this.queryPool = null;
+    }) : Promise.resolve();
     const measurementsDown = endFreshnessMeasurements();
     const drained = this.toolHandler.closeAll();
     this.stopPromise = Promise.all([drained, poolDown, measurementsDown]).then(async () => {

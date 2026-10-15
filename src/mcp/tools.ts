@@ -2834,6 +2834,7 @@ export class ToolHandler {
       }
 
       const project = await this.getCodeGraph(args.projectPath as string | undefined);
+      if (lifetime?.signal.aborted) return this.textResult('CodeGraph request cancelled or abandoned.');
       // Carry resolved routing separately from public args. Default calls may
       // need an explicit root on the worker wire without becoming explicit calls.
       const request = requestContext ?? (this.execution ? createQueryRequestContext(this.execution, 'untracked', 'untracked') : undefined);

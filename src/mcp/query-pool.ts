@@ -166,7 +166,8 @@ export class QueryPool {
   private totalCrashes = 0;
   private destroyed = false;
   private accepting = true;
-  private quietWaiters: Array<() => void> = [];
+  private quietWaiters: Array<{ resolve: () => void; reject: (error: Error) => void }> = [];
+  private cleanupFailure: Error | null = null;
   private failure: string | null = null;
   private readonly root: string | null;
   private readonly maxSize: number;
@@ -376,7 +377,7 @@ export class QueryPool {
       // Cancellation settles delivery, not execution. Only this abandoned
       // worker is retired after its drain allowance; shared peers keep running.
       job.abandonmentTimer = setTimeout(() => {
-        if (this.inflight.get(worker) === job) this.retire(worker);
+        if (this.inflight.get(worker) === job) this.retire(worker, true);
       }, QUERY_CLEANUP_BOUNDS.drainMs);
       job.abandonmentTimer.unref?.();
     }
@@ -385,14 +386,15 @@ export class QueryPool {
 
   private notifyQuiet(): void {
     if (this.queue.some(job => !job.settled) || this.inflight.size) return;
-    for (const resolve of this.quietWaiters.splice(0)) resolve();
+    for (const waiter of this.quietWaiters.splice(0)) waiter.resolve();
   }
 
   /** Routine handover has no execution deadline and never interrupts admitted work. */
   async drainNaturally(): Promise<void> {
     this.accepting = false;
+    if (this.cleanupFailure) throw this.cleanupFailure;
     if (this.queue.some(job => !job.settled) || this.inflight.size) {
-      await new Promise<void>(resolve => this.quietWaiters.push(resolve));
+      await new Promise<void>((resolve, reject) => this.quietWaiters.push({ resolve, reject }));
     }
     await this.destroy();
   }
@@ -441,7 +443,7 @@ export class QueryPool {
     start.settle();
   }
 
-  private retire(worker: PoolWorker): Promise<void> {
+  private retire(worker: PoolWorker, preservePeers = false): Promise<void> {
     const prior = this.retirements.get(worker);
     if (prior) return prior;
     const termination = this.terminateStarted(worker);
@@ -461,7 +463,13 @@ export class QueryPool {
     }, error => {
       // Keep the ownership record and expose incomplete cleanup. Never pretend
       // a still-owned worker exited, and never let a lost slot escape to main.
-      this.fail(`owned worker cleanup incomplete: ${error instanceof Error ? error.message : String(error)}`);
+      this.cleanupFailure = new Error(`owned worker cleanup incomplete: ${error instanceof Error ? error.message : String(error)}`);
+      for (const waiter of this.quietWaiters.splice(0)) waiter.reject(this.cleanupFailure);
+      if (preservePeers) {
+        // One vanished session cannot take healthy shared workers down with it.
+        // Retain its slot and rejected retirement for truthful final shutdown.
+        process.stderr.write(`[CodeGraph MCP] Targeted ${this.cleanupFailure.message}; other shared workers remain available.\n`);
+      } else this.fail(this.cleanupFailure.message);
     });
     return termination;
   }
@@ -508,15 +516,17 @@ export class QueryPool {
     }
     this.queue = [];
     this.destroyPromise = (async () => {
-      if (this.inflight.size) {
+      if (this.inflight.size && !this.cleanupFailure) {
         let drain: NodeJS.Timeout | undefined;
-        await Promise.race([new Promise<void>(resolve => this.quietWaiters.push(resolve)), new Promise<void>(resolve => {
+        await Promise.race([new Promise<void>((resolve, reject) => this.quietWaiters.push({ resolve, reject })), new Promise<void>(resolve => {
           drain = setTimeout(resolve, QUERY_CLEANUP_BOUNDS.drainMs); drain.unref?.();
-        })]);
+        })]).catch(() => { /* known incomplete retirement; still stop the other owned workers */ });
         clearTimeout(drain);
       }
       for (const worker of ws) this.retire(worker);
-      await Promise.all([...this.terminations]);
+      const outcomes = await Promise.allSettled([...this.terminations]);
+      const incomplete = outcomes.find((outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected');
+      if (incomplete) throw incomplete.reason;
       this.notifyQuiet();
     })();
     return this.destroyPromise;
