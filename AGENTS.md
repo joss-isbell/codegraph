@@ -4,6 +4,20 @@ Canonical project guidance for coding agents working in this repository (Codex/A
 
 **Codex size note:** root `AGENTS.md` is intentionally kept near ~35 KiB (critical build/test/arch/retrieval rules retained). Longer validation methodology + the Excalidraw worked example live in `docs/AGENTS.md`. This environment sets `project_doc_max_bytes = 49152` so root (and root+`docs/` when cwd is under `docs/`) are not silently truncated at the 32 KiB default.
 
+## Agent skills
+
+### Issue tracker
+
+Issues and Wayfinder maps use GitHub Issues in `joss-isbell/codegraph`, with native sub-issues and dependencies. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the default triage label vocabulary. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Use a single domain context: root `GLOSSARY.md` and `docs/adr/`, created lazily as needed. See `docs/agents/domain.md`.
+
 ## Project Overview
 
 CodeGraph is a local-first code intelligence library + CLI + MCP server. It parses any supported codebase with tree-sitter, stores symbols/edges/files in SQLite (FTS5), and exposes a knowledge graph to AI agents (Claude Code, Cursor, Codex CLI, opencode) over MCP. Per-project data lives in `.codegraph/`. Extraction is deterministic — derived from AST, not LLM-summarized.
