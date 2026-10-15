@@ -10,8 +10,7 @@ import { SocketTransport } from '../src/mcp/transport';
 import { QueryPool } from '../src/mcp/query-pool';
 import { createQueryExecutionContext, createQueryRequestContext } from '../src/mcp/query-context';
 import { resolveQueryPolicy } from '../src/mcp/query-policy';
-import { MCPEngine } from '../src/mcp/engine';
-import * as freshness from '../src/mcp/index-freshness';
+import type { MCPEngine } from '../src/mcp/engine';
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 async function until(check: () => boolean, timeout = 5000): Promise<void> {
@@ -297,7 +296,9 @@ describe('actual MCP cancellation and disconnect', () => {
       fs.writeFileSync(path.join(project, 'app.ts'), 'export function cancellationSymbol() { return 1; }\n');
       const cg = await CodeGraph.init(project); await cg.indexAll(); cg.close();
     }
-    const engine = new MCPEngine({ watch: false, queryPolicy: resolveQueryPolicy({ poolSize: '0' }, 'direct', 8) });
+    const { MCPEngine: BuiltEngine } = require('../dist/mcp/engine');
+    const freshness = require('../dist/mcp/index-freshness');
+    const engine = new BuiltEngine({ watch: false, queryPolicy: resolveQueryPolicy({ poolSize: '0' }, 'direct', 8) });
     await engine.ensureInitialized(root);
     let release!: () => void, entered = false;
     const gate = new Promise<void>(resolve => { release = resolve; });
