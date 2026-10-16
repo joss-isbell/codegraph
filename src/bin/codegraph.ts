@@ -2209,8 +2209,6 @@ program
   .option('--mcp', 'Run as MCP server (stdio transport)')
   .option('--no-watch', 'Disable the file watcher (no auto-sync; useful on slow filesystems like WSL2 /mnt drives)')
   .action(async (options: { path?: string; mcp?: boolean; watch?: boolean }) => {
-    const projectPath = options.path ? resolveProjectPath(options.path) : undefined;
-
     // Commander sets watch=false when --no-watch is passed. Route it through
     // the same env-var chokepoint the watcher and MCP server already honor.
     if (options.watch === false) {
@@ -2218,6 +2216,12 @@ program
     }
 
     try {
+      // A path probe can open SQLite and create its WAL sidecars. Validate the
+      // immutable MCP request first, then reuse it after normal path resolution.
+      const startup = options.mcp
+        ? (await import('../mcp/query-policy')).captureQueryStartup(process.env, require('os').cpus().length)
+        : undefined;
+      const projectPath = options.path ? resolveProjectPath(options.path) : undefined;
       if (options.mcp) {
         // `serve --mcp` is the stdio MCP server an AI agent launches for itself,
         // not a command to run by hand. A human in a terminal would otherwise
@@ -2237,7 +2241,7 @@ program
         }
         // Start MCP server - it handles initialization lazily based on rootUri from client
         const { MCPServer } = await import('../mcp/index');
-        const server = new MCPServer(projectPath);
+        const server = new MCPServer(projectPath, startup);
         await server.start();
         // Server will run until terminated
       } else {

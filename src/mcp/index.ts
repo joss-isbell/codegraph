@@ -36,11 +36,13 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
 import { spawn, StdioOptions } from 'child_process';
 import { resolveServerRoot, getCodeGraphDir } from '../directory';
 import { StdioTransport } from './transport';
 import { MCPEngine } from './engine';
 import { MCPSession } from './session';
+import { captureQueryStartup, immutable, resolveQueryPolicy, type QueryStartupRequest } from './query-policy';
 import {
   Daemon,
   clearStaleDaemonLock,
@@ -402,6 +404,7 @@ async function outwaitCandidate(root: string, handoverFrom: number | null, pid: 
  */
 export class MCPServer {
   private projectPath: string | null;
+  private readonly queryStartup: QueryStartupRequest;
   // Direct-mode-only state. In daemon mode the per-connection sessions live
   // inside the Daemon class; in proxy mode there is no session at all.
   private session: MCPSession | null = null;
@@ -422,7 +425,11 @@ export class MCPServer {
   /** Project root whose writer.pid we hold in direct mode (#1740); released on stop. */
   private writerLockRoot: string | null = null;
 
-  constructor(projectPath?: string) {
+  constructor(projectPath?: string, startup = captureQueryStartup(process.env, os.cpus().length)) {
+    // Validate before start() can bootstrap, attach or acquire any authority.
+    // Keep the original immutable inputs for the execution mode selected later.
+    this.queryStartup = immutable({ requested: { ...startup.requested }, cpuCount: startup.cpuCount });
+    resolveQueryPolicy(this.queryStartup.requested, 'direct', this.queryStartup.cpuCount);
     this.projectPath = projectPath || null;
   }
 
@@ -528,6 +535,7 @@ export class MCPServer {
 
   /** Single-process stdio MCP session — the pre-issue-#411 code path. */
   private async startDirect(reason: string): Promise<void> {
+    const queryPolicy = resolveQueryPolicy(this.queryStartup.requested, 'direct', this.queryStartup.cpuCount);
     if (reason && process.env.CODEGRAPH_MCP_DEBUG) {
       process.stderr.write(`[CodeGraph MCP] Direct mode: ${reason}.\n`);
     }
@@ -546,7 +554,7 @@ export class MCPServer {
       this.writerLockRoot = writerRoot;
     }
 
-    this.engine = new MCPEngine({ queryPool: true, queryPoolDefaultMax: DIRECT_QUERY_POOL_MAX, executionMode: 'direct' });
+    this.engine = new MCPEngine({ queryPool: true, queryPolicy, executionMode: 'direct' });
     const transport = new StdioTransport({ exitOnClose: false, onClose: () => { void this.stop(); } });
     this.session = new MCPSession(transport, this.engine, {
       explicitProjectPath: this.projectPath,
