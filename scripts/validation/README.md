@@ -135,3 +135,53 @@ The initial accepted source is `bcd1586a48ad65ee2aeda3d562eaafc0aae74e87`.
 Durable local attempt paths, hashes, measurements, failed-attempt history and the
 independent review version are recorded in the ticket's implementation report.
 Public delivery should contain project facts, not local installation inventories.
+
+## Exact previous-installation recovery (Issue #28)
+
+`recovery.py` preserves the actual selected installation B instead of building a
+checkout or installing a current npm version. A private input declaration names
+the complete installed engine/runtime tree, the selected launcher's dependency
+closure, the complete selected Git distribution and the saved MCP configuration.
+Protection hashes originals before/after copying and retains the original launch
+recipe and every component byte. Inactive launchers and historical logs remain
+untouched; they are not silently substituted for the selected B closure. Private
+settings, process inventories and artifacts belong under `.validation/`, never in
+the public tracker or a commit.
+
+Restoration creates a new path beneath an explicitly declared disposable owner.
+It verifies the protected inventory before copying and records the original and
+relocated recipes separately. Only the external command/argument paths relocate
+to copied components: no launcher, runtime, worker, dependency or saved-config
+bytes are patched. The saved full configuration is evidence; it is never written
+back to the live configuration. Saved settings do not prove the inherited
+environment of an older installed process; unknown values stay unknown.
+
+`capture_snapshot` uses SQLite's online backup API through a read-only source
+connection, validates integrity and schema/project metadata in the same read
+transaction, and records the original main/WAL/SHM provenance. It produces a
+self-contained database in DELETE journal mode. `restore_snapshot` verifies that
+snapshot and writes only a new, absent disposable database with absent sidecars.
+It cannot overwrite an existing database. A live main-file-only copy is never a
+recovery snapshot.
+
+The focused `recovery-tests.py` scenarios exercise real live WAL state and exact
+component preservation, path relocation and changed-byte refusal. The actual
+`recovery-rehearsal.py`/`recovery-probe.cjs` protocol restores B, uses B's copied
+Git/runtime/library to create compatible disposable indexes, and sends ordinary
+MCP requests through its exact copied launcher. It records runtime/worker module
+identities, keeps copied B under a native integrity witness, snapshots a committed
+WAL while disposable owners remain live, restores protected compatible state only
+after closing the target owner, then explicitly catches up legitimate later
+source changes. The later closed index remains preserved, an unrelated newer
+project remains available, and a second reconciliation must be a no-op. Complete
+RPC, source/semantic/index/snapshot/identity and cleanup evidence is retained even
+on failure. Test-only direct-session, sandbox, temporary-directory and observer
+controls are separately identified from saved B settings.
+
+Run every operation through `runner.py` with predeclared scenarios, artifacts,
+deadlines and a fresh output directory. `recovery-ledger.py` consumes the actual
+receipts, checks current relevant adapter bytes and the protected-to-original B
+inventory, and retains all attempt outcomes. This Windows installed-B rehearsal
+does not prove B can open a candidate-updated schema, qualify a later candidate
+package, change the installation, stop any installed owner, or access a held
+index. Those remain later acceptance and explicit installation-decision gates.
