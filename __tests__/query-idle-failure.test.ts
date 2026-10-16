@@ -57,6 +57,7 @@ describe('owned idle-worker cleanup failures', () => {
     sockets.forEach((socket, index) => socket.on('data', chunk => { output[index] += chunk; }));
     const send = (index: number, id: number, query: string) => sockets[index].write(JSON.stringify({ jsonrpc: '2.0', id,
       method: 'tools/call', params: { name: 'codegraph_explore', arguments: { query } } }) + '\n');
+    let primaryFailure: unknown;
     try {
       await until(() => sessions.length === 2);
       send(0, 1, 'healthySymbol');
@@ -91,16 +92,25 @@ describe('owned idle-worker cleanup failures', () => {
       record({ scenario: 'idle-cleanup-rejected-survivor', rejected, survivorResponses: 1, survivorHistory: 1,
         idleResponses: 2, idleHistory: 2, nativeExits: 1, retainedWorkers: pool.liveWorkers, retainedActivity: pool.activity,
         naturalHandoverFailed: true, destroyFailed: true, observations });
-    } finally {
-      release(healthyGate);
-      sockets.forEach(socket => socket.destroy()); sessions.forEach(session => session.stop());
-      await new Promise<void>(resolve => server.close(() => resolve()));
-      // The fixture owns this injected failure. Native cleanup is explicit and
-      // does not turn the pool's rejected stop into a successful ownership claim.
-      if (nativeIdleTerminate) await nativeIdleTerminate();
-      await pool.destroy().catch(() => undefined); await engine.stop();
-      record({ scenario: 'idle-cleanup-rejected-survivor-fixture-cleanup', actualExited: workers.every(worker => worker.threadId === -1) });
-      await fs.promises.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    } catch (error) { primaryFailure = error; throw error; }
+    finally {
+      let cleanupFailure: unknown;
+      try {
+        release(healthyGate);
+        sockets.forEach(socket => socket.destroy()); sessions.forEach(session => session.stop());
+        await new Promise<void>(resolve => server.close(() => resolve()));
+        // Native fixture cleanup does not make the rejected pool stop pass.
+        if (nativeIdleTerminate) await nativeIdleTerminate();
+        await pool.destroy().catch(() => undefined); await engine.stop();
+        await fs.promises.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      } catch (error) { cleanupFailure = error; }
+      finally {
+        try { record({ scenario: 'idle-cleanup-rejected-survivor-fixture-cleanup', root, observations,
+          actualExited: workers.every(worker => worker.threadId === -1), retainedActivity: pool.activity,
+          primaryFailure: primaryFailure ? String(primaryFailure) : null, cleanupFailure: cleanupFailure ? String(cleanupFailure) : null }); }
+        catch (ledgerError) { if (!primaryFailure && !cleanupFailure) throw ledgerError; process.stderr.write(`Idle-failure ledger also failed: ${String(ledgerError)}\n`); }
+      }
+      if (cleanupFailure) { if (!primaryFailure) throw cleanupFailure; process.stderr.write(`Idle-failure cleanup also failed: ${String(cleanupFailure)}\n`); }
     }
   }, 75000);
 
@@ -111,6 +121,7 @@ describe('owned idle-worker cleanup failures', () => {
     const workers: Worker[] = [], nativeTeardowns: Array<() => Promise<number>> = [], rejections: Array<() => void> = [];
     const gate = new SharedArrayBuffer(4), observations: any[] = [];
     let queuedOutcomes = 0, newOutcomes = 0;
+    let primaryFailure: unknown;
     const pool = new QueryPool({ root, execution, createWorker: () => {
       const worker = new Worker(path.join(__dirname, 'fixtures/query-idle-sqlite-worker.cjs'), { workerData: { root, execution,
         gates: { healthySymbol: gate } } });
@@ -144,11 +155,24 @@ describe('owned idle-worker cleanup failures', () => {
       expect(pool.activity).toEqual({ queued: 0, executing: 0, starting: 0, retiring: maximum });
       record({ scenario: 'idle-cleanup-finite-reserved', maximum, spawned: workers.length, rejections: rejections.length,
         queuedOutcomes, newOutcomes, retainedActivity: pool.activity, nativeExits: 0, naturalHandoverFailed: true, destroyFailed: true });
-    } finally {
-      release(gate); rejections.forEach(reject => reject());
-      await Promise.all(nativeTeardowns.map(stop => stop())); await pool.destroy().catch(() => undefined);
-      record({ scenario: 'idle-cleanup-finite-reserved-fixture-cleanup', maximum, actualExited: workers.every(worker => worker.threadId === -1) });
-      await fs.promises.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    } catch (error) { primaryFailure = error; throw error; }
+    finally {
+      let cleanupFailure: unknown;
+      try {
+        release(gate); rejections.forEach(reject => reject());
+        const nativeResults = await Promise.allSettled(nativeTeardowns.map(stop => stop()));
+        await pool.destroy().catch(() => undefined);
+        const failedNative = nativeResults.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+        if (failedNative) throw failedNative.reason;
+        await fs.promises.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      } catch (error) { cleanupFailure = error; }
+      finally {
+        try { record({ scenario: 'idle-cleanup-finite-reserved-fixture-cleanup', maximum, root,
+          actualExited: workers.every(worker => worker.threadId === -1), retainedActivity: pool.activity,
+          primaryFailure: primaryFailure ? String(primaryFailure) : null, cleanupFailure: cleanupFailure ? String(cleanupFailure) : null }); }
+        catch (ledgerError) { if (!primaryFailure && !cleanupFailure) throw ledgerError; process.stderr.write(`Reserved-idle ledger also failed: ${String(ledgerError)}\n`); }
+      }
+      if (cleanupFailure) { if (!primaryFailure) throw cleanupFailure; process.stderr.write(`Reserved-idle cleanup also failed: ${String(cleanupFailure)}\n`); }
     }
   }, 65000);
 });

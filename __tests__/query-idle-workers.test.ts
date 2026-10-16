@@ -36,6 +36,7 @@ describe('independent retirement of real unused SQLite workers', () => {
     } });
     const context = (id: number, session: string) => routeQueryRequest(createQueryRequestContext(execution, session, id), 'default', root, getDatabasePath(root));
     let healthyOutcomes = 0, abandonedOutcomes = 0;
+    let primaryFailure: unknown;
     const healthy = pool.run('codegraph_search', { query: 'healthySymbol' }, context(1, 'survivor')).then(result => { healthyOutcomes++; return result; });
     const controller = new AbortController();
     let abandoned: Promise<any> | undefined;
@@ -76,12 +77,22 @@ describe('independent retirement of real unused SQLite workers', () => {
       if (process.env.VALIDATION_OUT) fs.appendFileSync(path.join(process.env.VALIDATION_OUT, 'idle-mixed-facts.jsonl'), JSON.stringify({
         phase, root, observations, healthyOutcomes, abandonedOutcomes, finalActivity: pool.activity, idleGraceMs: 30000,
       }) + '\n');
-    } finally {
-      release(healthyGate); release(abandonedGate); await healthy; await abandoned; await pool.destroy();
-      if (process.env.VALIDATION_OUT) fs.appendFileSync(path.join(process.env.VALIDATION_OUT, 'idle-mixed-cleanup.jsonl'), JSON.stringify({
-        phase, root, observations, finalActivity: pool.activity, actualExited: workers.every(worker => worker.threadId === -1),
-      }) + '\n');
-      await fs.promises.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    } catch (error) { primaryFailure = error; throw error; }
+    finally {
+      let cleanupFailure: unknown;
+      try {
+        release(healthyGate); release(abandonedGate); await healthy; await abandoned; await pool.destroy();
+        await fs.promises.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      } catch (error) { cleanupFailure = error; }
+      finally {
+        try {
+          if (process.env.VALIDATION_OUT) fs.appendFileSync(path.join(process.env.VALIDATION_OUT, 'idle-mixed-cleanup.jsonl'), JSON.stringify({
+            phase, root, observations, finalActivity: pool.activity, actualExited: workers.every(worker => worker.threadId === -1),
+            primaryFailure: primaryFailure ? String(primaryFailure) : null, cleanupFailure: cleanupFailure ? String(cleanupFailure) : null,
+          }) + '\n');
+        } catch (ledgerError) { if (!primaryFailure && !cleanupFailure) throw ledgerError; process.stderr.write(`Mixed-idle ledger also failed: ${String(ledgerError)}\n`); }
+      }
+      if (cleanupFailure) { if (!primaryFailure) throw cleanupFailure; process.stderr.write(`Mixed-idle cleanup also failed: ${String(cleanupFailure)}\n`); }
     }
   }, 120000);
 });

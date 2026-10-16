@@ -26,6 +26,7 @@ describe('unlimited capacity recovery without a busy timer', () => {
       worker.on('exit', code => observations.push({ type: 'exit', threadId, code }));
       return worker;
     } });
+    let primaryFailure: unknown;
     try {
       const results = await Promise.all(Array.from({ length: 3 }, (_, i) => pool.run('codegraph_search', { query: 'recoveredSymbol' },
         routeQueryRequest(createQueryRequestContext(execution, `session-${i}`, 1), 'default', root, getDatabasePath(root)))));
@@ -37,7 +38,21 @@ describe('unlimited capacity recovery without a busy timer', () => {
       if (process.env.VALIDATION_OUT) fs.appendFileSync(path.join(process.env.VALIDATION_OUT, 'unlimited-recovery.jsonl'), JSON.stringify({
         mode, scenario: 'recovered', results, observations, finalActivity: pool.activity,
       }) + '\n');
-    } finally { await pool.destroy(); await fs.promises.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
+    } catch (error) { primaryFailure = error; throw error; }
+    finally {
+      let cleanupFailure: unknown;
+      try { await pool.destroy(); await fs.promises.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
+      catch (error) { cleanupFailure = error; }
+      finally {
+        try {
+          if (process.env.VALIDATION_OUT) fs.appendFileSync(path.join(process.env.VALIDATION_OUT, 'unlimited-recovery-cleanup.jsonl'), JSON.stringify({
+            mode, scenario: 'recovered', observations, finalActivity: pool.activity, actualExited: workers.every(worker => worker.threadId === -1),
+            primaryFailure: primaryFailure ? String(primaryFailure) : null, cleanupFailure: cleanupFailure ? String(cleanupFailure) : null,
+          }) + '\n');
+        } catch (ledgerError) { if (!primaryFailure && !cleanupFailure) throw ledgerError; process.stderr.write(`Recovery ledger also failed: ${String(ledgerError)}\n`); }
+      }
+      if (cleanupFailure) { if (!primaryFailure) throw cleanupFailure; process.stderr.write(`Recovery cleanup also failed: ${String(cleanupFailure)}\n`); }
+    }
   }, 120000);
   it('exhausts actual failed read-only SQLite starts and settles all timer-free demand without resurrection or repair', async () => {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-unlimited-broken-')));
@@ -54,6 +69,7 @@ describe('unlimited capacity recovery without a busy timer', () => {
       return worker;
     } });
     let outcomes = 0;
+    let primaryFailure: unknown;
     try {
       const results = await Promise.all(Array.from({ length: 6 }, () => pool.run('codegraph_search', {}).then(result => { outcomes++; return result; })));
       expect(results.every(result => result.isError && /capacity.*unavailable/.test(result.content[0].text))).toBe(true);
@@ -69,6 +85,21 @@ describe('unlimited capacity recovery without a busy timer', () => {
       if (process.env.VALIDATION_OUT) fs.appendFileSync(path.join(process.env.VALIDATION_OUT, 'unlimited-recovery.jsonl'), JSON.stringify({
         mode: 'read-only-fallback', scenario: 'exhausted', outcomes, created, results, observations, finalActivity: pool.activity,
       }) + '\n');
-    } finally { await pool.destroy(); await fs.promises.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
+    } catch (error) { primaryFailure = error; throw error; }
+    finally {
+      let cleanupFailure: unknown;
+      try { await pool.destroy(); await fs.promises.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
+      catch (error) { cleanupFailure = error; }
+      finally {
+        try {
+          if (process.env.VALIDATION_OUT) fs.appendFileSync(path.join(process.env.VALIDATION_OUT, 'unlimited-recovery-cleanup.jsonl'), JSON.stringify({
+            mode: 'read-only-fallback', scenario: 'exhausted', outcomes, observations, finalActivity: pool.activity,
+            actualExited: workers.every(worker => worker.threadId === -1), primaryFailure: primaryFailure ? String(primaryFailure) : null,
+            cleanupFailure: cleanupFailure ? String(cleanupFailure) : null,
+          }) + '\n');
+        } catch (ledgerError) { if (!primaryFailure && !cleanupFailure) throw ledgerError; process.stderr.write(`Exhaustion ledger also failed: ${String(ledgerError)}\n`); }
+      }
+      if (cleanupFailure) { if (!primaryFailure) throw cleanupFailure; process.stderr.write(`Exhaustion cleanup also failed: ${String(cleanupFailure)}\n`); }
+    }
   }, 120000);
 });

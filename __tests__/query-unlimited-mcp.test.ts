@@ -9,7 +9,7 @@ import { CodeGraph, getDatabasePath } from '../src';
 import { createDatabase } from '../src/db/sqlite-adapter';
 import { getWriterPidPath, tryAcquireWriterLock, releaseWriterLock } from '../src/mcp/writer-lock';
 import { WASM_RUNTIME_FLAGS } from '../src/extraction/wasm-runtime-flags';
-import { recordSpawns, removeSpawnLog, settleLosingCandidates } from './daemon-candidates';
+import { recordSpawns, removeSpawnLog, settleLosingCandidates, spawnLogFor } from './daemon-candidates';
 
 const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 async function until(check: () => boolean, ms: number, detail: () => string = () => '') {
@@ -88,6 +88,8 @@ describe('independent unlimited concurrency through actual MCP', () => {
     let daemonPid: number | undefined;
     let disappearingSession: any;
     const routeProbes: any[] = [];
+    let phase = 'fixture setup';
+    let primaryFailure: unknown;
     const events = (): any[] => fs.existsSync(observations) ? fs.readFileSync(observations, 'utf8').split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line)) : [];
     const activeWorkers = () => events().filter(event => event.event === 'spawn').length - events().filter(event => event.event === 'exit').length;
     const resultText = (result: any, symbol: string) => { expect(result.isError).toBeFalsy(); expect(result.content[0].text).toContain(symbol); expect(result.content[0].text).toContain('app.ts:1'); };
@@ -109,6 +111,7 @@ describe('independent unlimited concurrency through actual MCP', () => {
         db: roots.map(root => digest(getDatabasePath(root))), wal: roots.map(root => digest(getDatabasePath(root) + '-wal')),
         metadata: roots.map(root => digest(path.join(root, '.codegraph/.gitignore'))), schema: observer.pragma('schema_version', { simple: true }) } : null;
       const client = new Client(roots[0], mode, observations, release); clients.push(client);
+      phase = 'initialize';
       const initialize = () => client.request('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'unlimited-proof', version: '1' }, rootUri: pathToFileURL(roots[0]).href });
       expect((await initialize()).serverInfo.name).toBe('codegraph');
       const probeRoutes = async (stage: 'before' | 'after') => {
@@ -126,7 +129,8 @@ describe('independent unlimited concurrency through actual MCP', () => {
           routeProbes.push({ stage, route: index ? 'explicit' : 'default', root: roots[index], query, search, explore });
         }
       };
-      await probeRoutes('before');
+      phase = 'unique routes before overlap'; await probeRoutes('before');
+      phase = 'initial overlap';
       const wave = Array.from({ length: 20 }, (_, i) => client.query('overlapSymbol', i % 2 ? roots[1] : undefined));
       // Catch all pending outcomes from the moment they are created.
       const resultsPromise = Promise.all(wave);
@@ -171,6 +175,7 @@ describe('independent unlimited concurrency through actual MCP', () => {
       }
       if (mode === 'read-only-fallback') expect(client.stderr).toContain('local read-only fallback');
       const idleStarted = process.hrtime.bigint();
+      phase = 'idle retirement observation';
       let polls = 0;
       while (activeWorkers() && Number(process.hrtime.bigint() - idleStarted) / 1e6 < 45000) {
         await client.request('ping');
@@ -196,6 +201,7 @@ describe('independent unlimited concurrency through actual MCP', () => {
         for (const [i, owner] of owners.entries()) { expect(owner.isWatching()).toBe(true); expect(fs.readFileSync(getWriterPidPath(roots[i]), 'utf8')).toBe(locks[i]); }
       }
       if (mode === 'shared-daemon') {
+        phase = 'shared overlap after zero';
         // Recreate from zero with concurrent genuine demand. A departed chat's
         // occupied worker must not terminate or suppress the surviving chat.
         fs.rmSync(release);
@@ -215,7 +221,8 @@ describe('independent unlimited concurrency through actual MCP', () => {
         expect(departed.replies.filter(reply => reply.result?.content)).toHaveLength(0);
         disappearingSession = { departedPid: departed.child.pid, departedQueryReplies: 0, survivorResults, overlapAfterZero: 21 };
       }
-      await probeRoutes('after');
+      phase = 'unique routes after zero'; await probeRoutes('after');
+      phase = 'native watcher after zero';
       fs.writeFileSync(path.join(roots[0], 'live.ts'), 'export function afterIdleNativeSymbol() { return 3; }\n');
       if (owners.length) await until(() => owners[0].searchNodes('afterIdleNativeSymbol').length === 1, 10000);
       let fresh: any;
@@ -226,7 +233,7 @@ describe('independent unlimited concurrency through actual MCP', () => {
       const recreated = events().filter(event => event.event === 'spawn').slice(20);
       expect(recreated).toHaveLength(mode === 'shared-daemon' ? 21 : 1);
       expect(events().filter(event => event.event === 'result').length).toBeGreaterThan(20);
-      await client.close();
+      phase = 'normal process cleanup'; await client.close();
       if (daemonPid) await until(() => !alive(daemonPid!), 10000);
       await settleLosingCandidates(roots[0], () => process.pid);
       expect(activeWorkers()).toBe(0);
@@ -249,25 +256,66 @@ describe('independent unlimited concurrency through actual MCP', () => {
         expect(event.context.project).toEqual({ route: index ? 'explicit' : 'default', root: roots[index], index: getDatabasePath(roots[index]) });
       }
       expect(final.filter(event => event.event === 'exit')).toHaveLength(final.filter(event => event.event === 'spawn').length);
+      phase = 'success evidence';
       if (process.env.VALIDATION_OUT) fs.writeFileSync(path.join(process.env.VALIDATION_OUT, `unlimited-${mode}.json`), JSON.stringify({
         mode, roots, releaseControl: 'owned file gates actual worker input; real built SQLite handler produces output', demand: 20,
         peakOverlap: 20, peakStarting, peakStartingAll, routeProbes, idleGraceMs: 30000, idleObservationBoundMs: 45000, polls,
         idleObservedMs, readonlyBefore, disappearingSession,
         events: final, results, replies: clients.map(client => client.replies), stderr: clients.map(client => client.stderr),
       }, null, 2));
-    } finally {
-      if (!fs.existsSync(release)) fs.writeFileSync(release, 'cleanup release');
-      await Promise.all(clients.map(client => client.close()));
-      if (daemonPid && alive(daemonPid)) await until(() => !alive(daemonPid!), 10000);
-      await settleLosingCandidates(roots[0], () => process.pid);
-      if (process.env.VALIDATION_OUT) fs.writeFileSync(path.join(process.env.VALIDATION_OUT, `unlimited-${mode}-cleanup.json`), JSON.stringify({
-        mode, roots, events: events(), replies: clients.map(client => client.replies), stderr: clients.map(client => client.stderr),
-        clients: clients.map(client => ({ pid: client.child.pid, exitCode: client.child.exitCode, signalCode: client.child.signalCode })),
-        daemonPid, daemonAlive: daemonPid ? alive(daemonPid) : false,
-      }, null, 2));
-      removeSpawnLog(roots[0]); observer?.close();
-      for (const [i, owner] of owners.entries()) { owner.close(); releaseWriterLock(roots[i]); }
-      await fs.promises.rm(fixture, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    } catch (error) { primaryFailure = error; throw error; }
+    finally {
+      const cleanupPhases: any[] = [], cleanupErrors: Array<{ phase: string; error: unknown }> = [];
+      let cleanupEvents: any[] = [], candidatePids: number[] = [], fixtureRemoved = false;
+      const detail = (error: unknown) => error instanceof Error ? error.stack ?? error.message : String(error);
+      const attempt = async (name: string, action: () => unknown | Promise<unknown>) => {
+        try { await action(); cleanupPhases.push({ phase: name, outcome: 'pass' }); return true; }
+        catch (error) { cleanupErrors.push({ phase: name, error }); cleanupPhases.push({ phase: name, outcome: 'fail', detail: detail(error) }); return false; }
+      };
+      // Attempt every owned cleanup even if one fails. The nested finally writes
+      // partial facts without replacing the original test/cleanup exception.
+      try {
+        await attempt('capture candidate ownership', () => {
+          if (fs.existsSync(spawnLogFor(roots[0]))) candidatePids = fs.readFileSync(spawnLogFor(roots[0]), 'utf8')
+            .split(/\r?\n/).map(Number).filter(pid => Number.isSafeInteger(pid) && pid > 0);
+          const pidFile = path.join(roots[0], '.codegraph/daemon.pid');
+          if (!daemonPid && fs.existsSync(pidFile)) daemonPid = JSON.parse(fs.readFileSync(pidFile, 'utf8')).pid;
+        });
+        await attempt('release gate', () => { if (!fs.existsSync(release)) fs.writeFileSync(release, 'cleanup release'); });
+        await Promise.all(clients.map((client, index) => attempt(`client ${index} exit`, () => client.close())));
+        await attempt('daemon exit', async () => { if (daemonPid && alive(daemonPid)) await until(() => !alive(daemonPid!), 10000); });
+        const candidatesExited = await attempt('losing candidates exit', () => settleLosingCandidates(roots[0], () => process.pid));
+        await attempt('capture worker observations', () => { cleanupEvents = events(); });
+        if (candidatesExited) await attempt('spawn log removal', () => removeSpawnLog(roots[0]));
+        await attempt('read-only observer close', () => observer?.close());
+        for (const [i, owner] of owners.entries()) {
+          const ownerClosed = await attempt(`owner ${i} close`, () => owner.close());
+          if (ownerClosed) await attempt(`owner ${i} lock release`, () => releaseWriterLock(roots[i]));
+        }
+        // Retain a failed fixture for diagnosis instead of erasing ownership
+        // evidence after an unverified process/handle cleanup.
+        if (cleanupErrors.length === 0) await attempt('fixture removal', async () => {
+          await fs.promises.rm(fixture, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); fixtureRemoved = true;
+        });
+      } finally {
+        try {
+          if (process.env.VALIDATION_OUT) fs.writeFileSync(path.join(process.env.VALIDATION_OUT, `unlimited-${mode}-cleanup.json`), JSON.stringify({
+            mode, roots, phase, outcome: primaryFailure || cleanupErrors.length ? 'fail' : 'pass',
+            primaryFailure: primaryFailure ? detail(primaryFailure) : null, cleanupPhases, fixtureRemoved,
+            events: cleanupEvents, replies: clients.map(client => client.replies), stderr: clients.map(client => client.stderr),
+            clients: clients.map(client => ({ pid: client.child.pid, exitCode: client.child.exitCode, signalCode: client.child.signalCode })),
+            daemonPid, daemonAlive: daemonPid ? alive(daemonPid) : false,
+            candidatePids, candidatesStillAlive: candidatePids.filter(alive), candidateSpawnLog: spawnLogFor(roots[0]),
+          }, null, 2));
+        } catch (ledgerError) {
+          if (!primaryFailure && cleanupErrors.length === 0) throw ledgerError;
+          process.stderr.write(`Failure ledger persistence also failed: ${detail(ledgerError)}\n`);
+        }
+      }
+      if (cleanupErrors.length) {
+        if (!primaryFailure) throw cleanupErrors[0].error;
+        process.stderr.write(`Owned cleanup also failed: ${cleanupErrors.map(row => `${row.phase}: ${detail(row.error)}`).join('\n')}\n`);
+      }
     }
   }, 120000);
 });
