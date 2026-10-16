@@ -9,7 +9,7 @@ export interface QueryPolicyRefusalData {
   readonly message: string;
 }
 
-export interface QueryPolicyRefusal extends Error, QueryPolicyRefusalData {}
+export type QueryPolicyRefusal = Error & QueryPolicyRefusalData;
 
 export class QueryPolicyRefusalError extends Error implements QueryPolicyRefusal {
   readonly code = 'CODEGRAPH_QUERY_POLICY_REFUSED' as const;
