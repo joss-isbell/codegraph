@@ -6,6 +6,15 @@ const record = value => fs.appendFileSync(process.env.QUERY_UNLIMITED_OBSERVATIO
   JSON.stringify({ monotonicNs: process.hrtime.bigint().toString(), pid: process.pid,
     threadId: threads.threadId, ...value }) + '\n');
 if (threads.isMainThread) {
+  // Observe the real engine constructor; never substitute policy or handlers.
+  const engineModule = require('../../dist/mcp/engine');
+  const OriginalEngine = engineModule.MCPEngine;
+  engineModule.MCPEngine = class extends OriginalEngine {
+    constructor(options) {
+      record({ event: 'engine-constructor', options });
+      super(options);
+    }
+  };
   // Observe delivered main-thread history without changing emission or results.
   const { ExploreSessionState } = require('../../dist/mcp/explore-session-state');
   const originalRecord = ExploreSessionState.prototype.record;
@@ -34,19 +43,7 @@ if (threads.isMainThread) {
       this.on('exit', code => record({ event: 'exit', threadId, code }));
     }
   };
-  if (process.env.QUERY_UNLIMITED_FAIL_DAEMON === '1') {
-    const childProcess = require('node:child_process');
-    const spawn = childProcess.spawn;
-    childProcess.spawn = function(command, args, options) {
-      if (!options?.detached || options.env?.CODEGRAPH_DAEMON_INTERNAL !== '1') return spawn.call(this, command, args, options);
-      // Own a real candidate process that exits before it can bind or acquire a
-      // writer. This is genuine unavailability, never a compatibility mismatch.
-      const child = spawn.call(this, command, ['-e', 'process.exit(78)'], options);
-      record({ event: 'unavailable-candidate', candidatePid: child.pid, reason: 'controlled exit 78 before bind' });
-      child.on('exit', code => record({ event: 'unavailable-candidate-exit', candidatePid: child.pid, code }));
-      return child;
-    };
-  }
+  require('./query-unavailable-daemon-preload.cjs')(record);
 } else if (threads.workerData?.execution) {
   const port = threads.parentPort;
   const originalOn = port.on.bind(port);

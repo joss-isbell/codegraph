@@ -76,9 +76,6 @@ import { armStartupHandshakeTimeout } from './startup-handshake';
 import { treatStdinFailureAsShutdown } from './stdin-teardown';
 import { HOST_PPID_ENV } from '../extraction/wasm-runtime-flags';
 
-/** Default worker cap for a direct (single-client) session; see MCPEngineOptions.queryPoolDefaultMax (#1465). */
-const DIRECT_QUERY_POOL_MAX = 2;
-
 /**
  * Env var that marks a process as the *detached daemon* itself (set by
  * {@link spawnDetachedDaemon} when it re-invokes the CLI). Without it a
@@ -124,7 +121,7 @@ function readOnlyFallback(holder: string): MCPEngine {
  * legacy daemon. Plain-PID locks cannot prove daemon identity, but they still
  * prove that a process owns the legacy writer slot.
  */
-function makeFallbackEngine(root: string): MCPEngine {
+function makeFallbackEngine(root: string, startup: QueryStartupRequest): MCPEngine {
   assertNoRebuild(root);
   let existing: ReturnType<typeof decodeLockInfo> = null;
   try {
@@ -161,7 +158,8 @@ function makeFallbackEngine(root: string): MCPEngine {
       installChangedReason(CodeGraphPackageJsonPath, CodeGraphPackageVersion) !== null) {
     return readOnlyFallback('this session\'s CodeGraph install was upgraded or removed; restart the session to use the current one');
   }
-  return new MCPEngine({ writerLockRoot: root, queryPool: true, queryPoolDefaultMax: DIRECT_QUERY_POOL_MAX, executionMode: 'writable-fallback' });
+  const queryPolicy = resolveQueryPolicy(startup.requested, 'writable-fallback', startup.cpuCount);
+  return new MCPEngine({ writerLockRoot: root, queryPool: true, queryPolicy, executionMode: 'writable-fallback' });
 }
 
 /**
@@ -486,7 +484,7 @@ export class MCPServer {
       // Runs until the host disconnects; the proxy installs its own watchdog and
       // falls back to an in-process engine if the daemon never comes up.
       this.mode = 'proxy';
-      await this.runProxyWithLocalHandshake(root);
+      await this.runProxyWithLocalHandshake(root, this.queryStartup);
       return;
     } catch (err) {
       // Belt-and-braces: a throw during proxy SETUP (before the client was served)
@@ -684,7 +682,8 @@ export class MCPServer {
    * proxy falls back to an in-process engine if the daemon never binds, so this
    * never wedges a session.
    */
-  private async runProxyWithLocalHandshake(root: string): Promise<void> {
+  private async runProxyWithLocalHandshake(root: string, startup: QueryStartupRequest,
+    makeEngine: () => MCPEngine = () => makeFallbackEngine(root, startup)): Promise<void> {
     // The daemon may relocate its socket past an in-project filesystem that can't
     // host one (ExFAT/FAT volumes, WSL2 DrvFs; #997) to the deterministic tmpdir
     // fallback. We don't read the bound path from the lockfile — both sides walk
@@ -732,7 +731,7 @@ export class MCPServer {
         if (older === 'stopped') releaseWriterLock(root);
       }
     };
-    await runLocalHandshakeProxy({ getDaemonSocket, makeEngine: () => makeFallbackEngine(root), root });
+    await runLocalHandshakeProxy({ getDaemonSocket, makeEngine, root });
   }
 
   /** Standard SIGINT/SIGTERM handlers that route to our `stop()` (direct mode). */

@@ -162,11 +162,13 @@ describe('strict policy through actual MCP startup', () => {
     }
   }, 120000);
 
-  it('keeps the constructor request through a later environment change and default/explicit/default real queries', async () => {
+  it.each(['direct', 'writable-fallback'] as const)('keeps the constructor request through a later environment change and default/explicit/default real queries in %s', async mode => {
     const fixture = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-strict-captured-')));
     const roots = [path.join(fixture, 'alpha'), path.join(fixture, 'beta')];
     let client: ProcessClient | undefined;
     let diagnostics: unknown;
+    const observations = path.join(fixture, 'workers.jsonl');
+    const events = (): any[] => fs.existsSync(observations) ? fs.readFileSync(observations, 'utf8').split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line)) : [];
     let before: unknown[] = [];
     const registry = path.join(os.homedir(), '.codegraph', 'daemons');
     let registryBefore: unknown[] = [];
@@ -178,26 +180,40 @@ describe('strict policy through actual MCP startup', () => {
       }
       before = roots.map(root => ({ root, index: inventory(path.join(root, '.codegraph')), owners: owners(path.join(root, '.codegraph')) }));
       registryBefore = inventory(registry);
-      client = new ProcessClient([path.join(__dirname, 'fixtures/query-captured-startup.cjs'), roots[0]], roots[0], environment({
-        CODEGRAPH_NO_DAEMON: '1', CODEGRAPH_QUERY_MODE: 'default', CODEGRAPH_QUERY_POOL_SIZE: '3', CODEGRAPH_QUERY_BUSY_TIMEOUT_MS: 'unlimited',
+      client = new ProcessClient(['--require', path.join(__dirname, 'fixtures/query-unlimited-preload.cjs'), path.join(__dirname, 'fixtures/query-captured-startup.cjs'), roots[0]], roots[0], environment({
+        CODEGRAPH_NO_DAEMON: mode === 'direct' ? '1' : '0', CODEGRAPH_QUERY_MODE: 'default', CODEGRAPH_QUERY_POOL_SIZE: '3', CODEGRAPH_QUERY_BUSY_TIMEOUT_MS: 'unlimited',
+        CODEGRAPH_DAEMON_RETRY_MS: '0', QUERY_UNLIMITED_FAIL_DAEMON: mode === 'writable-fallback' ? '1' : '0',
+        QUERY_UNLIMITED_OBSERVATIONS: observations, QUERY_UNLIMITED_RELEASE: path.join(fixture, 'unused-release'),
       }));
       await client.request('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'captured-startup', version: '1' } });
       const status = await client.request('tools/call', { name: 'codegraph_status', arguments: {} });
       const parsed = parseQueryDiagnostics(status); diagnostics = parsed;
       expect(parsed.requested).toEqual({ mode: 'default', poolSize: '3', busyTimeoutMs: 'unlimited' });
-      expect(parsed.effective).toMatchObject({ source: 'strict', executionMode: 'direct', concurrency: { kind: 'finite', maximum: 3 }, deadline: { kind: 'absent' }, retention: 'ordinary' });
+      expect(parsed.effective).toMatchObject({ source: 'strict', executionMode: mode, concurrency: { kind: 'finite', maximum: 3 }, deadline: { kind: 'absent' }, retention: 'ordinary' });
       expect(parsed.implementation.support.combinedPreset).toBe(true);
       for (const [i, projectPath] of [[0, undefined], [1, roots[1]], [0, undefined]] as const) {
         const symbol = `${i ? 'beta' : 'alpha'}CapturedSymbol`;
         const result = await client.request('tools/call', { name: 'codegraph_search', arguments: { query: symbol, ...(projectPath ? { projectPath } : {}) } });
         expect(result.isError).toBeFalsy(); expect(result.content[0].text).toContain(symbol);
+        const explored = await client.request('tools/call', { name: 'codegraph_explore', arguments: { query: symbol, ...(projectPath ? { projectPath } : {}) } });
+        expect(explored.isError).toBeFalsy(); expect(explored.content[0].text).toContain(symbol);
+      }
+      const history = events().filter(event => event.event === 'session-history');
+      expect(history.map(event => [event.projectRoot, event.query, event.index])).toEqual([
+        [roots[0], 'alphaCapturedSymbol', 1], [roots[1], 'betaCapturedSymbol', 1], [roots[0], 'alphaCapturedSymbol', 2],
+      ]);
+      expect(new Set(history.map(event => event.historyId)).size).toBe(1);
+      if (mode === 'writable-fallback') {
+        expect(events().filter(event => event.event === 'unavailable-candidate-exit').map(event => event.code)).toEqual([78]);
+        expect(client.stderr).toContain('Shared daemon unavailable');
+        expect(client.stderr).not.toMatch(/version.*differs|Attached to shared daemon/);
       }
       const exit = await client.close(); expect(exit).toEqual({ code: 0, signal: null });
     } finally {
       const cleanup = await Promise.allSettled(client ? [client.close()] : []);
-      if (process.env.VALIDATION_OUT) fs.writeFileSync(path.join(process.env.VALIDATION_OUT, 'strict-captured-startup.json'), JSON.stringify({ roots, before,
+      if (process.env.VALIDATION_OUT) fs.writeFileSync(path.join(process.env.VALIDATION_OUT, `strict-captured-startup-${mode}.json`), JSON.stringify({ mode, roots, before,
         after: roots.map(root => ({ root, index: inventory(path.join(root, '.codegraph')), owners: owners(path.join(root, '.codegraph')) })),
-        registryBefore, registryAfter: inventory(registry), diagnostics, capture: client?.capture(),
+        registryBefore, registryAfter: inventory(registry), diagnostics, events: events(), capture: client?.capture(),
         cleanup: cleanup.map(result => result.status === 'fulfilled' ? result : { status: result.status, reason: String(result.reason) }) }, null, 2));
       fs.rmSync(fixture, { recursive: true, force: true });
       expect(cleanup.filter(result => result.status === 'rejected')).toEqual([]);
