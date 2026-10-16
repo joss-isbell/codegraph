@@ -26,8 +26,25 @@ describe('query execution diagnostics', () => {
     const graph = await CodeGraph.init(root);
     try { await graph.indexAll(); } finally { graph.close(); }
     let child: ChildProcessWithoutNullStreams | undefined;
-    let closed = false, stderr = '', stdout = '', socketPath: string | undefined;
+    let closed = false, socketPath: string | undefined;
     let childError: Error | undefined, primaryFailure: unknown, cleanupFailure: unknown, hello: any;
+    const outputLimit = 65536;
+    const output = { stdout: { prefix: Buffer.alloc(outputLimit), seenBytes: 0, retainedBytes: 0, truncated: false },
+      stderr: { prefix: Buffer.alloc(outputLimit), seenBytes: 0, retainedBytes: 0, truncated: false } };
+    const capture = (stream: keyof typeof output, data: Buffer) => {
+      const current = output[stream];
+      current.seenBytes += data.length;
+      const retained = Math.min(data.length, outputLimit - current.retainedBytes);
+      data.copy(current.prefix, current.retainedBytes, 0, retained);
+      current.retainedBytes += retained;
+      if (retained < data.length) {
+        current.truncated = true;
+        childError ??= new Error(`bounded daemon ${stream} overflow`);
+      }
+    };
+    const text = (stream: keyof typeof output) => output[stream].prefix.subarray(0, output[stream].retainedBytes).toString('utf8');
+    const captured = (stream: keyof typeof output) => ({ text: text(stream), seenBytes: output[stream].seenBytes,
+      retainedBytes: output[stream].retainedBytes, truncated: output[stream].truncated, limitBytes: outputLimit });
     const cleanupPhases: Array<{ phase: string; outcome: string; error?: string }> = [];
     const cleanup = async (phase: string, action: () => Promise<void> | void) => {
       try { await action(); cleanupPhases.push({ phase, outcome: 'pass' }); }
@@ -42,16 +59,18 @@ describe('query execution diagnostics', () => {
           CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '1000', CODEGRAPH_DAEMON_INSTALL_CHECK_MS: '0',
           CODEGRAPH_NO_RELAUNCH: '1', CODEGRAPH_WASM_RELAUNCHED: '1',
           CODEGRAPH_QUERY_MODE: undefined, CODEGRAPH_QUERY_POOL_SIZE: undefined, CODEGRAPH_QUERY_BUSY_TIMEOUT_MS: undefined } });
-      child.once('error', error => { childError = error; });
+      child.once('error', error => { childError ??= error; });
       child.once('close', () => { closed = true; });
-      child.stdin.on('error', error => { childError = error; });
-      child.stdout.on('data', data => { stdout += data; if (stdout.length > 65536) childError = new Error('bounded daemon stdout overflow'); });
-      child.stderr.on('data', data => { stderr += data; if (stderr.length > 65536) childError = new Error('bounded daemon stderr overflow'); });
+      child.stdin.on('error', error => { childError ??= error; });
+      // Keep draining both pipes after overflow, but never retain past the byte
+      // prefix. The sticky error makes the whole fixture fail after cleanup.
+      child.stdout.on('data', (data: Buffer) => capture('stdout', data));
+      child.stderr.on('data', (data: Buffer) => capture('stderr', data));
       await until(() => {
         if (childError) throw childError;
-        if (closed) throw new Error(`Owned daemon exited before listening: ${stderr}`);
-        return stderr.includes('[CodeGraph daemon] Listening on ');
-      }, 15000, () => stderr);
+        if (closed) throw new Error(`Owned daemon exited before listening: ${text('stderr')}`);
+        return text('stderr').includes('[CodeGraph daemon] Listening on ');
+      }, 15000, () => text('stderr'));
       socketPath = JSON.parse(fs.readFileSync(getDaemonPidPath(root), 'utf8')).socketPath;
       expect(typeof socketPath).toBe('string');
       hello = await new Promise<any>((resolve, reject) => {
@@ -81,12 +100,12 @@ describe('query execution diagnostics', () => {
       await cleanup('natural owned daemon idle exit', async () => {
         child?.stdin.end();
         if (child) {
-          await until(() => closed, 15000, () => stderr);
-          expect(childError).toBeUndefined(); expect(child.exitCode, stderr).toBe(0); expect(child.signalCode).toBeNull();
+          await until(() => closed, 15000, () => text('stderr'));
+          expect(childError).toBeUndefined(); expect(child.exitCode, text('stderr')).toBe(0); expect(child.signalCode).toBeNull();
         }
       });
       await cleanup('owned child fallback settled', async () => {
-        if (child && !closed) { child.kill('SIGKILL'); await until(() => closed, 10000, () => stderr); }
+        if (child && !closed) { child.kill('SIGKILL'); await until(() => closed, 10000, () => text('stderr')); }
       });
       await cleanup('daemon writer locks and POSIX socket removed', () => {
         expect(fs.existsSync(getDaemonPidPath(root))).toBe(false);
@@ -98,7 +117,7 @@ describe('query execution diagnostics', () => {
       });
       if (process.env.VALIDATION_OUT) fs.writeFileSync(path.join(process.env.VALIDATION_OUT, 'hello-cleanup.json'), JSON.stringify({
         root, socketPath, hello, primaryFailure: primaryFailure ? String(primaryFailure) : null,
-        cleanupFailure: cleanupFailure ? String(cleanupFailure) : null, cleanupPhases, stderr, stdout,
+        cleanupFailure: cleanupFailure ? String(cleanupFailure) : null, cleanupPhases, stderr: captured('stderr'), stdout: captured('stdout'),
         child: child ? { pid: child.pid, closed, exitCode: child.exitCode, signalCode: child.signalCode } : null,
         fixtureRemoved: !fs.existsSync(root), outcome: primaryFailure || cleanupFailure ? 'fail' : 'pass',
       }, null, 2));
