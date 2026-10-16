@@ -152,17 +152,14 @@ export class MCPEngine {
     const concurrency = this.execution.policy.concurrency;
     if (concurrency.kind === 'disabled') {
       process.stderr.write(this.opts.readOnly
-        ? '[CodeGraph MCP] Local read-only fallback uses main-thread reads unless positive finite pooling is explicitly selected.\n'
+        ? '[CodeGraph MCP] Local read-only fallback uses main-thread reads unless pooling is explicitly selected.\n'
         : '[CodeGraph MCP] Query pool disabled (CODEGRAPH_QUERY_POOL_SIZE=0); serving reads in-process.\n');
       return;
     }
-    // #11 activates explicit finite read-only pooling only. The opt-in unlimited
-    // lifecycle and public preset uptake remain with #14/#15.
-    if (this.opts.readOnly && concurrency.kind !== 'finite') return;
     this.queryPool = new QueryPool({ root, execution: this.execution });
     this.toolHandler.setQueryPool(this.queryPool);
-    const size = concurrency.kind === 'finite' ? concurrency.maximum : 'unlimited';
-    process.stderr.write(`[CodeGraph MCP] Query pool: up to ${size} worker thread(s) for concurrent reads${this.opts.readOnly ? ' (local read-only fallback; no writer or auto-sync ownership)' : ''}.\n`);
+    const capacity = concurrency.kind === 'finite' ? `up to ${concurrency.maximum} worker thread(s)` : 'on-demand worker threads with no configured maximum';
+    process.stderr.write(`[CodeGraph MCP] Query pool: ${capacity} for concurrent reads${this.opts.readOnly ? ' (local read-only fallback; no writer or auto-sync ownership)' : ''}.\n`);
   }
 
   /**
@@ -206,9 +203,7 @@ export class MCPEngine {
       lifecycle: pool?.state ?? 'disabled', ready: pool?.ready ?? false,
       concurrency: pooled ? this.execution.policy.concurrency : { kind: 'disabled' as const },
       deadline: pooled ? this.execution.policy.deadline : { kind: 'inapplicable' as const },
-      // Retirement is represented in the resolved contract; lifecycle #14
-      // implements it. Do not claim the requested behavior is already active.
-      retention: 'ordinary' as const, workers: pool?.liveWorkers ?? 0,
+      retention: pool ? this.execution.policy.retention : 'ordinary' as const, workers: pool?.liveWorkers ?? 0,
     } });
   }
 

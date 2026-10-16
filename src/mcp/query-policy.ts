@@ -98,25 +98,29 @@ export function resolveLegacyPoolSize(raw: string | undefined, cpuCount: number)
   return Math.max(1, Math.min(cpuCount - 1, 16));
 }
 
-/** Snapshot public settings once; the independent waiting sentinel does not activate a preset. */
+/** Snapshot independent public controls once; neither sentinel activates a preset. */
 export function resolveLegacyQueryPolicy(requested: RequestedQueryPolicy, executionMode: QueryExecutionMode, cpuCount: number,
   options: { poolEnabled?: boolean; defaultMaximum?: number } = {}): ResolvedQueryPolicy {
   const defaults = queryDefaults(executionMode, cpuCount);
+  const unlimitedPool = requested.poolSize?.trim() === 'unlimited';
   let size = resolveLegacyPoolSize(requested.poolSize, cpuCount);
   const defaultMaximum = options.defaultMaximum ?? (executionMode === 'shared-daemon' ? 16 : 2);
   if (requested.poolSize === undefined || requested.poolSize === '') size = Math.min(size, defaultMaximum);
-  // Read-only fallback has no ordinary pool. Only an applicable explicit
-  // positive finite selection opts these exceptional local readers in.
-  const explicitReadOnlyPool = requested.poolSize !== undefined && requested.poolSize !== ''
+  // Read-only fallback has no ordinary pool. An explicit unlimited or positive
+  // finite selection opts these exceptional local readers in.
+  const explicitReadOnlyPool = unlimitedPool || (requested.poolSize !== undefined && requested.poolSize !== ''
     && Number.isFinite(Number(requested.poolSize)) && Number(requested.poolSize) > 0
-    && Number.isSafeInteger(Math.floor(Number(requested.poolSize)));
+    && Number.isSafeInteger(Math.floor(Number(requested.poolSize))));
   if (options.poolEnabled === false || (executionMode === 'read-only-fallback' && !explicitReadOnlyPool)) size = 0;
+  const pooledUnlimited = unlimitedPool && options.poolEnabled !== false;
   const n = Number(requested.busyTimeoutMs);
   // Node clamps an overflowing timeout to 1 ms. Until strict public parsing
   // lands, preserve malformed-input fallback rather than scheduling that timer.
   const milliseconds = requested.busyTimeoutMs !== undefined && requested.busyTimeoutMs !== '' && Number.isFinite(n) && n >= 1000 && n <= MAX_QUERY_BUSY_TIMEOUT_MS ? Math.floor(n) : QUERY_BUSY_TIMEOUT_MS;
   return immutable({ requested: { ...requested }, executionMode, defaults, preset: 'default', source: 'legacy',
-    concurrency: size === 0 ? { kind: 'disabled' } : { kind: 'finite', maximum: size },
-    deadline: size === 0 ? { kind: 'inapplicable' } : requested.busyTimeoutMs?.trim() === 'unlimited' ? { kind: 'absent' } : { kind: 'finite', milliseconds },
-    retention: 'ordinary', classification: requested.poolSize !== undefined || requested.busyTimeoutMs !== undefined ? 'custom' : 'default' });
+    concurrency: pooledUnlimited ? { kind: 'unlimited' } : size === 0 ? { kind: 'disabled' } : { kind: 'finite', maximum: size },
+    deadline: size === 0 && !pooledUnlimited ? { kind: 'inapplicable' } : requested.busyTimeoutMs?.trim() === 'unlimited' ? { kind: 'absent' } : { kind: 'finite', milliseconds },
+    retention: unlimitedPool ? 'retire-idle' : 'ordinary',
+    classification: pooledUnlimited && requested.busyTimeoutMs?.trim() === 'unlimited' ? 'unlimited'
+      : requested.poolSize !== undefined || requested.busyTimeoutMs !== undefined ? 'custom' : 'default' });
 }
