@@ -131,6 +131,7 @@ describe('MCP initialize handshake (issue #172)', () => {
     expect(json.id).toBe(0);
     expect(json.result.protocolVersion).toBeDefined();
     expect(json.result.capabilities.tools).toBeDefined();
+    expect(json.result.instructions).toContain('Query execution observations');
   }, 10000);
 
   it('sends initialize response BEFORE tryInitializeDefault finishes', async () => {
@@ -159,6 +160,7 @@ describe('MCP initialize handshake (issue #172)', () => {
     const json = JSON.parse(response.text);
     expect(json.id).toBe(0);
     expect(json.result.serverInfo.name).toBe('codegraph');
+    expect(json.result.instructions).toContain('Query execution observations');
   }, 20000);
 
   it('answers resources/list and prompts/list with empty lists, not -32601 (issue #621)', async () => {

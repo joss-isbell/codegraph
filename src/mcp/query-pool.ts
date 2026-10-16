@@ -105,6 +105,8 @@ interface Job {
 }
 
 export interface QueryPoolOptions {
+  /** Internal engine adapter: diagnostics and open chats must not create workers. */
+  warmWorker?: boolean;
   /** Engine-resolved immutable policy/authority; bypasses every legacy env parser. */
   execution?: QueryExecutionContext;
   /** Default project root each worker opens at spawn, or null for per-call projects. */
@@ -167,6 +169,8 @@ export class QueryPool {
   private destroyPromise: Promise<void> | null = null;
   private nextId = 1;
   private totalCrashes = 0;
+  private everReady = false;
+  private recovering = false;
   private destroyed = false;
   private accepting = true;
   private quietWaiters: Array<{ resolve: () => void; reject: (error: Error) => void }> = [];
@@ -196,7 +200,7 @@ export class QueryPool {
     this.maxRetries = opts.maxRetries ?? 1;
     this.createWorker = opts.createWorker ?? (() => new Worker(WORKER_FILE, { workerData: { root: this.root, execution: this.execution } }));
     this.startSettleMs = opts.startSettleMs ?? WORKER_START_SETTLE_MS;
-    this.spawnOne(); // one eager warm worker, ready for the first call
+    if (opts.warmWorker !== false) this.spawnOne(); // preserve standalone callers
   }
 
   /** Pool size cap (for logging/status). */
@@ -246,7 +250,19 @@ export class QueryPool {
    * recovering demand still belongs to this pool and waits in its queue.
    */
   get ready(): boolean {
-    return this.healthy && this.workers.size > this.pendingWorkers.size;
+    return this.healthy && (this.idle.some(worker => !this.retirements.has(worker))
+      || [...this.inflight.keys()].some(worker => !this.retirements.has(worker)));
+  }
+
+  /** Pure observation: never dispatches, starts workers or resets idle grace. */
+  get observation() {
+    const activity = this.activity;
+    const ready = this.ready;
+    const state = this.destroyed ? 'stopped' as const : this.failure ? 'unavailable' as const
+      : !this.accepting ? 'draining' as const : ready ? 'active' as const
+      : activity.starting ? this.recovering ? 'recovering' as const : 'starting' as const
+      : this.workers.size ? 'retiring' as const : this.everReady ? 'retired' as const : 'cold' as const;
+    return Object.freeze({ state, ready, workers: this.liveWorkers, ...activity, reason: this.failure ?? this.cleanupFailure?.message ?? null });
   }
 
   private spawnOne(): void {
@@ -255,6 +271,7 @@ export class QueryPool {
     try {
       w = this.createWorker();
     } catch {
+      this.recovering = true;
       this.totalCrashes++; // counts toward the circuit breaker
       if (this.totalCrashes >= CRASH_BUDGET) this.fail('worker creation failed repeatedly');
       return;
@@ -288,6 +305,8 @@ export class QueryPool {
         this.onWorkerGone(w); // failed opens consume the same budget as crashes
         return;
       }
+      this.everReady = true;
+      this.recovering = false;
       this.idle.push(w);
       this.drain();
       return;
@@ -315,6 +334,7 @@ export class QueryPool {
     this.pendingWorkers.delete(w);
     this.idle = this.idle.filter((x) => x !== w);
     this.totalCrashes++;
+    this.recovering = true;
     const job = this.inflight.get(w);
     this.inflight.delete(w);
     if (job?.abandonmentTimer) clearTimeout(job.abandonmentTimer);

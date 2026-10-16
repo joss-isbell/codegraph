@@ -152,9 +152,11 @@ describe('real query worker context', () => {
     try {
       await engine.ensureInitialized(root);
       expect(engine.getQueryExecutionContext()).toMatchObject({ capability: 'read-only', ownership: { writer: false, synchronization: false }, policy: { concurrency: { kind: 'unlimited' }, deadline: { kind: 'absent' } } });
-      expect(engine.getQueryExecutionState().actual).toMatchObject({ dispatch: 'worker', concurrency: { kind: 'unlimited' }, deadline: { kind: 'absent' }, retention: 'retire-idle', workers: 1 });
+      expect(engine.getQueryExecutionState().actual).toMatchObject({ dispatch: 'worker', concurrency: { kind: 'unlimited' }, deadline: { kind: 'absent' }, retention: 'retire-idle', workers: 0 });
+      expect(engine.getQueryDiagnostics().lifecycle).toMatchObject({ state: 'cold', ready: false });
       const response = await engine.getToolHandler().execute('codegraph_search', { query: 'contextSymbol' });
       expect(response.content[0].text).toContain('app.ts:1');
+      expect(engine.getQueryDiagnostics().lifecycle).toMatchObject({ state: 'active', ready: true, workers: 1 });
       expect(fs.existsSync(path.join(root, '.codegraph', 'writer.pid'))).toBe(false);
     } finally { await engine.stop(); }
   }, 30000);

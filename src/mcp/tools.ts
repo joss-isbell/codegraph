@@ -1967,6 +1967,7 @@ export class ToolHandler {
   // Optional worker-thread pool for off-loop read-tool dispatch. When ready +
   // healthy, heavy reads leave the main loop free for the MCP transport.
   private queryPool: QueryPool | null = null;
+  private queryDiagnostics: ((project: import('./query-diagnostics').QueryDiagnostics['project']) => import('./query-diagnostics').QueryDiagnostics) | null = null;
 
   constructor(private cg: CodeGraph | null, private readonly execution?: QueryExecutionContext) {}
 
@@ -1978,6 +1979,11 @@ export class ToolHandler {
    */
   setQueryPool(pool: QueryPool | null): void {
     this.queryPool = pool;
+  }
+
+  /** Engine-owned pure observation; the read worker never owns this provider. */
+  setQueryDiagnostics(provider: NonNullable<ToolHandler['queryDiagnostics']>): void {
+    this.queryDiagnostics = provider;
   }
 
   /**
@@ -8118,6 +8124,10 @@ export class ToolHandler {
     }
 
     // Text only, for the same reason as the stale-answer path (#2088).
+    if (this.queryDiagnostics) lines.push('', '**Query execution**', '```json', JSON.stringify(this.queryDiagnostics({
+      route: typeof args.projectPath === 'string' ? 'explicit' : 'default',
+      root: realpathSync(cg.getProjectRoot()), index: realpathSync(getDatabasePath(cg.getProjectRoot())),
+    }), null, 2), '```');
     return this.textResult(lines.join('\n'));
   }
 
