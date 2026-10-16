@@ -42,6 +42,7 @@ import { CodeGraph } from '../src';
 import { getDaemonSocketPath } from '../src/mcp/daemon-paths';
 import { CodeGraphPackageVersion } from '../src/mcp/version';
 import { once } from 'events';
+import { performance } from 'perf_hooks';
 import { WASM_RUNTIME_FLAGS } from '../src/extraction/wasm-runtime-flags';
 import { recordSpawns, removeSpawnLog, settleLosingCandidates } from './daemon-candidates';
 
@@ -165,6 +166,33 @@ function readDaemonLog(root: string): string {
   catch { return ''; }
 }
 
+/** Bounded diagnostic prefixes; do not read a whole growing log into memory. */
+function shutdownFile(file: string, limitBytes: number) {
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(file, 'r');
+    // procfs reports size zero even when its virtual file has content.
+    const stat = fs.fstatSync(fd), prefix = Buffer.alloc(limitBytes);
+    const retainedBytes = fs.readSync(fd, prefix, 0, prefix.length, 0);
+    const extra = retainedBytes === limitBytes ? fs.readSync(fd, Buffer.alloc(1), 0, 1, retainedBytes) : 0;
+    return { present: true as const, text: prefix.subarray(0, retainedBytes).toString('utf8'), seenBytes: Math.max(stat.size, retainedBytes + extra),
+      retainedBytes, limitBytes, truncated: stat.size > retainedBytes || extra > 0,
+      identity: { dev: stat.dev, ino: stat.ino, mtimeMs: stat.mtimeMs, size: stat.size } };
+  } catch (error) { return { present: false as const, code: (error as NodeJS.ErrnoException).code,
+    error: String(error).slice(0, 1024), text: '', truncated: false }; }
+  finally { if (fd !== undefined) fs.closeSync(fd); }
+}
+
+function shutdownProcess(pid: number) {
+  if (process.platform !== 'linux') return { pid, alive: isAlive(pid), proc: 'unavailable' };
+  const stat = shutdownFile(`/proc/${pid}/stat`, 4096);
+  if (!stat.present) return { pid, alive: isAlive(pid), proc: stat.code === 'ENOENT' ? 'absent' : 'unavailable', detail: stat.error };
+  const fields = stat.text.slice(stat.text.lastIndexOf(')') + 2).trim().split(/\s+/);
+  const state = fields[0];
+  return { pid, alive: isAlive(pid), state, ppid: Number(fields[1]), startTimeTicks: fields[19], truncated: stat.truncated,
+    proc: state === 'Z' ? 'zombie' : state === 'T' || state === 't' ? 'stopped' : 'live' };
+}
+
 function countListeningLines(root: string): number {
   return readDaemonLog(root).split('\n').filter((l) => l.includes('[CodeGraph daemon] Listening on')).length;
 }
@@ -192,8 +220,11 @@ describe('Shared MCP daemon (issue #411)', () => {
   let tempDir: string;   // the (possibly symlinked) path processes are spawned with
   let realRoot: string;  // its canonical form — what the daemon keys paths on
   const servers: SpawnedServer[] = [];
+  let shutdownDiagnostic: ((phase: string) => void) | undefined;
+  let shutdownDiagnosticFailure: unknown;
 
   beforeEach(async () => {
+    shutdownDiagnostic = undefined; shutdownDiagnosticFailure = undefined;
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-mcp-daemon-'));
     const cg = await CodeGraph.init(tempDir);
     cg.close();
@@ -201,6 +232,7 @@ describe('Shared MCP daemon (issue #411)', () => {
   });
 
   afterEach(async () => {
+    shutdownDiagnostic?.('afterEach before owned cleanup');
     // The runtime flags avoid an intermediate relaunch process. Wait for each
     // actual server to exit before removing its Windows working directory.
     await Promise.all(servers.map(async ({ child }) => {
@@ -223,9 +255,12 @@ describe('Shared MCP daemon (issue #411)', () => {
       await waitProcessExit(daemonPid, 5000);
     }
     await new Promise((r) => setTimeout(r, 50));
+    shutdownDiagnostic?.('afterEach after owned cleanup before deletion');
     servers.length = 0;
     removeSpawnLog(tempDir);
     await fs.promises.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    shutdownDiagnostic?.('afterEach after fixture deletion');
+    if (shutdownDiagnosticFailure) throw shutdownDiagnosticFailure;
   }, 45_000);
 
   it.runIf(process.platform !== 'win32')('stops despite a socket still waiting for its client hello (#1963)', async () => {
@@ -238,16 +273,48 @@ describe('Shared MCP daemon (issue #411)', () => {
     await waitFor(() => server.stderr.some((l) => l.includes('Attached to shared daemon')), 10000);
     const pid = await waitFor(() => readLockPid(realRoot), 10000);
     const raw = net.connect(getDaemonSocketPath(realRoot));
+    let started: number | undefined, samples: any[] = [], snapshots: any[] = [], primaryFailure: string | null = null;
+    let exitedWithinDeadline: boolean | undefined;
+    const sample = () => {
+      if (samples.length >= 128) { shutdownDiagnosticFailure ??= new Error('bounded shutdown sample overflow'); return; }
+      samples.push({ elapsedMs: started === undefined ? null : performance.now() - started, process: shutdownProcess(pid) });
+    };
+    shutdownDiagnostic = phase => {
+      try {
+        if (snapshots.length >= 16) throw new Error('bounded shutdown snapshot overflow');
+        const files = { daemonLog: shutdownFile(path.join(realRoot, '.codegraph/daemon.log'), 65536),
+          daemonLock: shutdownFile(path.join(realRoot, '.codegraph/daemon.pid'), 4096),
+          writerLock: shutdownFile(path.join(realRoot, '.codegraph/writer.pid'), 4096) };
+        if (Object.values(files).some(file => file.truncated)) shutdownDiagnosticFailure ??= new Error('bounded shutdown file prefix overflow');
+        sample(); snapshots.push({ phase, elapsedMs: started === undefined ? null : performance.now() - started, files,
+          raw: { destroyed: raw.destroyed, readable: raw.readable, writable: raw.writable }, process: shutdownProcess(pid) });
+        if (process.env.VALIDATION_OUT) fs.writeFileSync(path.join(process.env.VALIDATION_OUT, 'daemon-shutdown-diagnostic.json'),
+          JSON.stringify({ root: realRoot, pid, deadlineMs: 1500, exitedWithinDeadline, primaryFailure,
+            captureFailure: shutdownDiagnosticFailure ? String(shutdownDiagnosticFailure) : null, samples, snapshots }, null, 2));
+      } catch (error) { shutdownDiagnosticFailure ??= error; }
+    };
+    let sampling: NodeJS.Timeout | undefined;
     try {
       await new Promise<void>((resolve, reject) => {
         raw.once('data', () => resolve());
         raw.once('error', reject);
       });
+      shutdownDiagnostic('before SIGTERM');
+      started = performance.now(); sampling = setInterval(sample, 25);
       process.kill(pid, 'SIGTERM');
-      expect(await waitProcessExit(pid, 1500)).toBe(true);
+      shutdownDiagnostic('after SIGTERM');
+      exitedWithinDeadline = await waitProcessExit(pid, 1500);
+      clearInterval(sampling); sampling = undefined;
+      shutdownDiagnostic('before original exit assertion');
+      expect(exitedWithinDeadline).toBe(true);
       expect(fs.existsSync(path.join(realRoot, '.codegraph', 'writer.pid'))).toBe(false);
+      shutdownDiagnostic('after original assertions');
+    } catch (error) { primaryFailure = String(error); throw error;
     } finally {
+      if (sampling) clearInterval(sampling);
+      shutdownDiagnostic('finally before raw close');
       raw.destroy();
+      shutdownDiagnostic('finally after raw close');
     }
   }, 20000);
 
