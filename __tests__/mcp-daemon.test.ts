@@ -167,30 +167,68 @@ function readDaemonLog(root: string): string {
 }
 
 /** Bounded diagnostic prefixes; do not read a whole growing log into memory. */
-function shutdownFile(file: string, limitBytes: number) {
+function shutdownFile(file: string, limitBytes: number, allowMissing: boolean) {
+  const result: { present: boolean | null; text: string; seenBytes: number; retainedBytes: number;
+    limitBytes: number; truncated: boolean; code?: string; error?: string; expectedMissing?: boolean;
+    identity?: { dev: number; ino: number; mtimeMs: number; size: number }; captureErrors: string[] } = {
+    present: null, text: '', seenBytes: 0, retainedBytes: 0, limitBytes, truncated: false, captureErrors: [],
+  };
   let fd: number | undefined;
   try {
     fd = fs.openSync(file, 'r');
+    result.present = true;
     // procfs reports size zero even when its virtual file has content.
     const stat = fs.fstatSync(fd), prefix = Buffer.alloc(limitBytes);
     const retainedBytes = fs.readSync(fd, prefix, 0, prefix.length, 0);
+    result.text = prefix.subarray(0, retainedBytes).toString('utf8');
+    result.retainedBytes = retainedBytes;
+    result.seenBytes = Math.max(stat.size, retainedBytes);
+    result.identity = { dev: stat.dev, ino: stat.ino, mtimeMs: stat.mtimeMs, size: stat.size };
     const extra = retainedBytes === limitBytes ? fs.readSync(fd, Buffer.alloc(1), 0, 1, retainedBytes) : 0;
-    return { present: true as const, text: prefix.subarray(0, retainedBytes).toString('utf8'), seenBytes: Math.max(stat.size, retainedBytes + extra),
-      retainedBytes, limitBytes, truncated: stat.size > retainedBytes || extra > 0,
-      identity: { dev: stat.dev, ino: stat.ino, mtimeMs: stat.mtimeMs, size: stat.size } };
-  } catch (error) { return { present: false as const, code: (error as NodeJS.ErrnoException).code,
-    error: String(error).slice(0, 1024), text: '', truncated: false }; }
-  finally { if (fd !== undefined) fs.closeSync(fd); }
+    result.seenBytes = Math.max(stat.size, retainedBytes + extra);
+    result.truncated = stat.size > retainedBytes || extra > 0;
+  } catch (error) {
+    result.code = (error as NodeJS.ErrnoException).code;
+    result.error = String(error).slice(0, 1024);
+    result.expectedMissing = result.code === 'ENOENT' && allowMissing;
+    if (result.code === 'ENOENT') result.present = false;
+    if (!result.expectedMissing) result.captureErrors.push(result.error);
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); }
+      catch (error) { result.captureErrors.push(`close: ${String(error)}`.slice(0, 1024)); }
+    }
+  }
+  return result;
 }
 
-function shutdownProcess(pid: number) {
+function shutdownProcess(pid: number, allowMissing: boolean, captureFailure: (error: string) => void) {
   if (process.platform !== 'linux') return { pid, alive: isAlive(pid), proc: 'unavailable' };
-  const stat = shutdownFile(`/proc/${pid}/stat`, 4096);
-  if (!stat.present) return { pid, alive: isAlive(pid), proc: stat.code === 'ENOENT' ? 'absent' : 'unavailable', detail: stat.error };
+  const stat = shutdownFile(`/proc/${pid}/stat`, 4096, allowMissing);
+  stat.captureErrors.forEach(captureFailure);
+  if (stat.truncated) captureFailure('bounded shutdown proc prefix overflow');
+  if (stat.present !== true) return { pid, alive: isAlive(pid), proc: stat.code === 'ENOENT' ? 'absent' : 'unavailable', detail: stat.error };
   const fields = stat.text.slice(stat.text.lastIndexOf(')') + 2).trim().split(/\s+/);
   const state = fields[0];
+  if (!/^[A-Za-z]$/.test(state) || !/^\d+$/.test(fields[1]) || !/^\d+$/.test(fields[19])) {
+    captureFailure('invalid bounded shutdown proc stat fields');
+  }
   return { pid, alive: isAlive(pid), state, ppid: Number(fields[1]), startTimeTicks: fields[19], truncated: stat.truncated,
     proc: state === 'Z' ? 'zombie' : state === 'T' || state === 't' ? 'stopped' : 'live' };
+}
+
+/** The exit must be observed within the original signal-relative budget, including diagnostic I/O. */
+function waitProcessExitBefore(pid: number, deadline: number): Promise<{ exited: boolean; observedAt: number }> {
+  return new Promise(resolve => {
+    const tick = () => {
+      if (performance.now() > deadline) return resolve({ exited: false, observedAt: performance.now() });
+      const alive = isAlive(pid), observedAt = performance.now();
+      if (observedAt > deadline) return resolve({ exited: false, observedAt });
+      if (!alive) return resolve({ exited: true, observedAt });
+      setTimeout(tick, Math.min(25, Math.max(0, deadline - observedAt)));
+    };
+    tick();
+  });
 }
 
 function countListeningLines(root: string): number {
@@ -275,21 +313,29 @@ describe('Shared MCP daemon (issue #411)', () => {
     const raw = net.connect(getDaemonSocketPath(realRoot));
     let started: number | undefined, samples: any[] = [], snapshots: any[] = [], primaryFailure: string | null = null;
     let exitedWithinDeadline: boolean | undefined;
+    let exitObservedElapsedMs: number | undefined;
+    let ownedCleanupFinished = false;
+    const captureFailure = (error: string) => { shutdownDiagnosticFailure ??= new Error(error); };
+    const processSnapshot = () => shutdownProcess(pid, started !== undefined || ownedCleanupFinished, captureFailure);
     const sample = () => {
       if (samples.length >= 128) { shutdownDiagnosticFailure ??= new Error('bounded shutdown sample overflow'); return; }
-      samples.push({ elapsedMs: started === undefined ? null : performance.now() - started, process: shutdownProcess(pid) });
+      const process = processSnapshot();
+      samples.push({ elapsedMs: started === undefined ? null : performance.now() - started, process });
     };
     shutdownDiagnostic = phase => {
       try {
         if (snapshots.length >= 16) throw new Error('bounded shutdown snapshot overflow');
-        const files = { daemonLog: shutdownFile(path.join(realRoot, '.codegraph/daemon.log'), 65536),
-          daemonLock: shutdownFile(path.join(realRoot, '.codegraph/daemon.pid'), 4096),
-          writerLock: shutdownFile(path.join(realRoot, '.codegraph/writer.pid'), 4096) };
+        const deleted = phase === 'afterEach after fixture deletion';
+        if (phase === 'afterEach after owned cleanup before deletion' || deleted) ownedCleanupFinished = true;
+        const files = { daemonLog: shutdownFile(path.join(realRoot, '.codegraph/daemon.log'), 65536, deleted),
+          daemonLock: shutdownFile(path.join(realRoot, '.codegraph/daemon.pid'), 4096, started !== undefined || ownedCleanupFinished),
+          writerLock: shutdownFile(path.join(realRoot, '.codegraph/writer.pid'), 4096, started !== undefined || ownedCleanupFinished) };
+        Object.values(files).flatMap(file => file.captureErrors).forEach(captureFailure);
         if (Object.values(files).some(file => file.truncated)) shutdownDiagnosticFailure ??= new Error('bounded shutdown file prefix overflow');
         sample(); snapshots.push({ phase, elapsedMs: started === undefined ? null : performance.now() - started, files,
-          raw: { destroyed: raw.destroyed, readable: raw.readable, writable: raw.writable }, process: shutdownProcess(pid) });
+          raw: { destroyed: raw.destroyed, readable: raw.readable, writable: raw.writable }, process: processSnapshot() });
         if (process.env.VALIDATION_OUT) fs.writeFileSync(path.join(process.env.VALIDATION_OUT, 'daemon-shutdown-diagnostic.json'),
-          JSON.stringify({ root: realRoot, pid, deadlineMs: 1500, exitedWithinDeadline, primaryFailure,
+          JSON.stringify({ root: realRoot, pid, deadlineMs: 1500, exitedWithinDeadline, exitObservedElapsedMs, primaryFailure,
             captureFailure: shutdownDiagnosticFailure ? String(shutdownDiagnosticFailure) : null, samples, snapshots }, null, 2));
       } catch (error) { shutdownDiagnosticFailure ??= error; }
     };
@@ -302,8 +348,10 @@ describe('Shared MCP daemon (issue #411)', () => {
       shutdownDiagnostic('before SIGTERM');
       started = performance.now(); sampling = setInterval(sample, 25);
       process.kill(pid, 'SIGTERM');
+      const exitObservation = waitProcessExitBefore(pid, started + 1500);
       shutdownDiagnostic('after SIGTERM');
-      exitedWithinDeadline = await waitProcessExit(pid, 1500);
+      const observed = await exitObservation;
+      exitedWithinDeadline = observed.exited; exitObservedElapsedMs = observed.observedAt - started;
       clearInterval(sampling); sampling = undefined;
       shutdownDiagnostic('before original exit assertion');
       expect(exitedWithinDeadline).toBe(true);
