@@ -17,6 +17,17 @@
  * tools (node/search/callers/…) stay defined and are re-enablable via
  * CODEGRAPH_MCP_TOOLS, but they are NOT listed to agents, so don't name them.
  */
+const QUERY_EXECUTION_GUIDANCE = `## Query execution observations
+
+Separate requested settings from effective policy and live query-worker
+readiness. Cold or retired query pools have no ready query workers; status
+checks and heartbeats are not query demand. Status may still use a separate,
+short-lived freshness-measurement worker. Resource PID, generation and scope
+identify the query engine; writerAuthority and synchronizationAuthority mean
+engine permission, not a held project writer lease. Missing observations from
+older services remain unknown and never prove matching policy or permission
+to reuse a service.`;
+
 export const SERVER_INSTRUCTIONS = `# Codegraph — code intelligence over an indexed knowledge graph
 
 Codegraph is a SQLite knowledge graph of every symbol, edge, and file in
@@ -75,6 +86,8 @@ calls; a grep/read exploration is dozens.
 - Index lags file writes by ~1 second.
 - Cross-file resolution is best-effort name matching; ambiguous calls may return multiple candidates.
 - No live correctness validation — that's still the TypeScript compiler / test suite / linter's job. Codegraph supplements those with structural context they don't have.
+
+${QUERY_EXECUTION_GUIDANCE}
 `;
 
 /**
@@ -108,4 +121,6 @@ default project — but the tools are available and work **per project**:
   for that project. Indexing is the user's decision — don't run it yourself, but
   if it comes up they can run \`codegraph init\` in a project to enable codegraph
   there (a new index is picked up live, no restart).
+
+${QUERY_EXECUTION_GUIDANCE}
 `;

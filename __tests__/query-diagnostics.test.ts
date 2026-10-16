@@ -6,14 +6,9 @@ import * as net from 'net';
 import { CodeGraph, getDatabasePath } from '../src';
 import type { MCPEngine } from '../src/mcp/engine';
 import * as QueryDiagnosticSchema from '../src/mcp/query-diagnostics';
+import { parseQueryDiagnostics as diagnostics } from './query-diagnostics-helper';
 const { MCPEngine: BuiltEngine } = require('../dist/mcp/engine') as { MCPEngine: new (...args: any[]) => MCPEngine };
 const { Daemon: BuiltDaemon, tryAcquireDaemonLock } = require('../dist/mcp/daemon');
-
-const diagnostics = (result: { content: Array<{ text: string }> }) => {
-  const match = result.content[0].text.match(/\*\*Query execution\*\*\n```json\n([\s\S]*?)\n```/);
-  expect(match, 'status carries verifiable execution diagnostics').not.toBeNull();
-  return JSON.parse(match![1]);
-};
 
 describe('query execution diagnostics', () => {
   it('advertises the actual cold engine identity and policy in the daemon hello without query demand', async () => {

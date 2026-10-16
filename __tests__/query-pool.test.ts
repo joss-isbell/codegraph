@@ -401,11 +401,15 @@ describe('MCP query pool with real projects (#1465)', () => {
     const activeEngine = await start(hasDefault ? alpha : workspace);
     expect(pool).not.toBeNull();
     expect(pool!.ready).toBe(false);
+    expect(pool!.liveWorkers).toBe(0);
+    const handler = activeEngine.getToolHandler();
+    const first = await handler.execute('codegraph_search', { projectPath: alpha, query: 'alphaSymbol' });
+    expect(first.isError).toBeFalsy(); expect(first.content[0].text).toContain('alphaSymbol');
+    expect(pool!.ready).toBe(true); expect(pool!.liveWorkers).toBe(1);
     const workerResults: unknown[] = [];
     for (const worker of (pool as unknown as { workers: Set<Worker> }).workers) {
       worker.on('message', message => { if (message.type === 'result') workerResults.push(message); });
     }
-    const handler = activeEngine.getToolHandler();
     const session = new ExploreSessionState();
     const calls = Array.from({ length: 6 }, (_, i) => {
       const projectPath = i % 2 ? beta : alpha;

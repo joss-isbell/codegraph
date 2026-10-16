@@ -9,7 +9,8 @@ import { CodeGraph, getDatabasePath } from '../src';
 import { createDatabase } from '../src/db/sqlite-adapter';
 import { getWriterPidPath, tryAcquireWriterLock, releaseWriterLock } from '../src/mcp/writer-lock';
 import { WASM_RUNTIME_FLAGS } from '../src/extraction/wasm-runtime-flags';
-import { readQueryDiagnostics, type QueryDiagnostics } from '../src/mcp/query-diagnostics';
+import type { QueryDiagnostics } from '../src/mcp/query-diagnostics';
+import { parseQueryDiagnostics as diagnostic } from './query-diagnostics-helper';
 import { recordSpawns, removeSpawnLog, settleLosingCandidates, spawnLogFor } from './daemon-candidates';
 
 const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -26,15 +27,6 @@ const profiles = {
   'finite-no-deadline': { CODEGRAPH_QUERY_MODE: 'unlimited', CODEGRAPH_QUERY_POOL_SIZE: '2', CODEGRAPH_QUERY_BUSY_TIMEOUT_MS: 'unlimited' },
 } as const;
 type Profile = keyof typeof profiles;
-const diagnostic = (result: any): QueryDiagnostics => {
-  expect(result.isError).toBeFalsy();
-  const match = result.content[0].text.match(/\*\*Query execution\*\*\n```json\n([\s\S]*?)\n```/);
-  expect(match, 'actual status contains the versioned execution observation').not.toBeNull();
-  const value = JSON.parse(match![1]);
-  expect(readQueryDiagnostics(value)).toEqual(value);
-  return value;
-};
-
 class Client {
   child: ChildProcessWithoutNullStreams;
   replies: any[] = [];
