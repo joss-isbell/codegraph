@@ -44,6 +44,7 @@ import * as fs from 'fs';
 import * as net from 'net';
 import * as path from 'path';
 import { MCPEngine } from './engine';
+import type { QueryDiagnostics } from './query-diagnostics';
 import { MCPSession } from './session';
 import { SocketTransport } from './transport';
 import {
@@ -169,6 +170,8 @@ export interface DaemonHello {
   pid: number;       // daemon pid (informational; for `ps` debugging)
   socketPath: string; // echoed back so the proxy can log it
   protocol: 1;       // bump if the hello shape changes
+  /** Optional for older peers. Reporting does not authorize reuse compatibility. */
+  queryExecution?: QueryDiagnostics;
 }
 
 /**
@@ -445,6 +448,7 @@ export class Daemon {
       pid: process.pid,
       socketPath: this.socketPath,
       protocol: 1,
+      queryExecution: this.engine.getQueryDiagnostics(),
     };
     socket.write(JSON.stringify(hello) + '\n');
 

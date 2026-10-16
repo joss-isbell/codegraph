@@ -8,6 +8,11 @@ import { QueryPool } from '../src/mcp/query-pool';
 import { resolveQueryPolicy, type QueryExecutionMode } from '../src/mcp/query-policy';
 import { createQueryExecutionContext, createQueryRequestContext, routeQueryRequest } from '../src/mcp/query-context';
 
+async function until(check: () => boolean, milliseconds: number) {
+  const deadline = Date.now() + milliseconds;
+  while (!check()) { if (Date.now() > deadline) throw new Error('independent recovery observation deadline'); await new Promise(resolve => setTimeout(resolve, 10)); }
+}
+
 describe('unlimited capacity recovery without a busy timer', () => {
   it.each(['direct', 'writable-fallback', 'read-only-fallback', 'shared-daemon'] as QueryExecutionMode[])
   ('recovers actual startup loss to a real SQLite result in %s', async mode => {
@@ -18,7 +23,7 @@ describe('unlimited capacity recovery without a busy timer', () => {
     const execution = createQueryExecutionContext(resolveQueryPolicy({ poolSize: 'unlimited', busyTimeoutMs: 'unlimited' }, mode, 8),
       { readOnly, writer: !readOnly, synchronization: !readOnly });
     const workers: Worker[] = [], observations: any[] = [];
-    const pool = new QueryPool({ root, execution, createWorker: () => {
+    const pool = new QueryPool({ root, execution, warmWorker: false, createWorker: () => {
       const file = workers.length ? path.resolve(__dirname, '../dist/mcp/query-worker.js') : path.join(__dirname, 'fixtures/query-capacity-worker.cjs');
       const worker = new Worker(file, { workerData: workers.length ? { root, execution } : { mode: 'exit-start' } });
       const threadId = worker.threadId; workers.push(worker);
@@ -28,15 +33,29 @@ describe('unlimited capacity recovery without a busy timer', () => {
     } });
     let primaryFailure: unknown;
     try {
-      const results = await Promise.all(Array.from({ length: 3 }, (_, i) => pool.run('codegraph_search', { query: 'recoveredSymbol' },
-        routeQueryRequest(createQueryRequestContext(execution, `session-${i}`, 1), 'default', root, getDatabasePath(root)))));
+      const snapshots = [pool.observation];
+      expect(pool.observation).toMatchObject({ state: 'cold', ready: false, workers: 0 });
+      const run = (i: number) => pool.run('codegraph_search', { query: 'recoveredSymbol' },
+        routeQueryRequest(createQueryRequestContext(execution, `session-${i}`, 1), 'default', root, getDatabasePath(root)));
+      const first = run(0);
+      void first.catch(() => {});
+      snapshots.push(pool.observation);
+      expect(pool.observation).toMatchObject({ state: 'starting', ready: false, starting: 1 });
+      await until(() => pool.observation.state === 'recovering', 10000);
+      const createdDuringRecovery = workers.length;
+      for (let index = 0; index < 20; index++) snapshots.push(pool.observation);
+      expect(pool.observation).toMatchObject({ state: 'recovering', ready: false });
+      expect(workers).toHaveLength(createdDuringRecovery);
+      const results = [await first, ...await Promise.all([run(1), run(2)])];
+      snapshots.push(pool.observation);
+      expect(pool.observation).toMatchObject({ state: 'active', ready: true });
       for (const result of results) { expect(result.isError).toBeFalsy(); expect(result.content[0].text).toContain('app.ts:1'); }
       expect(pool.healthy).toBe(true);
       await pool.destroy();
       expect(workers.every(worker => worker.threadId === -1)).toBe(true);
       expect(pool.activity).toEqual({ queued: 0, executing: 0, starting: 0, retiring: 0 });
       if (process.env.VALIDATION_OUT) fs.appendFileSync(path.join(process.env.VALIDATION_OUT, 'unlimited-recovery.jsonl'), JSON.stringify({
-        mode, scenario: 'recovered', results, observations, finalActivity: pool.activity,
+        mode, scenario: 'recovered', results, snapshots, observations, finalActivity: pool.activity,
       }) + '\n');
     } catch (error) { primaryFailure = error; throw error; }
     finally {
@@ -77,6 +96,11 @@ describe('unlimited capacity recovery without a busy timer', () => {
       expect(outcomes).toBe(6); expect(pool.state).toBe('failed');
       const created = workers.length;
       expect(created).toBeLessThanOrEqual(13);
+      const unavailable = pool.observation;
+      expect(unavailable).toMatchObject({ state: 'unavailable', ready: false });
+      expect(unavailable.reason).toMatch(/failed|crash|capacity|worker/i);
+      for (let index = 0; index < 20; index++) expect(pool.observation.state).toBe('unavailable');
+      expect(workers).toHaveLength(created);
       expect((await pool.run('codegraph_search', {})).isError).toBe(true); expect(workers).toHaveLength(created);
       await pool.destroy();
       expect(workers.every(worker => worker.threadId === -1)).toBe(true);
@@ -84,7 +108,7 @@ describe('unlimited capacity recovery without a busy timer', () => {
       expect(fs.readdirSync(path.join(root, '.codegraph'))).toEqual(['codegraph.db']);
       expect(pool.activity).toEqual({ queued: 0, executing: 0, starting: 0, retiring: 0 });
       if (process.env.VALIDATION_OUT) fs.appendFileSync(path.join(process.env.VALIDATION_OUT, 'unlimited-recovery.jsonl'), JSON.stringify({
-        mode: 'read-only-fallback', scenario: 'exhausted', outcomes, created, results, observations, finalActivity: pool.activity,
+        mode: 'read-only-fallback', scenario: 'exhausted', outcomes, created, results, unavailable, observations, finalActivity: pool.activity,
       }) + '\n');
     } catch (error) { primaryFailure = error; throw error; }
     finally {

@@ -12,8 +12,9 @@
 
 import * as os from 'os';
 import * as path from 'path';
+import { realpathSync } from 'fs';
 import type CodeGraph from '../index';
-import { resolveServerRoot } from '../directory';
+import { getCodeGraphDir, resolveServerRoot } from '../directory';
 import { ToolHandler } from './tools';
 import { WslSharedIndexError } from '../db/wsl-shared-index';
 import { assertNoRebuild, releaseWriterLock, tryAcquireWriterLock, writerLockHeldMessage } from './writer-lock';
@@ -22,6 +23,8 @@ import { immutable, requestedQueryPolicy, resolveLegacyQueryPolicy, type QueryEx
 import { createQueryExecutionContext, type QueryExecutionContext } from './query-context';
 import { endFreshnessMeasurements } from './index-freshness';
 import { acquireProject, ProjectLease } from './project-lifecycle';
+import { CodeGraphPackageVersion } from './version';
+import type { QueryDiagnostics } from './query-diagnostics';
 
 // Lazy-load the heavy CodeGraph chain (sqlite + query/graph/context layers) OFF
 // the MCP startup path. It's only needed once a tool actually opens a project —
@@ -109,6 +112,7 @@ export class MCPEngine {
       { poolEnabled: this.opts.queryPool, defaultMaximum: opts.queryPoolDefaultMax });
     this.execution = createQueryExecutionContext(policy, { readOnly: this.opts.readOnly, writer: !this.opts.readOnly, synchronization: !this.opts.readOnly });
     this.toolHandler = new ToolHandler(null, this.execution);
+    this.toolHandler.setQueryDiagnostics(project => this.getQueryDiagnostics(project));
     this.toolHandler.setProjectLifecycle({
       open: (root, open) => {
         // Explicit projects and read-only fallbacks also hold SQLite handles.
@@ -156,7 +160,7 @@ export class MCPEngine {
         : '[CodeGraph MCP] Query pool disabled (CODEGRAPH_QUERY_POOL_SIZE=0); serving reads in-process.\n');
       return;
     }
-    this.queryPool = new QueryPool({ root, execution: this.execution });
+    this.queryPool = new QueryPool({ root, execution: this.execution, warmWorker: false });
     this.toolHandler.setQueryPool(this.queryPool);
     const capacity = concurrency.kind === 'finite' ? `up to ${concurrency.maximum} worker thread(s)` : 'on-demand worker threads with no configured maximum';
     process.stderr.write(`[CodeGraph MCP] Query pool: ${capacity} for concurrent reads${this.opts.readOnly ? ' (local read-only fallback; no writer or auto-sync ownership)' : ''}.\n`);
@@ -180,6 +184,34 @@ export class MCPEngine {
 
   /** Internal resolved request, capability and ownership identity; no public diagnostic claim. */
   getQueryExecutionContext(): QueryExecutionContext { return this.execution; }
+
+  /** Owner observation only: no initialization, graph opening or pool demand. */
+  getQueryDiagnostics(project?: QueryDiagnostics['project']): QueryDiagnostics {
+    const { requested, ...effective } = this.execution.policy;
+    const enabled = effective.concurrency.kind !== 'disabled' && this.opts.queryPool;
+    const pool = this.queryPool?.observation;
+    const stopped = this.closed;
+    let resolvedProject = project ?? null;
+    const defaultRoot = this.cg?.getProjectRoot() ?? this.projectPath;
+    if (project === undefined && defaultRoot) {
+      // A daemon can send its hello before asynchronous graph initialization.
+      // Resolve only its own existing index; absence remains unknown, with no
+      // graph open, ancestor substitution or initialization for diagnostics.
+      try { resolvedProject = { route: 'default', root: realpathSync(defaultRoot),
+        index: realpathSync(path.join(getCodeGraphDir(defaultRoot), 'codegraph.db')) }; } catch { /* unknown identity */ }
+    }
+    return immutable({ schemaVersion: 1,
+      implementation: { packageVersion: CodeGraphPackageVersion, policySchemaVersion: 1,
+        support: { independentControls: true, combinedPreset: false, idleRetirement: true } },
+      requested, effective,
+      ownership: { writerAuthority: this.execution.ownership.writer, synchronizationAuthority: this.execution.ownership.synchronization,
+        capability: this.execution.capability,
+        resourceScope: effective.executionMode === 'shared-daemon' ? 'shared-project' : 'local-engine', pid: process.pid, generation: this.execution.generation },
+      lifecycle: pool ? { ...pool, dispatch: stopped || pool.state === 'unavailable' || pool.state === 'draining' ? 'unavailable' : 'worker' }
+        : { state: stopped ? 'stopped' : enabled ? 'cold' : 'disabled', dispatch: stopped ? 'unavailable' : enabled ? 'worker' : 'main-thread',
+          ready: !stopped && !enabled, workers: 0, queued: 0, executing: 0, starting: 0, retiring: 0, reason: null },
+      project: resolvedProject });
+  }
 
   /** Session disappearance never stops shared peers, only that session's jobs. */
   cancelQuerySession(sessionId: string): void { this.queryPool?.cancelSession(sessionId); }

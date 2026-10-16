@@ -9,6 +9,7 @@ import { CodeGraph, getDatabasePath } from '../src';
 import { createDatabase } from '../src/db/sqlite-adapter';
 import { getWriterPidPath, tryAcquireWriterLock, releaseWriterLock } from '../src/mcp/writer-lock';
 import { WASM_RUNTIME_FLAGS } from '../src/extraction/wasm-runtime-flags';
+import { readQueryDiagnostics, type QueryDiagnostics } from '../src/mcp/query-diagnostics';
 import { recordSpawns, removeSpawnLog, settleLosingCandidates, spawnLogFor } from './daemon-candidates';
 
 const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -18,6 +19,21 @@ async function until(check: () => boolean, ms: number, detail: () => string = ()
 }
 const digest = (file: string) => fs.existsSync(file) ? createHash('sha256').update(fs.readFileSync(file)).digest('hex') : null;
 const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+const profiles = {
+  unlimited: { CODEGRAPH_QUERY_MODE: 'default', CODEGRAPH_QUERY_POOL_SIZE: 'unlimited', CODEGRAPH_QUERY_BUSY_TIMEOUT_MS: '' },
+  default: { CODEGRAPH_QUERY_MODE: undefined, CODEGRAPH_QUERY_POOL_SIZE: undefined, CODEGRAPH_QUERY_BUSY_TIMEOUT_MS: undefined },
+  disabled: { CODEGRAPH_QUERY_MODE: 'unlimited', CODEGRAPH_QUERY_POOL_SIZE: '0', CODEGRAPH_QUERY_BUSY_TIMEOUT_MS: 'unlimited' },
+  'finite-no-deadline': { CODEGRAPH_QUERY_MODE: 'unlimited', CODEGRAPH_QUERY_POOL_SIZE: '2', CODEGRAPH_QUERY_BUSY_TIMEOUT_MS: 'unlimited' },
+} as const;
+type Profile = keyof typeof profiles;
+const diagnostic = (result: any): QueryDiagnostics => {
+  expect(result.isError).toBeFalsy();
+  const match = result.content[0].text.match(/\*\*Query execution\*\*\n```json\n([\s\S]*?)\n```/);
+  expect(match, 'actual status contains the versioned execution observation').not.toBeNull();
+  const value = JSON.parse(match![1]);
+  expect(readQueryDiagnostics(value)).toEqual(value);
+  return value;
+};
 
 class Client {
   child: ChildProcessWithoutNullStreams;
@@ -25,13 +41,12 @@ class Client {
   stderr = '';
   private id = 0;
   private pending = new Map<number, { resolve: (value: any) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
-  constructor(root: string, mode: string, observations: string, release: string) {
+  constructor(root: string, mode: string, observations: string, release: string, profile: Profile = 'unlimited') {
     const recorder = recordSpawns(root);
     this.child = spawn(process.execPath, [...WASM_RUNTIME_FLAGS, ...recorder.args, '--require', path.join(__dirname, 'fixtures/query-unlimited-preload.cjs'),
       path.resolve(__dirname, '../dist/bin/codegraph.js'), 'serve', '--mcp', '--path', root], {
       cwd: root, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, ...recorder.env,
-        CODEGRAPH_NO_DAEMON: mode === 'direct' ? '1' : '0', CODEGRAPH_QUERY_MODE: 'default',
-        CODEGRAPH_QUERY_POOL_SIZE: 'unlimited', CODEGRAPH_QUERY_BUSY_TIMEOUT_MS: '',
+        CODEGRAPH_NO_DAEMON: mode === 'direct' ? '1' : '0', ...profiles[profile],
         CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '1000', CODEGRAPH_DAEMON_INSTALL_CHECK_MS: '0',
         CODEGRAPH_DAEMON_RETRY_MS: '0', CODEGRAPH_MCP_LOG_ATTACH: '1', CODEGRAPH_NO_WATCHDOG: '1',
         CODEGRAPH_STARTUP_HANDSHAKE_TIMEOUT_MS: '0', CODEGRAPH_NO_RELAUNCH: '1', CODEGRAPH_WASM_RELAUNCHED: '1', CODEGRAPH_PPID_POLL_MS: '0',
@@ -77,8 +92,9 @@ class Client {
 }
 
 describe('independent unlimited concurrency through actual MCP', () => {
-  it.each(['direct', 'writable-fallback', 'read-only-fallback', 'shared-daemon'] as const)
-  ('exceeds 16 real workers, retires with live polling and recreates safely in %s', async mode => {
+  it.each((['direct', 'writable-fallback', 'read-only-fallback', 'shared-daemon'] as const)
+    .flatMap(mode => (Object.keys(profiles) as Profile[]).map(profile => [mode, profile] as const)))
+  ('reports real requested/effective execution and routes safely in %s with %s', async (mode, profile) => {
     const fixture = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-unlimited-mcp-')));
     const roots = [path.join(fixture, 'alpha'), path.join(fixture, 'beta')];
     const observations = path.join(fixture, 'workers.jsonl');
@@ -89,6 +105,8 @@ describe('independent unlimited concurrency through actual MCP', () => {
     let daemonPid: number | undefined;
     let disappearingSession: any;
     const routeProbes: any[] = [];
+    const diagnostics: Array<{ phase: string; value: QueryDiagnostics }> = [];
+    const evidenceName = profile === 'unlimited' ? `unlimited-${mode}` : `diagnostics-${mode}-${profile}`;
     let phase = 'fixture setup';
     let primaryFailure: unknown;
     const events = (): any[] => fs.existsSync(observations) ? fs.readFileSync(observations, 'utf8').split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line)) : [];
@@ -111,10 +129,37 @@ describe('independent unlimited concurrency through actual MCP', () => {
       const readonlyBefore = observer ? { version: observer.pragma('data_version', { simple: true }),
         db: roots.map(root => digest(getDatabasePath(root))), wal: roots.map(root => digest(getDatabasePath(root) + '-wal')),
         metadata: roots.map(root => digest(path.join(root, '.codegraph/.gitignore'))), schema: observer.pragma('schema_version', { simple: true }) } : null;
-      const client = new Client(roots[0], mode, observations, release); clients.push(client);
+      const client = new Client(roots[0], mode, observations, release, profile); clients.push(client);
       phase = 'initialize';
       const initialize = () => client.request('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'unlimited-proof', version: '1' }, rootUri: pathToFileURL(roots[0]).href });
       expect((await initialize()).serverInfo.name).toBe('codegraph');
+      const status = async (phase: string, index = 0, target = client) => {
+        const value = diagnostic(await target.request('tools/call', { name: 'codegraph_status', arguments: index ? { projectPath: roots[index] } : {} }));
+        diagnostics.push({ phase, value });
+        expect(value.project).toEqual({ route: index ? 'explicit' : 'default', root: roots[index], index: fs.realpathSync(getDatabasePath(roots[index])) });
+        expect(value.effective.executionMode).toBe(mode);
+        expect(value.implementation).toMatchObject({ policySchemaVersion: 1, support: { independentControls: true, combinedPreset: false, idleRetirement: true } });
+        expect(value.ownership).toMatchObject({ capability: mode === 'read-only-fallback' ? 'read-only' : 'read-write',
+          writerAuthority: mode !== 'read-only-fallback', synchronizationAuthority: mode !== 'read-only-fallback',
+          resourceScope: mode === 'shared-daemon' ? 'shared-project' : 'local-engine' });
+        return value;
+      };
+      phase = 'cold status without demand';
+      const cold = await status('cold');
+      const enabled = profile !== 'disabled' && !(mode === 'read-only-fallback' && profile === 'default');
+      expect(cold.lifecycle).toMatchObject({ state: enabled ? 'cold' : 'disabled', dispatch: enabled ? 'worker' : 'main-thread',
+        ready: !enabled, workers: 0, queued: 0, executing: 0, starting: 0, retiring: 0, reason: null });
+      expect(cold.requested).toEqual(Object.fromEntries(Object.entries(profiles[profile]).filter(([, value]) => value !== undefined)
+        .map(([key, value]) => [key === 'CODEGRAPH_QUERY_MODE' ? 'mode' : key === 'CODEGRAPH_QUERY_POOL_SIZE' ? 'poolSize' : 'busyTimeoutMs', value])));
+      expect(cold.effective).toMatchObject({ source: 'legacy', preset: 'default',
+        concurrency: !enabled ? { kind: 'disabled' } : profile === 'unlimited' ? { kind: 'unlimited' } : { kind: 'finite' },
+        deadline: !enabled ? { kind: 'inapplicable' } : profile === 'finite-no-deadline' ? { kind: 'absent' } : { kind: 'finite', milliseconds: 45000 },
+        retention: profile === 'unlimited' ? 'retire-idle' : 'ordinary', classification: profile === 'default' ? 'default' : 'custom' });
+      for (const index of [1, 0, 1, 0]) {
+        await client.request('ping');
+        expect((await status('cold repeat', index)).lifecycle).toEqual(cold.lifecycle);
+      }
+      expect(events().filter(event => event.event === 'spawn')).toHaveLength(0);
       const probeRoutes = async (stage: 'before' | 'after') => {
         for (const index of [0, 1, 0]) {
           const query = `${index ? 'beta' : 'alpha'}RouteSymbol`;
@@ -131,6 +176,54 @@ describe('independent unlimited concurrency through actual MCP', () => {
         }
       };
       phase = 'unique routes before overlap'; await probeRoutes('before');
+      const active = await status('active');
+      expect(active.effective).toEqual(cold.effective);
+      expect(active.ownership).toEqual(cold.ownership);
+      expect(active.lifecycle).toMatchObject({ state: enabled ? 'active' : 'disabled', ready: true, workers: enabled ? 1 : 0 });
+      expect((await status('active explicit', 1)).ownership).toEqual(cold.ownership);
+      if (profile !== 'unlimited') {
+        phase = 'open chat resource ownership';
+        // An open chat must not add query workers. Shared chats see the same
+        // engine; local fallback/direct chats own a distinct engine generation.
+        let peerRoot = roots[0];
+        if (mode === 'direct') {
+          // Direct mode deliberately refuses a second same-project writer.
+          // Compare independent engine costs on another indexed project;
+          // readonly fallback and shared peers still use the same project.
+          peerRoot = path.join(fixture, 'independent-direct-peer');
+          fs.mkdirSync(peerRoot);
+          fs.writeFileSync(path.join(peerRoot, 'app.ts'), 'export function peerSymbol() {}\n');
+          const graph = await CodeGraph.init(peerRoot); try { await graph.indexAll(); } finally { graph.close(); }
+        }
+        const peer = new Client(peerRoot, mode, observations, release, profile); clients.push(peer);
+        await peer.request('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'diagnostic-peer', version: '1' } });
+        const spawnedBeforePeerStatus = events().filter(event => event.event === 'spawn').length;
+        const peerValue = diagnostic(await peer.request('tools/call', { name: 'codegraph_status', arguments: {} }));
+        diagnostics.push({ phase: 'open peer', value: peerValue });
+        expect(peerValue.project).toEqual({ route: 'default', root: fs.realpathSync(peerRoot), index: fs.realpathSync(getDatabasePath(peerRoot)) });
+        expect(peerValue.ownership.resourceScope).toBe(mode === 'shared-daemon' ? 'shared-project' : 'local-engine');
+        if (mode === 'shared-daemon') {
+          daemonPid = peerValue.ownership.pid;
+          expect(peerValue.ownership).toEqual(active.ownership);
+          expect(peerValue.lifecycle.workers).toBe(enabled ? 1 : 0);
+        } else {
+          expect(peerValue.ownership.generation).not.toBe(active.ownership.generation);
+          expect(peerValue.ownership.pid).not.toBe(active.ownership.pid);
+          expect(peerValue.lifecycle.workers).toBe(0);
+        }
+        expect(events().filter(event => event.event === 'spawn')).toHaveLength(spawnedBeforePeerStatus);
+        await peer.close();
+        if (observer) {
+          expect({ version: observer.pragma('data_version', { simple: true }), db: roots.map(root => digest(getDatabasePath(root))),
+            wal: roots.map(root => digest(getDatabasePath(root) + '-wal')), metadata: roots.map(root => digest(path.join(root, '.codegraph/.gitignore'))),
+            schema: observer.pragma('schema_version', { simple: true }) }).toEqual(readonlyBefore);
+          for (const [index, owner] of owners.entries()) { expect(owner.isWatching()).toBe(true); expect(fs.readFileSync(getWriterPidPath(roots[index]), 'utf8')).toBe(locks[index]); }
+        }
+        if (process.env.VALIDATION_OUT) fs.writeFileSync(path.join(process.env.VALIDATION_OUT, `${evidenceName}.json`), JSON.stringify({
+          mode, profile, roots, peerRoot, diagnostics, routeProbes, readonlyBefore, events: events(), replies: clients.map(item => item.replies),
+        }, null, 2));
+        return;
+      }
       phase = 'initial overlap';
       const wave = Array.from({ length: 20 }, (_, i) => client.query('overlapSymbol', i % 2 ? roots[1] : undefined));
       // Catch all pending outcomes from the moment they are created.
@@ -143,10 +236,10 @@ describe('independent unlimited concurrency through actual MCP', () => {
       fs.writeFileSync(release, 'release controlled delivery to ordinary SQLite handler');
       const results = await resultsPromise;
       for (const result of results) resultText(result, 'overlapSymbol');
-      expect(client.replies.filter(reply => reply.result?.content)).toHaveLength(26);
+      expect(results).toHaveLength(20); expect(routeProbes).toHaveLength(3);
       if (mode === 'shared-daemon') {
         daemonPid = JSON.parse(fs.readFileSync(path.join(roots[0], '.codegraph/daemon.pid'), 'utf8')).pid;
-        const peer = new Client(roots[0], mode, observations, release); clients.push(peer);
+        const peer = new Client(roots[0], mode, observations, release, profile); clients.push(peer);
         await peer.request('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'peer', version: '1' } });
         resultText(await peer.query('overlapSymbol'), 'overlapSymbol');
         expect(new Set(events().filter(event => event.event === 'spawn').map(event => event.pid)).size).toBe(1);
@@ -181,7 +274,8 @@ describe('independent unlimited concurrency through actual MCP', () => {
       while (activeWorkers() && Number(process.hrtime.bigint() - idleStarted) / 1e6 < 45000) {
         await client.request('ping');
         const status = await client.request('tools/call', { name: 'codegraph_status', arguments: {} });
-        expect(status.isError).toBeFalsy(); polls++;
+        const value = diagnostic(status);
+        expect(value.effective).toEqual(cold.effective); expect(value.ownership).toEqual(cold.ownership); polls++;
         await wait(500);
       }
       expect(activeWorkers()).toBe(0);
@@ -194,7 +288,11 @@ describe('independent unlimited concurrency through actual MCP', () => {
       }
       expect(idleEvents.filter(event => event.event === 'exit')).toHaveLength(20);
       // Status/heartbeats did not keep workers alive, and remain available at zero.
-      await client.request('ping');
+      for (const index of [0, 1, 0]) {
+        await client.request('ping');
+        expect((await status('retired repeat', index)).lifecycle).toMatchObject({ state: 'retired', ready: false, workers: 0, starting: 0, retiring: 0 });
+      }
+      expect(events().filter(event => event.event === 'spawn')).toHaveLength(20);
       if (observer) {
         expect({ version: observer.pragma('data_version', { simple: true }), db: roots.map(root => digest(getDatabasePath(root))),
           wal: roots.map(root => digest(getDatabasePath(root) + '-wal')), metadata: roots.map(root => digest(path.join(root, '.codegraph/.gitignore'))),
@@ -207,8 +305,10 @@ describe('independent unlimited concurrency through actual MCP', () => {
         // occupied worker must not terminate or suppress the surviving chat.
         fs.rmSync(release);
         const beforeCalls = events().filter(event => event.event === 'call-start').length;
-        const departed = new Client(roots[0], mode, observations, release); clients.push(departed);
+        const departed = new Client(roots[0], mode, observations, release, profile); clients.push(departed);
         await departed.request('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'departing-peer', version: '1' } });
+        expect((await status('retired open chat', 0, departed)).lifecycle).toMatchObject({ state: 'retired', workers: 0 });
+        expect(events().filter(event => event.event === 'spawn')).toHaveLength(20);
         const victim = departed.query('overlapSymbol').then(value => ({ value, error: undefined }), error => ({ value: undefined, error: String(error) }));
         const survivors = Promise.all(Array.from({ length: 20 }, (_, i) => client.query('overlapSymbol', i % 2 ? roots[1] : undefined)));
         void survivors.catch(() => {});
@@ -219,8 +319,9 @@ describe('independent unlimited concurrency through actual MCP', () => {
         for (const result of survivorResults) resultText(result, 'overlapSymbol');
         const abandoned = await victim;
         expect(abandoned.value).toBeUndefined(); expect(abandoned.error).toContain('owned client exited');
-        expect(departed.replies.filter(reply => reply.result?.content)).toHaveLength(0);
-        disappearingSession = { departedPid: departed.child.pid, departedQueryReplies: 0, survivorResults, overlapAfterZero: 21 };
+        const departedQueryReplies = departed.replies.filter(reply => reply.id !== 2 && reply.result?.content).length;
+        expect(departedQueryReplies).toBe(0); // id 2 is the deliberate retired status probe
+        disappearingSession = { departedPid: departed.child.pid, departedQueryReplies, survivorResults, overlapAfterZero: 21 };
       }
       phase = 'unique routes after zero'; await probeRoutes('after');
       phase = 'native watcher after zero';
@@ -258,8 +359,8 @@ describe('independent unlimited concurrency through actual MCP', () => {
       }
       expect(final.filter(event => event.event === 'exit')).toHaveLength(final.filter(event => event.event === 'spawn').length);
       phase = 'success evidence';
-      if (process.env.VALIDATION_OUT) fs.writeFileSync(path.join(process.env.VALIDATION_OUT, `unlimited-${mode}.json`), JSON.stringify({
-        mode, roots, releaseControl: 'owned file gates actual worker input; real built SQLite handler produces output', demand: 20,
+      if (process.env.VALIDATION_OUT) fs.writeFileSync(path.join(process.env.VALIDATION_OUT, `${evidenceName}.json`), JSON.stringify({
+        mode, profile, roots, diagnostics, releaseControl: 'owned file gates actual worker input; real built SQLite handler produces output', demand: 20,
         peakOverlap: 20, peakStarting, peakStartingAll, routeProbes, idleGraceMs: 30000, idleObservationBoundMs: 45000, polls,
         idleObservedMs, readonlyBefore, disappearingSession,
         events: final, results, replies: clients.map(client => client.replies), stderr: clients.map(client => client.stderr),
@@ -307,8 +408,8 @@ describe('independent unlimited concurrency through actual MCP', () => {
         });
       } finally {
         try {
-          if (process.env.VALIDATION_OUT) fs.writeFileSync(path.join(process.env.VALIDATION_OUT, `unlimited-${mode}-cleanup.json`), JSON.stringify({
-            mode, roots, phase, outcome: primaryFailure || cleanupErrors.length ? 'fail' : 'pass',
+          if (process.env.VALIDATION_OUT) fs.writeFileSync(path.join(process.env.VALIDATION_OUT, `${evidenceName}-cleanup.json`), JSON.stringify({
+            mode, profile, roots, diagnostics, phase, outcome: primaryFailure || cleanupErrors.length ? 'fail' : 'pass',
             primaryFailure: primaryFailure ? detail(primaryFailure) : null, cleanupPhases, fixtureRemoved,
             events: cleanupEvents, replies: clients.map(client => client.replies), stderr: clients.map(client => client.stderr),
             clients: clients.map(client => ({ pid: client.child.pid, exitCode: client.child.exitCode, signalCode: client.child.signalCode })),
