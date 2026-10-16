@@ -68,9 +68,10 @@ class Client {
   }
   query(query: string, projectPath?: string) { return this.request('tools/call', { name: 'codegraph_search', arguments: { query, ...(projectPath ? { projectPath } : {}) } }); }
   async close() {
-    if (this.child.exitCode !== null || this.child.signalCode !== null) return;
-    this.child.stdin.end();
-    await until(() => this.child.exitCode !== null || this.child.signalCode !== null, 35000, () => this.stderr);
+    if (this.child.exitCode === null && this.child.signalCode === null) {
+      this.child.stdin.end();
+      await until(() => this.child.exitCode !== null || this.child.signalCode !== null, 35000, () => this.stderr);
+    }
     expect(this.child.exitCode, this.stderr).toBe(0);
   }
 }
@@ -294,6 +295,13 @@ describe('independent unlimited concurrency through actual MCP', () => {
         }
         // Retain a failed fixture for diagnosis instead of erasing ownership
         // evidence after an unverified process/handle cleanup.
+        await attempt('verify all native exits', () => {
+          if (clients.some(client => client.child.exitCode === null && client.child.signalCode === null)
+            || (daemonPid && alive(daemonPid)) || candidatePids.some(alive)
+            || cleanupEvents.filter(event => event.event === 'spawn').length !== cleanupEvents.filter(event => event.event === 'exit').length) {
+            throw new Error('MCP fixture still owns unverified native processes/workers; preserve its files');
+          }
+        });
         if (cleanupErrors.length === 0) await attempt('fixture removal', async () => {
           await fs.promises.rm(fixture, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); fixtureRemoved = true;
         });

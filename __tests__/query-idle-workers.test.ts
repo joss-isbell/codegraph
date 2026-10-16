@@ -82,6 +82,7 @@ describe('independent retirement of real unused SQLite workers', () => {
       let cleanupFailure: unknown;
       try {
         release(healthyGate); release(abandonedGate); await healthy; await abandoned; await pool.destroy();
+        if (!workers.every(worker => worker.threadId === -1)) throw new Error('mixed-idle fixture still owns live native workers; preserve its files');
         await fs.promises.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
       } catch (error) { cleanupFailure = error; }
       finally {

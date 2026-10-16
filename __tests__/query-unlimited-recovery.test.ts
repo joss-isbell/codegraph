@@ -41,7 +41,8 @@ describe('unlimited capacity recovery without a busy timer', () => {
     } catch (error) { primaryFailure = error; throw error; }
     finally {
       let cleanupFailure: unknown;
-      try { await pool.destroy(); await fs.promises.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
+      try { await pool.destroy(); if (!workers.every(worker => worker.threadId === -1)) throw new Error('recovery fixture still owns live native workers');
+        await fs.promises.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
       catch (error) { cleanupFailure = error; }
       finally {
         try {
@@ -88,7 +89,8 @@ describe('unlimited capacity recovery without a busy timer', () => {
     } catch (error) { primaryFailure = error; throw error; }
     finally {
       let cleanupFailure: unknown;
-      try { await pool.destroy(); await fs.promises.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
+      try { await pool.destroy(); if (!workers.every(worker => worker.threadId === -1)) throw new Error('exhaustion fixture still owns live native workers');
+        await fs.promises.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
       catch (error) { cleanupFailure = error; }
       finally {
         try {
