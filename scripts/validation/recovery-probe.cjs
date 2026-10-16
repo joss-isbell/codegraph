@@ -2,8 +2,8 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { spawn, spawnSync } = require('node:child_process');
-const { pathToFileURL } = require('node:url');
+const { spawnSync } = require('node:child_process');
+const { Client: RecoveryClient } = require('./recovery-client.cjs');
 const { DatabaseSync } = require('node:sqlite');
 const out = process.env.VALIDATION_OUT;
 const recipe = JSON.parse(fs.readFileSync(process.env.RECOVERY_RECIPE, 'utf8'));
@@ -51,47 +51,10 @@ function callRecovery(operation, ...args) {
   fs.appendFileSync(path.join(out, 'snapshot-operations.jsonl'), JSON.stringify({ operation,args,status:result.status,stdout:result.stdout,stderr:result.stderr })+'\n');
   check('snapshot operation completes through the recovery boundary', result.status === 0, { operation, status:result.status, stderr:result.stderr });
 }
-class Client {
+class Client extends RecoveryClient {
   constructor(root, name) {
-    this.root = root; this.name = name; this.pending = new Map(); this.buffer=''; this.stderr='';
-    this.child = spawn(recipe.launch.command, recipe.launch.args, { cwd:root, env:{...process.env,...recipe.launch.env,CODEGRAPH_NO_DAEMON:'1'}, stdio:['pipe','pipe','pipe'],windowsHide:true });
-    this.child.on('error', error=>this.fail(error));
-    this.child.stdin.on('error', error=>this.fail(error));
-    this.child.stderr.on('data', data=>{this.stderr+=data.toString();if(this.stderr.length>1024*1024)this.fail(new Error('MCP stderr overflow'));});
-    this.child.stdout.on('data', data=>{
-      this.buffer+=data.toString();if(this.buffer.length>10*1024*1024)return this.fail(new Error('MCP stdout overflow'));
-      while(this.buffer.includes('\n')) {
-        const end=this.buffer.indexOf('\n');const line=this.buffer.slice(0,end);this.buffer=this.buffer.slice(end+1);
-        fs.appendFileSync(path.join(out,name+'.rpc.jsonl'),line+'\n');
-        let value;try{value=JSON.parse(line);}catch{continue;}
-        const pending=this.pending.get(value.id);if(pending){this.pending.delete(value.id);clearTimeout(pending.timer);value.error?pending.reject(new Error(JSON.stringify(value.error))):pending.resolve(value.result);}
-      }
-    });
-    this.child.on('exit',(code,signal)=>this.fail(new Error(`MCP exited ${code}/${signal}`)));
-    clients.push(this);sessions.push({name,root,pid:this.child.pid,mode:'exact-B-relocated-proxy-direct'});
-  }
-  fail(error) {for(const pending of this.pending.values()){clearTimeout(pending.timer);pending.reject(error);}this.pending.clear();}
-  request(method,params={}) {
-    const requestId=id++;
-    return new Promise((resolve,reject)=>{
-      const timer=setTimeout(()=>{this.pending.delete(requestId);reject(new Error('host probe deadline '+method));},75000);
-      this.pending.set(requestId,{resolve,reject,timer});this.child.stdin.write(JSON.stringify({jsonrpc:'2.0',id:requestId,method,params})+'\n');
-    });
-  }
-  async initialize() {
-    await this.request('initialize',{protocolVersion:'2024-11-05',capabilities:{},clientInfo:{name:this.name,version:'1'},rootUri:pathToFileURL(this.root).href});
-    this.child.stdin.write(JSON.stringify({jsonrpc:'2.0',method:'notifications/initialized'})+'\n');
-  }
-  tool(name,args={}) {return this.request('tools/call',{name,arguments:{...args,projectPath:this.root}});}
-  async close() {
-    if(this.closed)return;
-    if(this.child.exitCode===null&&this.child.signalCode===null){
-      const exited=new Promise(resolve=>this.child.once('exit',resolve));this.child.stdin.end();
-      let timer;try{await Promise.race([exited,new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('MCP graceful-close deadline')),15000);})]);}finally{clearTimeout(timer);}
-    }
-    if(this.child.exitCode!==0||this.child.signalCode!==null)throw new Error(`MCP cleanup exit ${this.child.exitCode}/${this.child.signalCode}`);
-    fs.writeFileSync(path.join(out,this.name+'.stderr.log'),this.stderr);this.closed=true;
-    cleanup.push({name:this.name,pid:this.child.pid,exitCode:this.child.exitCode,complete:true});
+    super(root, name, { out, cleanup, sessions, launch: recipe.launch });
+    clients.push(this);
   }
 }
 const has = (result,name) => !result.isError && JSON.stringify(result).includes(name) && !JSON.stringify(result).includes('No results found');

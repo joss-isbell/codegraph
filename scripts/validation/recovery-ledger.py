@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 
 from events import event, assertion
-from recovery import file_manifest
+from recovery import file_manifest, original_inventory
 from report import consume, digest
 from runner import write
 
@@ -27,22 +27,16 @@ for item in declaration["accepted"]:
         assertion(scenario, "accepted proof retains qualified runner and consumer bytes",
                   binding["sources"].get("scripts/validation/" + file) == expected, role=item["role"], file=file)
     accepted.append({**item, "sha256": digest(receipt), "summary": summary})
-assertion(scenario, "all four required protection/current focused/rehearsal roles joined",
-          [item["role"] for item in accepted] == ["actual-B-protection", "current-WAL-recovery", "current-exact-bundle", "actual-B-rehearsal"])
+assertion(scenario, "all five required protection/current focused/rehearsal roles joined",
+          [item["role"] for item in accepted] == ["actual-B-protection", "current-WAL-recovery", "current-exact-bundle",
+                                               "current-nested-client", "actual-B-rehearsal"])
 
 protected = Path(declaration["protectedB"])
 assertion(scenario, "protected B manifest remains at its declared identity",
           digest(protected / "manifest.json") == declaration["protectedManifestSha256"])
 manifest = json.loads((protected / "manifest.json").read_text())
 assertion(scenario, "all protected B component bytes remain unchanged", file_manifest(protected / "components") == manifest["files"])
-original = {}
-for name in ["engine", "git"]:
-    original.update({name + "/" + key: value for key, value in file_manifest(manifest["sources"][name]).items()})
-for relative in manifest["launcherClosure"]:
-    file = Path(manifest["sources"]["launcher"]) / relative
-    original["launcher/" + relative] = {"sha256": digest(file), "bytes": file.stat().st_size}
-file = Path(manifest["sources"]["settings"])
-original["settings/config.toml"] = {"sha256": digest(file), "bytes": file.stat().st_size}
+original = original_inventory(manifest["sources"], manifest["launcherClosure"])
 assertion(scenario, "original installed B and saved settings still equal the exact protection point", original == manifest["files"])
 
 history = []

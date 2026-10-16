@@ -174,8 +174,13 @@ WAL while disposable owners remain live, restores protected compatible state onl
 after closing the target owner, then explicitly catches up legitimate later
 source changes. The later closed index remains preserved, an unrelated newer
 project remains available, and a second reconciliation must be a no-op. Complete
-RPC, source/semantic/index/snapshot/identity and cleanup evidence is retained even
-on failure. Test-only direct-session, sandbox, temporary-directory and observer
+RPC prefixes, source/semantic/index/snapshot/identity and cleanup evidence is
+retained even on failure. `recovery-client.cjs` caps cumulative nested stdout at
+10 MiB and stderr at 1 MiB per session, retains only those byte prefixes and
+fails the whole protocol on overflow. It persists counts and failure diagnostics
+on nonzero exit, signal and graceful-close timeout. `recovery-client-tests.cjs`
+exercises those paths with real owned children, including repeated short RPC
+lines that must not evade cumulative limits. Test-only direct-session, sandbox, temporary-directory and observer
 controls are separately identified from saved B settings.
 
 Run every operation through `runner.py` with predeclared scenarios, artifacts,

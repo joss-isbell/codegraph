@@ -107,6 +107,21 @@ def directory_manifest(root):
     return sorted(path.relative_to(root).as_posix() for path in Path(root).rglob("*") if path.is_dir())
 
 
+def original_inventory(sources, launcher_files):
+    inventory = {}
+    for component in ["engine", "git"]:
+        inventory.update({component + "/" + key: value for key, value in file_manifest(sources[component]).items()})
+    launcher = Path(sources["launcher"])
+    for relative in launcher_files:
+        path = owned(launcher / relative, launcher)
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("launcher closure entry must be a regular file")
+        inventory["launcher/" + relative] = {"sha256": digest(path), "bytes": path.stat().st_size}
+    settings = Path(sources["settings"])
+    inventory["settings/config.toml"] = {"sha256": digest(settings), "bytes": settings.stat().st_size}
+    return inventory
+
+
 def relocated_launch(selected, sources, destination):
     def relocate(value):
         path = Path(value)
@@ -139,17 +154,9 @@ def protect_bundle(specification):
         raise ValueError("saved CodeGraph launch recipe is missing")
     # Resolve the external rendezvous only. All copied artifact bytes stay exact.
     relocated_launch(selected, sources, destination / "components")
-    original = {}
-    for component in ["engine", "git"]:
-        original.update({component + "/" + key: value for key, value in file_manifest(sources[component]).items()})
+    original = original_inventory(sources, specification["launcherFiles"])
     launcher = Path(sources["launcher"])
-    for relative in specification["launcherFiles"]:
-        path = owned(launcher / relative, launcher)
-        if path.is_symlink() or not path.is_file():
-            raise ValueError("launcher closure entry must be a regular file")
-        original["launcher/" + relative] = {"sha256": digest(path), "bytes": path.stat().st_size}
     settings = Path(sources["settings"])
-    original["settings/config.toml"] = {"sha256": digest(settings), "bytes": settings.stat().st_size}
     destination.mkdir(parents=True, exist_ok=False)
     components = destination / "components"
     for component in ["engine", "git"]:
@@ -163,14 +170,7 @@ def protect_bundle(specification):
     if file_manifest(components) != original:
         raise ValueError("protected B differs from original component inventory")
     # Re-read the originals after copying so source mutation cannot qualify B.
-    after = {}
-    for component in ["engine", "git"]:
-        after.update({component + "/" + key: value for key, value in file_manifest(sources[component]).items()})
-    for key in original:
-        if key.startswith("launcher/"):
-            path = launcher / key.removeprefix("launcher/")
-            after[key] = {"sha256": digest(path), "bytes": path.stat().st_size}
-    after["settings/config.toml"] = {"sha256": digest(settings), "bytes": settings.stat().st_size}
+    after = original_inventory(sources, specification["launcherFiles"])
     if after != original:
         raise ValueError("original B changed during preservation")
     manifest = {"schema": "codegraph-exact-B-v1", "sources": sources, "selectedSettings": selected,
