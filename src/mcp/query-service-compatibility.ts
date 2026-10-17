@@ -1,3 +1,6 @@
+import * as fs from 'fs';
+import * as path from 'path';
+import { getCodeGraphDir } from '../directory';
 import type { DaemonHello } from './daemon';
 import { readQueryDiagnostics, type QueryDiagnostics } from './query-diagnostics';
 import type { ResolvedQueryPolicy } from './query-policy';
@@ -12,6 +15,29 @@ export function servicePolicyRefusal(reason: ServicePolicyRefusal['reason'], pro
     `CodeGraph query policy refused for ${projectRoot}: ${detail}. ${guidance}`);
 }
 
+/** A copied live owner record cannot authorize queries against another index.
+ * Filesystem identity only: never open SQLite, discover an ancestor, or mutate
+ * either project's records while proving the service's default route. */
+export function assertQueryServiceProject(hello: DaemonHello, projectRoot: string): void {
+  const project = readQueryDiagnostics(hello.queryExecution).project;
+  if (project === 'unknown' || project === null || project.route !== 'default'
+    || !path.isAbsolute(project.root) || !path.isAbsolute(project.index)) {
+    throw servicePolicyRefusal('unknown', projectRoot, 'the live service has no proved canonical default project and index');
+  }
+  const identity = (file: string): string => {
+    const native = fs.realpathSync.native(file);
+    return process.platform === 'win32' ? native.toLowerCase() : native;
+  };
+  let matches = false;
+  try {
+    const root = fs.realpathSync.native(projectRoot);
+    const index = path.join(getCodeGraphDir(root), 'codegraph.db');
+    matches = fs.statSync(index).isFile()
+      && identity(project.root) === identity(root) && identity(project.index) === identity(index);
+  } catch { /* Missing/unreadable identity is unknown, never fallback permission. */ }
+  if (!matches) throw servicePolicyRefusal('unknown', projectRoot, 'the live service default project and index do not match the selected own index');
+}
+
 /** Shared transport observation only. It never grants caller policy permission. */
 export function readSharedQueryService(hello: DaemonHello, expectedVersion: string, projectRoot: string):
   Pick<QueryDiagnostics, 'implementation' | 'effective' | 'ownership' | 'lifecycle'> {
@@ -19,6 +45,7 @@ export function readSharedQueryService(hello: DaemonHello, expectedVersion: stri
   if (hello.protocol !== 1 || hello.codegraph !== expectedVersion) {
     refuse('unknown', `service version ${hello.codegraph} has no proved wire compatibility with ${expectedVersion}`);
   }
+  assertQueryServiceProject(hello, projectRoot);
   const observed = readQueryDiagnostics(hello.queryExecution);
   if (observed.implementation === 'unknown' || observed.effective === 'unknown' || observed.ownership === 'unknown'
     || observed.lifecycle === 'unknown') return refuse('unknown', 'the live service has incomplete query execution diagnostics');

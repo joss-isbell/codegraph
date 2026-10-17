@@ -3,7 +3,7 @@
 import * as fs from 'fs';
 import { decodeLockInfo, getDaemonPidPath, type DaemonLockInfo } from './daemon-paths';
 import { decodeWriterLockInfo, getWriterPidPath, type WriterLockInfo } from './writer-lock';
-import { servicePolicyRefusal } from './query-service-compatibility';
+import { assertQueryServiceProject, servicePolicyRefusal } from './query-service-compatibility';
 import type { DaemonHello } from './daemon';
 
 export type OwnerRecord<T> =
@@ -70,6 +70,7 @@ export function assertNoLiveQueryDaemon(root: string, owners = readQueryServiceO
 /** A compatible descriptor is an observation, not proof of a held writer slot.
  * Check actual project records before granting the responding service access. */
 export function assertQueryServiceOwner(root: string, hello: DaemonHello): void {
+  assertQueryServiceProject(hello, root);
   const owners = readQueryServiceOwners(root);
   assertReadableQueryOwners(root, owners);
   const daemon = owners.daemon, writer = owners.writer;

@@ -218,7 +218,7 @@ function registerRoot(root: string): void { if (!current.roots.includes(root)) c
 function arm(fault: 'stop-before-status' | 'exit78-before-status' | 'hold-before-status' | 'observe', attempt = 'initial'): void {
   fs.writeFileSync(current.control, JSON.stringify({ fault, attempt }));
 }
-function proveUnavailable(server: SpawnedServer, attempt = 'initial'): void {
+function proveUnavailable(server: SpawnedServer, attempt = 'initial', expectedDeadDaemon?: { pid: number; contents: string }): void {
   const records = trace().filter(record => record.pid === server.child.pid);
   const candidates = records.filter(record => record.event === 'candidate-spawn' && record.attempt === attempt);
   expect(candidates).toHaveLength(1);
@@ -231,16 +231,26 @@ function proveUnavailable(server: SpawnedServer, attempt = 'initial'): void {
   const close = records.find(record => record.event === 'candidate-close' && record.candidatePid === candidatePid);
   if (firstFactory) expect(close.sequence).toBeLessThan(firstFactory.sequence);
   expect(isAlive(candidatePid)).toBe(false);
-  expect(fs.existsSync(path.join(current.root, '.codegraph/daemon.pid'))).toBe(false);
+  const daemonPath = path.join(current.root, '.codegraph/daemon.pid');
+  if (expectedDeadDaemon) {
+    // A Windows SIGTERM can end the previous service without unlinking its
+    // record. Exact known-dead evidence is not a live or unknown owner, and
+    // the newly stopped pre-service candidate must not mutate that record.
+    expect(JSON.parse(expectedDeadDaemon.contents).pid).toBe(expectedDeadDaemon.pid);
+    expect(isAlive(expectedDeadDaemon.pid)).toBe(false);
+    expect(bounded(daemonPath).toString('utf8')).toBe(expectedDeadDaemon.contents);
+  } else expect(fs.existsSync(daemonPath)).toBe(false);
   const entry = JSON.parse(bounded(path.join(current.trace, `candidate-${candidatePid}-entered.json`)).toString('utf8'));
   expect(entry.argv[1]).toBe(BIN); expect(entry.argv.slice(2)).toEqual(candidates[0].args.slice(candidates[0].args.indexOf(BIN) + 1));
   expect(entry.controls).toEqual(candidates[0].controls); expect(entry.startupCpu).toBe(candidates[0].startupCpu);
   expect(trace().filter(record => record.pid === candidatePid && ['engine-before-constructor','engine-constructor','sqlite-constructor','graph-open','graph-openSync','graph-sync','graph-watch','tool-start','history'].includes(record.event))).toEqual([]);
   const factory = records.find(record => record.event === 'engine-before-constructor' && record.sequence > candidates[0].sequence);
-  if (firstFactory) expect(factory?.held.find((route: any) => route.root === current.root)?.owners['daemon.pid']).toEqual({ present: false });
+  if (firstFactory) expect(factory?.held.find((route: any) => route.root === current.root)?.owners['daemon.pid']).toEqual(expectedDeadDaemon
+    ? { present: true, base64: Buffer.from(expectedDeadDaemon.contents).toString('base64') } : { present: false });
   const held = current.roots.map(root => ({ root, index: fs.realpathSync(path.join(root, '.codegraph/codegraph.db')) }));
   current.observations.push({ event: 'controlled-pre-service-unavailable', candidatePid, attempt, held,
-    daemonAbsent: true, writer: readWriterInfo(current.root), evidence: 'native fault before status/ACK; exit+close; fresh owner/held-route records' });
+    daemonAbsent: !expectedDeadDaemon, deadDaemonPid: expectedDeadDaemon?.pid ?? null, writer: readWriterInfo(current.root),
+    evidence: 'native fault before status/ACK; exit+close; fresh absent or exact known-dead owner/held-route records' });
 }
 function proveQualified78(server: SpawnedServer): void {
   const records = trace().filter(record => record.pid === server.child.pid);
@@ -1357,6 +1367,7 @@ describe('Shared MCP daemon (issue #411)', () => {
     sendMessage(a.child, { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'codegraph_status', arguments: {} } });
     await waitFor(() => findResponse(a.stdout, 2), 30000, 25, 'warm tools/call via daemon');
     const firstDaemon = readLockPid(realRoot)!;
+    const firstDaemonLock = { pid: firstDaemon, contents: bounded(path.join(realRoot, '.codegraph/daemon.pid')).toString('utf8') };
     await realExplore(a, 1000);
 
     arm('stop-before-status', 'post-loss');
@@ -1366,7 +1377,7 @@ describe('Shared MCP daemon (issue #411)', () => {
     sendMessage(a.child, { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'codegraph_status', arguments: {} } });
     await waitFor(() => findResponse(a.stdout, 3), 15000, 25, 'in-process tools/call');
 
-    proveUnavailable(a, 'post-loss');
+    proveUnavailable(a, 'post-loss', firstDaemonLock);
     // Arm the NEXT actual candidate before the first local query: this is a
     // second one-use native pre-status failure, not synthetic null acquisition.
     arm('stop-before-status', 'local-recreation'); await realExplore(a, 1001);
@@ -1386,7 +1397,7 @@ describe('Shared MCP daemon (issue #411)', () => {
       trace().some(spawn => spawn.pid === proxyPid && spawn.event === 'candidate-spawn' && spawn.attempt === 'local-recreation' && spawn.candidatePid === record.candidatePid)), 15000, 25, 'second genuine unavailable native close');
     await waitFor(() => trace().find(record => record.pid === proxyPid && record.event === 'engine-constructor' &&
       record.diagnostics.effective.executionMode === 'writable-fallback' && record.diagnostics.ownership.generation !== firstGeneration), 15000, 25, 'actual replacement local engine');
-    proveUnavailable(a, 'local-recreation'); arm('observe', 'handover');
+    proveUnavailable(a, 'local-recreation', firstDaemonLock); arm('observe', 'handover');
     await realExplore(a, 1003);
     const localCalls = trace().filter(record => record.pid === proxyPid && record.event === 'tool-start' && [1001,1003].includes(record.requestId));
     expect(localCalls).toHaveLength(2);

@@ -288,7 +288,11 @@ describe('real MCP project ownership precedes native writes', () => {
       // close is still pending, rather than reading or mutating engine lookups.
       expect((await search(engine, 'alphaOriginal', root)).content[0]?.text).toContain('alphaOriginal');
       expect(engineLeases).toHaveLength(2); expect(retained.has(engineLeases[1])).toBe(true);
-      expect(readWriterLock(root)).toMatchObject({ pid: process.pid, ready: true });
+      expect(readWriterLock(root)).toMatchObject({ pid: process.pid });
+      // The shared reader can answer while this new writer's actual catch-up
+      // is still running. Join its readiness before releasing the old observer.
+      await until(() => readWriterLock(root)?.pid === process.pid && readWriterLock(root)?.ready === true,
+        'reacquired writer catch-up readiness');
       resumeOldRelease(); await until(() => released.includes(engineLeases[0]), 'old observation released');
       // Join the old release's continuation before triggering another eviction.
       await new Promise<void>(resolve => setImmediate(resolve));
