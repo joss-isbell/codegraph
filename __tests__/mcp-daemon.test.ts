@@ -1423,12 +1423,6 @@ describe('Shared MCP daemon (issue #411)', () => {
     // The lockout: the in-process engine owns the project's writer slot.
     expect(readWriterInfo(realRoot)).toMatchObject({ pid: proxyPid, mode: 'fallback' });
 
-    // Another session starting now cannot get a daemon while that lock is held.
-    const b = spawnServer(tempDir, env);
-    servers.push(b);
-    sendInitialize(b.child, `file://${tempDir}`, 1);
-    await waitFor(() => findResponse(b.stdout, 1), 20000, 25, 'second session initialize');
-
     // Keep calling through the handover: every request gets exactly one reply.
     // The same owned ticker spans local recreation and the original handover.
     let daemonWriter: { pid: number; mode: string } | null = null;
@@ -1447,13 +1441,6 @@ describe('Shared MCP daemon (issue #411)', () => {
     send();
     const lastId = nextId - 1;
     await waitFor(() => findResponse(a.stdout, lastId), 15000, 25, 'a tools/call through the new daemon');
-    for (let id = 2; id <= lastId; id++) {
-      const replies = a.stdout.filter((line) => {
-        try { const m = JSON.parse(line); return m.id === id && ('result' in m || 'error' in m); } catch { return false; }
-      });
-      expect(replies, `replies to request ${id}`).toHaveLength(1);
-      expect(JSON.parse(replies[0]).error, `request ${id}`).toBeUndefined();
-    }
     expect(readLockPid(realRoot)).toBe(daemonWriter!.pid);
     expect(daemonWriter!.pid).not.toBe(firstDaemon);
     const branch = trace().filter(record => record.event === 'engine-diagnostics').map(record => record.diagnostics);
@@ -1463,6 +1450,7 @@ describe('Shared MCP daemon (issue #411)', () => {
     const finalDrain = trace().find(record => record.pid === proxyPid && record.event === 'engine-drain-complete' && record.generation === localCalls[1].generation);
     const finalCandidate = trace().find(record => record.pid === proxyPid && record.event === 'candidate-spawn' && record.attempt === 'handover');
     expect(finalDrain).toBeDefined();
+    expect(finalCandidate).toBeDefined();
     const localGenerations = new Set(localCalls.map(record => record.generation));
     const localWorkers = trace().filter(record => record.pid === proxyPid && record.event === 'worker-spawn' && localGenerations.has(record.execution.generation));
     expect(new Set(localWorkers.map(record => record.execution.generation))).toEqual(localGenerations);
@@ -1472,11 +1460,17 @@ describe('Shared MCP daemon (issue #411)', () => {
     const localExits = trace().filter(record => record.pid === proxyPid && record.event === 'worker-exit' && localWorkerKeys.includes(workerKey(record)));
     expect(localExits.map(workerKey).sort()).toEqual(localWorkerKeys);
     expect(localExits.every(record => record.code === 0 || record.code === 1)).toBe(true);
-    // Another real session may win daemon election; when this proxy spawns
-    // the candidate itself, its native drain must precede that exact spawn.
-    if (finalCandidate) expect(finalDrain.sequence).toBeLessThan(finalCandidate.sequence);
+    // No competing launch can publish an unproved foreign daemon owner during
+    // A's healthy local epoch: that correctly causes a terminal unknown refusal.
+    // A must complete its OWN scheduled handback before B tests daemon reuse.
+    expect(finalDrain.sequence).toBeLessThan(finalCandidate.sequence);
+    expect(finalCandidate.candidatePid).toBe(daemonWriter!.pid);
 
-    // The session that started during the lockout ends up on the shared daemon too.
+    const b = spawnServer(tempDir, env);
+    servers.push(b);
+    sendInitialize(b.child, `file://${tempDir}`, 1);
+    await waitFor(() => findResponse(b.stdout, 1), 20000, 25, 'second session initialize');
+    // A later independent session reuses the same proved live shared owner.
     await waitFor(
       () => b.stderr.some((l) => l.includes('Attached to shared daemon') && l.includes(`(pid ${daemonWriter!.pid},`)),
       30000, 25, 'the second session to attach',
@@ -1485,6 +1479,30 @@ describe('Shared MCP daemon (issue #411)', () => {
     const bReply = await waitFor(() => findResponse(b.stdout, 2), 15000, 25, 'second session tools/call');
     expect(bReply.error).toBeUndefined();
     await realExplore(a, 1002); await realExplore(b, 1000);
+    const recoveredEngine = trace().find(record => record.pid === daemonWriter!.pid && record.event === 'engine-constructor');
+    expect(recoveredEngine).toBeDefined();
+    expect(recoveredEngine.diagnostics.effective.executionMode).toBe('shared-daemon');
+    const sharedCalls = trace().filter(record => record.pid === daemonWriter!.pid && record.event === 'tool-start' &&
+      record.name === 'codegraph_explore' && [1002,1000].includes(record.requestId));
+    expect(sharedCalls).toHaveLength(2);
+    expect(new Set(sharedCalls.map(record => record.sessionId)).size).toBe(2);
+    for (const call of sharedCalls) {
+      expect(call.generation).toBe(recoveredEngine.diagnostics.ownership.generation);
+      expect(call.diagnostics.effective).toEqual(recoveredEngine.diagnostics.effective);
+      expect(call.diagnostics.implementation).toEqual(recoveredEngine.diagnostics.implementation);
+      expect(call.diagnostics.ownership).toEqual(recoveredEngine.diagnostics.ownership);
+    }
+    expect(trace().filter(record => record.pid === b.child.pid &&
+      ['candidate-spawn', 'engine-constructor', 'worker-spawn'].includes(record.event))).toEqual([]);
+    for (const id of [1, ...Array.from({ length: lastId - 1 }, (_, index) => index + 2), 1000, 1001, 1002, 1003]) {
+      const replies = a.stdout.filter((line) => {
+        try { const m = JSON.parse(line); return m.id === id && ('result' in m || 'error' in m); } catch { return false; }
+      });
+      expect(replies, `replies to request ${id}`).toHaveLength(1);
+      const reply = JSON.parse(replies[0]);
+      expect(reply.error, `request ${id}`).toBeUndefined();
+      expect(reply.result.isError, `request ${id}`).toBeFalsy();
+    }
     const history = actualHistory().filter(record => record.root === realRoot); expect(history).toHaveLength(5);
     expect(new Set(history.map(record => record.historyId)).size).toBe(4); // Old daemon, SAME local state across two engines, then two new daemon sessions.
   }, 90000);
