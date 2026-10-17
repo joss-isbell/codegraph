@@ -6,6 +6,7 @@ const record = value => fs.appendFileSync(process.env.QUERY_WAITING_OBSERVATIONS
   JSON.stringify({ at: Date.now(), clock: 'process.hrtime.bigint', monotonicNs: process.hrtime.bigint().toString(),
     pid: process.pid, threadId: threads.threadId, ...value }) + '\n');
 if (threads.isMainThread) {
+  require('./query-unavailable-daemon-preload.cjs')(record);
   const OriginalWorker = threads.Worker;
   threads.Worker = class extends OriginalWorker {
     constructor(file, options) {

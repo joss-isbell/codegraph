@@ -2209,15 +2209,24 @@ program
   .option('--mcp', 'Run as MCP server (stdio transport)')
   .option('--no-watch', 'Disable the file watcher (no auto-sync; useful on slow filesystems like WSL2 /mnt drives)')
   .action(async (options: { path?: string; mcp?: boolean; watch?: boolean }) => {
-    const projectPath = options.path ? resolveProjectPath(options.path) : undefined;
-
     // Commander sets watch=false when --no-watch is passed. Route it through
     // the same env-var chokepoint the watcher and MCP server already honor.
     if (options.watch === false) {
       process.env.CODEGRAPH_NO_WATCH = '1';
     }
 
+    const qualifiedCandidate = options.mcp && process.env.CODEGRAPH_DAEMON_INTERNAL === '1'
+      && typeof process.send === 'function';
     try {
+      // MCP hints are lexical only. Qualified transport is consumed/scrubbed
+      // before filesystem discovery; permission must precede schema probing.
+      const hint = options.path ? path.resolve(options.path) : undefined;
+      const startup = options.mcp
+        ? (await import('../mcp/query-startup-transport')).captureMcpQueryStartup(process.env,
+          () => require('os').cpus().length, qualifiedCandidate === true && process.connected === true,
+          hint ?? path.resolve(process.cwd()), typeof process.send === 'function')
+        : undefined;
+      const projectPath = options.mcp ? hint : options.path ? resolveProjectPath(options.path) : undefined;
       if (options.mcp) {
         // `serve --mcp` is the stdio MCP server an AI agent launches for itself,
         // not a command to run by hand. A human in a terminal would otherwise
@@ -2237,7 +2246,7 @@ program
         }
         // Start MCP server - it handles initialization lazily based on rootUri from client
         const { MCPServer } = await import('../mcp/index');
-        const server = new MCPServer(projectPath);
+        const server = new MCPServer(projectPath, startup);
         await server.start();
         // Server will run until terminated
       } else {
@@ -2267,6 +2276,16 @@ program
         console.error(chalk.cyan('  codegraph_status') + '    - Get index status');
       }
     } catch (err) {
+      if (qualifiedCandidate && process.connected) {
+        // A malformed qualified candidate cannot look like genuine pre-service
+        // unavailability and select a writer. Await the bounded terminal status.
+        const { isQueryPolicyRefusal, QueryPolicyRefusalError } = await import('../mcp/query-policy-refusal');
+        const refusal = isQueryPolicyRefusal(err) ? err : new QueryPolicyRefusalError('unknown',
+          path.resolve(options.path ?? process.cwd()), 'Inspect the candidate startup before retrying.',
+          err instanceof Error ? err.message : String(err));
+        try { await (await import('../mcp/query-bootstrap')).reportDaemonBootstrapRefusal(refusal); }
+        catch (failure) { error(`Candidate refusal transport failed: ${failure instanceof Error ? failure.message : String(failure)}`); }
+      }
       error(`Failed to start server: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
     }

@@ -18,7 +18,7 @@
  *
  * - **Direct** — one process serves one MCP client over stdio. The pre-#411
  *   behavior; used when the user opts out (`CODEGRAPH_NO_DAEMON=1`), no
- *   `.codegraph/` is reachable, or the daemon machinery fails for any reason.
+ *   `.codegraph/` is reachable. Primary policy refusal remains terminal.
  * - **Proxy** — what an MCP host actually talks to when sharing is on: a thin
  *   stdio↔socket pipe to the shared daemon. The proxy carries the #277 PPID
  *   watchdog, so a SIGKILL'd host reaps its proxy promptly. See {@link ./proxy.ts}.
@@ -37,12 +37,22 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { requestedQueryPolicy, resolveQueryPolicy } from './query-policy';
+import { performance } from 'perf_hooks';
 import { spawn, StdioOptions } from 'child_process';
-import { resolveServerRoot, getCodeGraphDir } from '../directory';
-import { StdioTransport } from './transport';
+import { getCodeGraphDir, codeGraphDirNameFor, resolveMcpRoot, admitMcpRoute,
+  captureMcpIndexRoute, assertMcpIndexRoute, type McpIndexRoute } from '../directory';
+import type { JsonRpcTransport } from './transport';
 import { MCPEngine } from './engine';
 import { MCPSession } from './session';
+import { immutable, resolveQueryPolicy, resolveLegacyQueryPolicy, type QueryStartupRequest,
+  type QueryExecutionMode, type ResolvedQueryPolicy } from './query-policy';
+import { captureMcpQueryStartup, daemonQueryEnvironment } from './query-startup-transport';
+import { QueryPolicyRefusalError, isQueryPolicyRefusal } from './query-policy-refusal';
+import { awaitDaemonBootstrap, confirmDaemonBootstrap, reportDaemonBootstrapRefusal,
+  type DaemonBootstrapResult } from './query-bootstrap';
+import { admitQueryProject, retainStartupProjectWriter, rollbackStartupProjectWriter, type ProjectWriterReservation,
+  type IndexProgressLease } from './project-lifecycle';
+import { assertNoLiveQueryDaemon, readQueryServiceOwners, processPresence } from './query-service-owner';
 import {
   Daemon,
   clearStaleDaemonLock,
@@ -51,15 +61,17 @@ import {
   tryAcquireDaemonLock,
 } from './daemon';
 import { clearStaleDaemonArtifacts } from './daemon-registry';
-import { connectWithHello, runLocalHandshakeProxy } from './proxy';
-import { assertNoLiveQueryDaemon, assertReadableQueryOwners, readQueryServiceOwners } from './query-service-owner';
+import { connectWithHello, closeOwnedDaemonSocket, runLocalHandshakeProxy, type LocalHandshakeDeps,
+  type PreparedLocalHandshake, type LocalHandshakePreparationControls } from './proxy';
 import { CodeGraphPackageJsonPath, CodeGraphPackageVersion } from './version';
 import {
   readWriterLock,
+  getWriterPidPath,
+  decodeWriterLockInfo,
   assertNoRebuild,
-  releaseWriterLock,
   tryAcquireWriterLock,
   writerLockHeldMessage,
+  type WriterLockInfo,
 } from './writer-lock';
 import {
   canProbeDaemonIdentity,
@@ -70,15 +82,8 @@ import {
 } from './daemon-paths';
 import { getTelemetry } from '../telemetry';
 import { checkForUpdateInBackground } from '../upgrade/update-check';
-import { EARLY_PPID } from './early-ppid';
-import { supervisionLostReason, parsePpidPollMs, parseHostPpid } from './ppid-watchdog';
 import { installMainThreadWatchdog, WatchdogHandle } from './liveness-watchdog';
-import { armStartupHandshakeTimeout } from './startup-handshake';
-import { treatStdinFailureAsShutdown } from './stdin-teardown';
 import { HOST_PPID_ENV } from '../extraction/wasm-runtime-flags';
-
-/** Default worker cap for a direct (single-client) session; see MCPEngineOptions.queryPoolDefaultMax (#1465). */
-const DIRECT_QUERY_POOL_MAX = 2;
 
 /**
  * Env var that marks a process as the *detached daemon* itself (set by
@@ -115,9 +120,69 @@ const HANDOVER_CANDIDATE_WAIT_MS = 5_000;
  * Say so on stderr: otherwise a session that quietly stopped syncing looks
  * the same as a healthy one in the logs.
  */
-function readOnlyFallback(holder: string): MCPEngine {
+function selectedQueryPolicy(startup: QueryStartupRequest, mode: QueryExecutionMode, root: string): ResolvedQueryPolicy {
+  const strict = resolveQueryPolicy(startup.requested, mode, startup.cpuCount);
+  if (mode === 'direct' || mode === 'writable-fallback') return strict;
+  if (strict.preset === 'unlimited') {
+    throw new QueryPolicyRefusalError('unsupported-mode', root,
+      'Use direct or writable fallback for the combined query preset until this mode supports it.',
+      `The combined query preset is unsupported in ${mode}.`);
+  }
+  // Independent controls keep their existing mode semantics and truthful support=false.
+  return resolveLegacyQueryPolicy(startup.requested, mode, startup.cpuCount, { poolEnabled: true });
+}
+
+function cancelled(signal?: AbortSignal): void {
+  if (signal?.aborted) throw signal.reason ?? new Error('Query startup was cancelled.');
+}
+
+function unknownStartup(root: string, detail: string): QueryPolicyRefusalError {
+  return new QueryPolicyRefusalError('unknown', root, 'Inspect project ownership and startup before retrying.', detail);
+}
+
+function assertStartupRoute(route: McpIndexRoute): void {
+  try { assertMcpIndexRoute(route); }
+  catch (error) { throw unknownStartup(route.root,
+    `The primary held index route is unavailable: ${error instanceof Error ? error.message : String(error)}`); }
+}
+
+interface StartupWriterObservation {
+  readonly pidPath: string;
+  readonly locator: string;
+  readonly previous: WriterLockInfo | null;
+}
+
+/** The own DB already exists: observe exact native authority before acquisition. */
+function observeStartupWriter(route: McpIndexRoute): StartupWriterObservation {
+  const pidPath = getWriterPidPath(route.root);
+  const locator = path.join(fs.realpathSync(path.dirname(pidPath)), path.basename(pidPath));
+  let previous: WriterLockInfo | null = null;
+  try {
+    previous = decodeWriterLockInfo(fs.readFileSync(locator, 'utf8'));
+    if (!previous) throw unknownStartup(route.root, 'The previous native writer record is malformed.');
+  } catch (error) { if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error; }
+  return { pidPath, locator, previous };
+}
+
+function retainObservedStartupWriter(route: McpIndexRoute, observed: StartupWriterObservation,
+  acquired: Extract<ReturnType<typeof tryAcquireWriterLock>, { kind: 'acquired' }>): ProjectWriterReservation {
+  try { return retainStartupProjectWriter(route, acquired.info); }
+  catch (primary) {
+    // The lifecycle coordinator retains unresolved native authority in its
+    // existing entry; there is no raw-unlink fallback after its rejection.
+    try { rollbackStartupProjectWriter(route, acquired, observed); }
+    catch (cleanup) { reportStartupCleanup('unretained startup writer rollback', cleanup); }
+    throw primary;
+  }
+}
+
+function readOnlyFallback(holder: string, startup: QueryStartupRequest, prospective: ResolvedQueryPolicy,
+  route: McpIndexRoute, controls: LocalHandshakePreparationControls): MCPEngine {
+  const queryPolicy = selectedQueryPolicy(startup, 'read-only-fallback', route.root);
   process.stderr.write(`[CodeGraph MCP] Serving reads in-process without auto-sync: ${holder}; local read-only fallback resources are not shared across chats.\n`);
-  return new MCPEngine({ readOnly: true, queryPool: true, executionMode: 'read-only-fallback' });
+  return new MCPEngine({ readOnly: true, queryPool: true, queryPolicy, queryAdmissionPolicy: prospective,
+    projectRoute: route, executionMode: 'read-only-fallback', resourceObserver: controls.resourceObserver,
+    onInitialDefaultOutcome: controls.onInitialDefaultOutcome });
 }
 
 /**
@@ -125,7 +190,11 @@ function readOnlyFallback(holder: string): MCPEngine {
  * legacy daemon. Plain-PID locks cannot prove daemon identity, but they still
  * prove that a process owns the legacy writer slot.
  */
-function makeFallbackEngine(root: string): MCPEngine {
+function makeFallbackEngine(route: McpIndexRoute, startup: QueryStartupRequest, prospective: ResolvedQueryPolicy,
+  controls: LocalHandshakePreparationControls, retain: (reservation: ProjectWriterReservation) => void): MCPEngine {
+  const root = route.root;
+  assertStartupRoute(route);
+  assertNoLiveQueryDaemon(root);
   assertNoRebuild(root);
   let existing: ReturnType<typeof decodeLockInfo> = null;
   try {
@@ -133,7 +202,7 @@ function makeFallbackEngine(root: string): MCPEngine {
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code !== 'ENOENT') {
-      throw new Error(`The daemon lock could not be read (${code ?? 'unknown error'}); refusing an in-process fallback.`);
+      throw unknownStartup(root, `The daemon lock could not be read (${code ?? 'unknown error'}); refusing an in-process fallback.`);
     }
   }
   if (
@@ -141,18 +210,16 @@ function makeFallbackEngine(root: string): MCPEngine {
     isProcessAlive(existing.pid) &&
     !canProbeDaemonIdentity(existing)
   ) {
-    throw new Error(
-      `Cannot start an in-process fallback while live legacy daemon pid ${existing.pid} holds the project lock.`
-    );
+    throw unknownStartup(root, `Cannot start an in-process fallback while live legacy daemon pid ${existing.pid} holds the project lock.`);
   }
   const writer = readWriterLock(root);
   if (writer && writer.pid > 0 && isProcessAlive(writer.pid)) {
     // Another process owns updates. A fallback may still serve read-only WAL
     // queries without claiming a second writer or starting a watcher (#1963).
-    return readOnlyFallback(`writer lock held by PID ${writer.pid} (${writer.mode} mode)`);
+    return readOnlyFallback(`writer lock held by PID ${writer.pid} (${writer.mode} mode)`, startup, prospective, route, controls);
   }
   if (existing && isProcessAlive(existing.pid)) {
-    return readOnlyFallback(`live daemon PID ${existing.pid} holds the project lock`);
+    throw unknownStartup(root, `Live daemon PID ${existing.pid} has no proved compatible attachment.`);
   }
   // This session's own install was upgraded or removed underneath it (#2335):
   // its code no longer loads whole, so as the project's writer it would only
@@ -160,9 +227,23 @@ function makeFallbackEngine(root: string): MCPEngine {
   // for the same reason, which is how it got here.
   if (CodeGraphPackageVersion !== '0.0.0-unknown' &&
       installChangedReason(CodeGraphPackageJsonPath, CodeGraphPackageVersion) !== null) {
-    return readOnlyFallback('this session\'s CodeGraph install was upgraded or removed; restart the session to use the current one');
+    return readOnlyFallback('this session\'s CodeGraph install was upgraded or removed; restart the session to use the current one', startup, prospective, route, controls);
   }
-  return new MCPEngine({ writerLockRoot: root, queryPool: true, queryPoolDefaultMax: DIRECT_QUERY_POOL_MAX, executionMode: 'writable-fallback' });
+  const queryPolicy = resolveQueryPolicy(startup.requested, 'writable-fallback', startup.cpuCount);
+  assertNoLiveQueryDaemon(root);
+  const observed = observeStartupWriter(route);
+  const acquired = tryAcquireWriterLock(root, 'fallback');
+  if (acquired.kind === 'taken') throw unknownStartup(root, writerLockHeldMessage(acquired.existing, acquired.pidPath));
+  const reservation = retainObservedStartupWriter(route, observed, acquired);
+  retain(reservation);
+  try {
+    return new MCPEngine({ projectWriter: reservation, queryPool: true, queryPolicy, queryAdmissionPolicy: prospective,
+      projectRoute: route, executionMode: 'writable-fallback', resourceObserver: controls.resourceObserver,
+      onInitialDefaultOutcome: controls.onInitialDefaultOutcome });
+  } catch (error) {
+    if (isQueryPolicyRefusal(error)) throw error;
+    throw unknownStartup(root, `Writable fallback construction failed after its owner check: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 /**
@@ -235,30 +316,57 @@ export function watchdogProgressPaths(root: string | null): { progressPaths?: st
   return { progressPaths: [dbPath, `${dbPath}-wal`] };
 }
 
-/**
- * Resolve the project root the daemon machinery should key on. Returns
- * `null` when no `.codegraph/` is reachable from the candidate path — in
- * that case the caller must run in direct mode, since the daemon lockfile
- * and socket both live under `.codegraph/`.
- *
- * Uses the same resolution as the engine (#1606): up-walk first, then the
- * bounded workspace down-scan that adopts a SINGLE indexed sub-project. A
- * workspace root above one indexed child therefore gets the shared daemon
- * (one watcher, one writer, keyed on the child) instead of a direct-mode
- * server per host.
- *
- * The result is canonicalized with `realpathSync` so every client converges on
- * the same socket/lock path regardless of how it expressed the path: a client
- * launched with cwd under a symlink (e.g. macOS `/var` → `/private/var`, where
- * spawned `process.cwd()` is already realpath'd) and one that passed a
- * symlinked `rootUri` would otherwise hash to different sockets and silently
- * fail to share the daemon.
- */
-function resolveDaemonRoot(explicitPath: string | null): string | null {
-  const candidate = explicitPath ?? process.cwd();
-  const root = resolveServerRoot(candidate).root;
-  if (!root) return null;
-  try { return fs.realpathSync(root); } catch { return root; }
+/** One initial spawn's route-bound evidence; it never caches permission. */
+interface BootstrapSeed {
+  readonly route: McpIndexRoute;
+  readonly result: Extract<DaemonBootstrapResult, { kind: 'unavailable' }>;
+}
+
+async function connectHeldService(route: McpIndexRoute, prospective: ResolvedQueryPolicy, signal: AbortSignal) {
+  cancelled(signal);
+  assertStartupRoute(route);
+  const owners = readQueryServiceOwners(route.root);
+  const candidates = getDaemonSocketCandidates(route.root);
+  if (owners.daemon.kind === 'live' && canProbeDaemonIdentity(owners.daemon.value)) {
+    candidates.unshift(owners.daemon.value.socketPath);
+  }
+  for (const candidate of new Set(candidates)) {
+    const socket = await connectWithHello(candidate, undefined, prospective, route.root);
+    try { cancelled(signal); assertStartupRoute(route); }
+    catch (primary) {
+      if (socket) {
+        try { await closeOwnedDaemonSocket(socket); }
+        catch (cleanup) { reportStartupCleanup('refused socket close', cleanup); }
+      }
+      throw primary;
+    }
+    if (socket) return socket;
+  }
+  return null;
+}
+
+function reportStartupCleanup(phase: string, error: unknown): void {
+  try { process.stderr.write(`[CodeGraph MCP] ${phase}: ${String(error).slice(0, 2048)}\n`); } catch { /* preserve primary */ }
+}
+
+async function waitAcknowledgedCandidate(route: McpIndexRoute, candidatePid: number,
+  prospective: ResolvedQueryPolicy, signal: AbortSignal): Promise<void> {
+  for (let attempt = 0; attempt < DAEMON_CONNECT_MAX_RETRIES; attempt++) {
+    cancelled(signal);
+    assertStartupRoute(route);
+    const socket = await connectHeldService(route, prospective, signal);
+    if (socket) { await closeOwnedDaemonSocket(socket); return; }
+    if (processPresence(candidatePid) === 'absent') break;
+    await sleep(DAEMON_CONNECT_RETRY_DELAY_MS);
+  }
+  if (processPresence(candidatePid) !== 'absent') {
+    throw unknownStartup(route.root, `Acknowledged candidate PID ${candidatePid} has no proved attachment or native absence.`);
+  }
+  // The candidate's absence alone never grants a new writer.
+  await admitQueryProject(route.root, prospective, signal);
+  cancelled(signal);
+  assertStartupRoute(route);
+  assertNoLiveQueryDaemon(route.root);
 }
 
 /**
@@ -273,30 +381,37 @@ function resolveDaemonRoot(explicitPath: string | null): string | null {
  * launcher proxies through the single winner. `handover` tells the daemon this
  * launcher holds the writer slot for it (see {@link DAEMON_HANDOVER_ENV}).
  */
-function spawnDetachedDaemon(root: string, handover = false): void {
+async function spawnDetachedDaemon(route: McpIndexRoute, startup: QueryStartupRequest, handover = false,
+  signal?: AbortSignal, acknowledgePermission = true): Promise<DaemonBootstrapResult> {
+  cancelled(signal);
+  assertStartupRoute(route);
+  const root = route.root;
+  const selector = codeGraphDirNameFor(root);
+  if (fs.realpathSync(path.join(root, selector, 'codegraph.db')) !== route.index) {
+    throw unknownStartup(root, 'The captured child index-directory binding changed.');
+  }
   const scriptPath = process.argv[1];
   if (!scriptPath) {
-    // No resolvable CLI entry point to re-invoke — let the caller fall back to
-    // direct mode rather than spawn something broken.
-    throw new Error('cannot resolve CLI script path to spawn the daemon');
+    throw unknownStartup(root, 'Cannot resolve the CLI script path to spawn the daemon.');
   }
 
   let logFd: number | null = null;
   let stdio: StdioOptions = 'ignore';
   try {
     logFd = fs.openSync(path.join(getCodeGraphDir(root), 'daemon.log'), 'a');
-    stdio = ['ignore', logFd, logFd];
+    stdio = ['ignore', logFd, logFd, 'ipc'];
   } catch {
-    stdio = 'ignore'; // no log file — discard daemon output rather than fail
+    stdio = ['ignore', 'ignore', 'ignore', 'ipc'];
   }
   try {
     // The daemon has no host: scrub the threaded host pid so it can't leak
     // into the daemon's env (and from there into anything the daemon spawns),
     // where a long-dead session's host pid would trigger spurious shutdowns.
-    const env: NodeJS.ProcessEnv = { ...process.env, [DAEMON_INTERNAL_ENV]: '1' };
+    const env = daemonQueryEnvironment({ ...process.env, CODEGRAPH_DIR: selector, [DAEMON_INTERNAL_ENV]: '1' }, startup);
     delete env[HOST_PPID_ENV];
     if (handover) env[DAEMON_HANDOVER_ENV] = String(process.pid);
     else delete env[DAEMON_HANDOVER_ENV];
+    const bootstrapDeadline = performance.now() + 15_000;
     const child = spawn(
       process.execPath,
       [...process.execArgv, scriptPath, 'serve', '--mcp', '--path', root],
@@ -307,13 +422,58 @@ function spawnDetachedDaemon(root: string, handover = false): void {
         env,
       },
     );
+    type NativeClose = { exitCode: number | null; signal: NodeJS.Signals | null; observedAt: number };
+    let closeFacts: NativeClose | undefined;
+    let resolveClose: (facts: NativeClose) => void = () => {};
+    const nativeClose = new Promise<NativeClose>(resolve => { resolveClose = resolve; });
+    const onClose = (exitCode: number | null, signal: NodeJS.Signals | null) => {
+      closeFacts = { exitCode, signal, observedAt: performance.now() };
+      resolveClose(closeFacts);
+    };
+    // Native close may immediately follow exit/error; observe before H starts.
+    child.once('close', onClose);
+    let closeTimer: NodeJS.Timeout | undefined;
     // An upgrade can delete the install this launcher runs from — its daemon
     // then exits (#2335) and a respawn finds no executable. spawn reports that
     // as an asynchronous 'error' event, which would crash this process if
     // nobody listened. No daemon binds either way; the caller's poll gives up
     // and the session is served in-process.
-    child.on('error', () => { /* no daemon — see above */ });
-    child.unref();
+    const abort = () => { if (child.connected) child.disconnect(); };
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) abort();
+    try {
+      // An unsupported discovery preflight must remain inert even if a child
+      // unexpectedly advertises permission. H's explicit option denies ACK.
+      const result = acknowledgePermission
+        ? await awaitDaemonBootstrap(child, root)
+        : await awaitDaemonBootstrap(child, root, { acknowledgePermission: false });
+      cancelled(signal);
+      if (result.kind === 'unavailable') {
+        const remaining = bootstrapDeadline - performance.now();
+        if (!closeFacts && remaining <= 0) throw unknownStartup(root, 'Candidate native close exceeded the original 15000ms bootstrap deadline.');
+        const closed = closeFacts ?? await Promise.race([nativeClose, new Promise<never>((_resolve, reject) => {
+          closeTimer = setTimeout(() => reject(unknownStartup(root,
+            'Candidate native close did not complete within the original 15000ms bootstrap deadline.')), remaining);
+        })]);
+        cancelled(signal);
+        if (closed.observedAt > bootstrapDeadline) throw unknownStartup(root, 'Candidate native close exceeded the original bootstrap deadline.');
+        if (result.cause === 'pre-service-exit') {
+          if (child.pid === undefined || !Number.isSafeInteger(child.pid) || child.pid <= 0
+            || closed.exitCode !== result.exitCode || closed.signal !== result.signal) {
+            throw unknownStartup(root, 'Candidate native exit/close identity or outcome is inconsistent.');
+          }
+        } else if (child.pid !== undefined) {
+          // Spawn failure has no native candidate exit. Preserve its distinct
+          // error/close facts rather than treating it as a spawned process.
+          throw unknownStartup(root, 'Candidate spawn failure unexpectedly has a native process identity.');
+        }
+      }
+      return result;
+    } finally {
+      signal?.removeEventListener('abort', abort);
+      child.removeListener('close', onClose);
+      if (closeTimer) clearTimeout(closeTimer);
+    }
   } finally {
     // The child holds its own dup of the log fd now; the launcher doesn't need it.
     if (logFd !== null) {
@@ -360,27 +520,32 @@ async function outwaitCandidate(root: string, handoverFrom: number | null, pid: 
  */
 export class MCPServer {
   private projectPath: string | null;
+  private readonly queryStartup: QueryStartupRequest;
+  private readonly queryAdmissionPolicy: ResolvedQueryPolicy;
+  private readonly directQueryPolicy: ResolvedQueryPolicy;
+  private directStopPromise: Promise<void> | null = null;
   // Direct-mode-only state. In daemon mode the per-connection sessions live
   // inside the Daemon class; in proxy mode there is no session at all.
   private session: MCPSession | null = null;
   private engine: MCPEngine | null = null;
   private daemon: Daemon | null = null;
-  private ppidWatchdog: ReturnType<typeof setInterval> | null = null;
   // Worker-thread liveness watchdog (#850). Long-lived modes only; SIGKILLs the
   // process if the main thread wedges in a non-yielding sync loop.
   private livenessWatchdog: WatchdogHandle | null = null;
-  // PPID watchdog baseline — from the CLI entry's earliest-possible capture
-  // (early-ppid.ts). Capturing here (construction) already lost the race when
-  // the launcher was killed during module loading (#1185).
-  private originalPpid: number = EARLY_PPID;
-  private hostPpid: number | null = parseHostPpid(process.env[HOST_PPID_ENV]);
   // Idempotency guard for stop().
   private stopped = false;
-  private mode: 'unstarted' | 'direct' | 'proxy' | 'daemon' = 'unstarted';
   /** Project root whose writer.pid we hold in direct mode (#1740); released on stop. */
-  private writerLockRoot: string | null = null;
+  private startupWriters = new Set<ProjectWriterReservation>();
 
-  constructor(projectPath?: string) {
+  constructor(projectPath?: string, startup = captureMcpQueryStartup(process.env, () => os.cpus().length,
+    process.connected === true && typeof process.send === 'function', path.resolve(projectPath ?? process.cwd()),
+    typeof process.send === 'function')) {
+    // Validate before start() can bootstrap, attach or acquire any authority.
+    // Keep the original immutable inputs for the execution mode selected later.
+    if (!Number.isSafeInteger(startup.cpuCount) || startup.cpuCount < 0) throw new Error('Invalid captured query CPU count.');
+    this.queryStartup = immutable({ requested: { ...startup.requested }, cpuCount: startup.cpuCount });
+    this.directQueryPolicy = resolveQueryPolicy(this.queryStartup.requested, 'direct', this.queryStartup.cpuCount);
+    this.queryAdmissionPolicy = resolveQueryPolicy(this.queryStartup.requested, 'shared-daemon', this.queryStartup.cpuCount);
     this.projectPath = projectPath || null;
   }
 
@@ -394,8 +559,8 @@ export class MCPServer {
    *      socket both live under `.codegraph/`).
    *   4. Otherwise connect to (or spawn) the shared daemon and proxy to it.
    *
-   * On any unexpected failure in step 4 we transparently fall back to direct
-   * mode — a misbehaving daemon must never block a session from starting.
+   * The outer prepared shell exposes static discovery immediately. Primary
+   * admission remains terminal; genuinely absent service may select fallback.
    */
   async start(): Promise<void> {
     // Long-lived process (direct / proxy / daemon alike): flush buffered
@@ -417,129 +582,157 @@ export class MCPServer {
       return this.startDaemonProcess();
     }
 
-    // Direct mode if the user opted out. Setting the env var is sufficient to
-    // get the pre-#411 single-process behavior.
-    if (daemonOptOutSet()) {
-      return this.startDirect('CODEGRAPH_NO_DAEMON set');
-    }
-
-    const root = resolveDaemonRoot(this.projectPath);
-    if (!root) {
-      // No initialized project found — daemon mode has nowhere to put its
-      // socket. The fresh-checkout / outside-project case; behave as before.
-      return this.startDirect('no .codegraph/ root found');
-    }
-
-    try {
-      // Answer the MCP handshake LOCALLY (instant tool registration — no waiting
-      // ~600ms for the daemon to spawn+bind, which produced the cold-start race)
-      // and forward tool CALLS to the shared daemon, connected in the background.
-      // Runs until the host disconnects; the proxy installs its own watchdog and
-      // falls back to an in-process engine if the daemon never comes up.
-      this.mode = 'proxy';
-      await this.runProxyWithLocalHandshake(root);
-      return;
-    } catch (err) {
-      // Belt-and-braces: a throw during proxy SETUP (before the client was served)
-      // is still safe to recover from with a direct-mode session.
-      const msg = err instanceof Error ? err.message : String(err);
-      process.stderr.write(`[CodeGraph MCP] Proxy path failed (${msg}); falling back to direct mode.\n`);
-      return this.startDirect('proxy path threw');
-    }
+    // P2 owns one input parser and its supervision lifetime, even when initial
+    // verification ultimately selects direct/no-root. Refusal is never downgraded.
+    await runLocalHandshakeProxy({ hint: this.projectPath ?? process.cwd(),
+      prepare: (signal, controls) => this.prepareHandshake(signal, controls) });
   }
 
   /**
    * Stop the server. In daemon mode this triggers graceful shutdown of every
-   * connected session; in direct mode it mirrors the pre-#411 behavior (close
-   * cg, exit). Proxy mode never routes through here — the proxy exits itself.
+   * connected session. Prepared direct mode only releases resources; its
+   * outer shell owns process exit and the shutdown deadline.
    */
   async stop(): Promise<void> {
+    return this.directStopPromise ??= this.stopResources();
+  }
+
+  private async stopResources(): Promise<void> {
     if (this.stopped) return;
     this.stopped = true;
-    if (this.ppidWatchdog) {
-      clearInterval(this.ppidWatchdog);
-      this.ppidWatchdog = null;
-    }
     if (this.livenessWatchdog) {
       this.livenessWatchdog.stop();
       this.livenessWatchdog = null;
     }
     if (this.daemon) {
-      void this.daemon.stop('stop()');
-      // Daemon.stop calls process.exit; nothing else to do.
+      await this.daemon.stop('stop()');
+      // Daemon.stop owns final exit, but its rejected drain remains observable.
       return;
     }
-    if (this.session) {
-      this.session.stop();
-      this.session = null;
+    let failure: unknown, failed = false;
+    const recordFailure = (phase: string, error: unknown) => {
+      if (!failed) { failed = true; failure = error; } else reportStartupCleanup(phase, error);
+    };
+    try { this.session?.stop(); } catch (error) { recordFailure('session stop', error); }
+    this.session = null;
+    let engineStopped = !this.engine;
+    try { await this.engine?.drain(); engineStopped = true; }
+    catch (error) {
+      recordFailure('engine drain', error);
     }
-    if (this.engine) {
-      await this.engine.stop();
-      this.engine = null;
+    if (engineStopped) this.engine = null;
+    if (engineStopped) for (const reservation of this.startupWriters) {
+      try { await reservation.release(); this.startupWriters.delete(reservation); }
+      catch (error) { recordFailure('startup writer reservation release', error); }
     }
-    if (this.writerLockRoot) {
-      releaseWriterLock(this.writerLockRoot);
-      this.writerLockRoot = null;
-    }
-    process.exit(0);
+    // Resource-only: the prepared shell owns final exit and its bounded backstop.
+    if (failed) throw failure;
   }
 
-  /** Single-process stdio MCP session — the pre-issue-#411 code path. */
-  private async startDirect(reason: string): Promise<void> {
-    if (reason && process.env.CODEGRAPH_MCP_DEBUG) {
-      process.stderr.write(`[CodeGraph MCP] Direct mode: ${reason}.\n`);
-    }
-
-    // #1740: refuse a second direct writer on an initialized project. Daemon
-    // mode multiplexes clients; direct mode is single-writer-per-project.
-    const writerRoot = resolveDaemonRoot(this.projectPath);
-    if (writerRoot) {
-      assertNoRebuild(writerRoot);
-      const writer = tryAcquireWriterLock(writerRoot, 'direct');
-      if (writer.kind === 'taken') {
-        const msg = writerLockHeldMessage(writer.existing, writer.pidPath);
-        process.stderr.write(`[CodeGraph MCP] ${msg}\n`);
-        process.exit(1);
+  private async prepareHandshake(signal: AbortSignal, controls: LocalHandshakePreparationControls): Promise<PreparedLocalHandshake> {
+    // Selection is deferred to the actual session, including client roots.
+    // Null here means inert, not a proved no-index/cwd permission result.
+    if (daemonOptOutSet()) return { kind: 'direct', route: null,
+      makeSession: (transport, factorySignal) => this.makeDirectSession(null, transport, factorySignal, controls),
+      stop: () => this.stop() };
+    const unsupportedShared = this.queryAdmissionPolicy.preset === 'unlimited';
+    // Only closed, unacknowledged attempts can be retained during discovery.
+    // The selected route consumes its one result; no seed grants permission.
+    const seeds = new Map<string, BootstrapSeed>();
+    const routeKey = (route: McpIndexRoute) => JSON.stringify([route.root, route.index]);
+    const progress = new Set<IndexProgressLease>();
+    let primaryFailed = false;
+    try {
+    const resolution = await resolveMcpRoot(this.projectPath ?? process.cwd(), { signal, admit: async route => {
+      progress.add(await controls.resourceObserver.acquireIndexProgress(route, signal));
+      cancelled(signal);
+      await admitQueryProject(route.root, this.queryAdmissionPolicy, signal);
+      cancelled(signal);
+      if (!unsupportedShared) return;
+      // Normal supported discovery classifies admitted schemas without starting
+      // speculative services. Combined shared selection is still unsupported:
+      // its actual inert preflight must finish before the parent's schema probe.
+      const existing = await connectHeldService(route, this.queryAdmissionPolicy, signal);
+      if (existing) { await closeOwnedDaemonSocket(existing); return; }
+      assertNoLiveQueryDaemon(route.root);
+      const result = seeds.get(routeKey(route))?.result
+        ?? await spawnDetachedDaemon(route, this.queryStartup, false, signal, false);
+      if (result.kind === 'refused') throw result.refusal;
+      if (result.kind === 'permitted') {
+        // The no-ACK helper cannot return permitted. Keep an explicit fence if
+        // its implementation ever changes; discovery cannot promote a service.
+        throw unknownStartup(route.root, 'Unsupported discovery unexpectedly advertised startup permission.');
       }
-      this.writerLockRoot = writerRoot;
-    }
-
-    this.engine = new MCPEngine({ queryPool: true, queryPoolDefaultMax: DIRECT_QUERY_POOL_MAX, executionMode: 'direct' });
-    const transport = new StdioTransport({ exitOnClose: false, onClose: () => { void this.stop(); } });
-    this.session = new MCPSession(transport, this.engine, {
-      explicitProjectPath: this.projectPath,
+      await admitQueryProject(route.root, this.queryAdmissionPolicy, signal);
+      cancelled(signal);
+      assertStartupRoute(route);
+      assertNoLiveQueryDaemon(route.root);
+      const writer = readQueryServiceOwners(route.root).writer;
+      selectedQueryPolicy(this.queryStartup, writer.kind === 'live' ? 'read-only-fallback' : 'writable-fallback', route.root);
+      seeds.set(routeKey(route), Object.freeze({ route, result }));
+    } }).catch(error => {
+      seeds.clear();
+      cancelled(signal);
+      if (isQueryPolicyRefusal(error)) throw error;
+      throw unknownStartup(this.projectPath ?? process.cwd(),
+        `Primary project selection failed: ${error instanceof Error ? error.message : String(error)}`);
     });
-
-    if (this.projectPath) {
-      // Background init so the initialize response stays fast (#172).
-      void this.engine.ensureInitialized(this.projectPath);
+    const route = resolution.route;
+    const seed = route ? seeds.get(routeKey(route)) : undefined;
+    // Invalid-nearer and ambiguous/rootless discovery cannot carry evidence to
+    // an ancestor, another candidate, a future retry or an explicit target.
+    seeds.clear();
+    cancelled(signal);
+    if (route) {
+      return { kind: 'proxy', deps: this.proxyDependencies(route, this.queryStartup, seed, signal, controls) };
     }
+    return { kind: 'direct', route,
+      makeSession: (transport, factorySignal) => this.makeDirectSession(route, transport, factorySignal, controls),
+      stop: () => this.stop() };
+    } catch (error) { primaryFailed = true; throw error; }
+    finally {
+      let cleanupFailed = false, cleanupFailure: unknown;
+      for (const lease of progress) try { await lease.release(); }
+      catch (error) {
+        if (!cleanupFailed) { cleanupFailed = true; cleanupFailure = error; }
+        reportStartupCleanup('schema progress release', error);
+      }
+      if (cleanupFailed && !primaryFailed) throw cleanupFailure;
+    }
+  }
 
-    this.session.start();
-
-    // Detect parent-process death — same logic as pre-refactor. When stdin
-    // closes the transport drains the engine through stop(), but
-    // SIGKILL of the parent doesn't reliably close stdin on Linux (#277).
-    // Also treat a stdin `'error'` (a socket-backed stdin can fail with
-    // ECONNRESET/hangup instead of a clean close) as shutdown, and destroy the
-    // stream so a hung fd can't busy-spin the event loop (#799).
-    treatStdinFailureAsShutdown(() => this.stop());
-    // Backstop for a launch abandoned during startup (#1185): launcher killed
-    // before EARLY_PPID could see it + host holding our pipes open. A server
-    // that never receives a byte of MCP traffic isn't serving anyone. Armed
-    // after session.start() attached the real stdin consumer.
-    armStartupHandshakeTimeout(() => {
-      process.stderr.write(
-        '[CodeGraph MCP] No MCP traffic since startup; assuming an abandoned launch and shutting down (#1185). ' +
-        'Tune with CODEGRAPH_STARTUP_HANDSHAKE_TIMEOUT_MS (0 disables).\n'
-      );
-      this.stop();
-    });
-
-    this.mode = 'direct';
-    this.installSignalHandlers();
-    this.installPpidWatchdog();
-    this.livenessWatchdog = installMainThreadWatchdog(watchdogProgressPaths(resolveDaemonRoot(this.projectPath)));
+  private async makeDirectSession(route: McpIndexRoute | null, transport: JsonRpcTransport,
+    signal: AbortSignal, controls: LocalHandshakePreparationControls): Promise<MCPSession> {
+    cancelled(signal);
+    if (this.stopped) throw new Error('MCP startup is closed.');
+    let projectWriter: ProjectWriterReservation | undefined;
+    if (route) {
+      await admitMcpRoute(route, { signal, admit: async held => {
+        await admitQueryProject(held.root, this.queryAdmissionPolicy, signal);
+        cancelled(signal);
+      } }).catch(error => {
+        cancelled(signal);
+        if (isQueryPolicyRefusal(error)) throw error;
+        throw unknownStartup(route.root, `Primary direct admission failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
+      cancelled(signal);
+      if (this.stopped) throw new Error('MCP startup is closed.');
+      assertStartupRoute(route);
+      assertNoRebuild(route.root);
+      const observed = observeStartupWriter(route);
+      const writer = tryAcquireWriterLock(route.root, 'direct');
+      if (writer.kind === 'taken') throw unknownStartup(route.root, writerLockHeldMessage(writer.existing, writer.pidPath));
+      projectWriter = retainObservedStartupWriter(route, observed, writer);
+      this.startupWriters.add(projectWriter);
+    }
+    // No await separates the final closing/ownership fence and publication.
+    cancelled(signal);
+    if (this.stopped) throw new Error('MCP startup is closed.');
+    this.engine = new MCPEngine({ queryPool: true, queryPolicy: this.directQueryPolicy,
+      queryAdmissionPolicy: this.queryAdmissionPolicy, ...(route ? { projectRoute: route, projectWriter } : {}),
+      resourceObserver: controls.resourceObserver, onInitialDefaultOutcome: controls.onInitialDefaultOutcome, executionMode: 'direct' });
+    this.session = new MCPSession(transport, this.engine, { explicitProjectPath: this.projectPath });
+    return this.session;
   }
 
   /**
@@ -555,23 +748,48 @@ export class MCPServer {
     // In daemon mode stderr IS `.codegraph/daemon.log`; stamp every line so
     // kills/restarts can be placed in time (#1431 — the log was undatable).
     timestampStderrLines();
-    const root = resolveDaemonRoot(this.projectPath) ?? this.projectPath ?? process.cwd();
+    const hint = this.projectPath ?? process.cwd();
+    const qualified = process.env[DAEMON_INTERNAL_ENV] === '1' && typeof process.send === 'function';
+    let route: McpIndexRoute;
+    let queryPolicy: ResolvedQueryPolicy;
+    try {
+      if (qualified && !process.connected) throw unknownStartup(hint,
+        'Native candidate bootstrap IPC disconnected before daemon startup.');
+      // Support is selected before any schema/authority; parent --path binds an
+      // exact own index, never a nearest-root search inside the child.
+      queryPolicy = selectedQueryPolicy(this.queryStartup, 'shared-daemon', hint);
+      const captured = captureMcpIndexRoute(hint);
+      if (!captured) throw unknownStartup(hint, 'The detached candidate has no held own index.');
+      route = await admitMcpRoute(captured, { admit: async held => {
+        await admitQueryProject(held.root, this.queryAdmissionPolicy);
+        if (qualified) await confirmDaemonBootstrap(held.root);
+      } });
+    } catch (error) {
+      const refusal = isQueryPolicyRefusal(error) ? error : unknownStartup(hint,
+        `The detached candidate held route could not be proved: ${error instanceof Error ? error.message : String(error)}`);
+      if (qualified && process.connected) await reportDaemonBootstrapRefusal(refusal);
+      throw refusal;
+    }
+    const root = route.root;
     // Read once and dropped, so nothing this daemon spawns inherits it.
     const handoverPid = Number(process.env[DAEMON_HANDOVER_ENV]);
     const handoverFrom = Number.isInteger(handoverPid) && handoverPid > 0 ? handoverPid : null;
     delete process.env[DAEMON_HANDOVER_ENV];
     for (let attempt = 0; attempt < TAKEOVER_MAX_RETRIES; attempt++) {
+      assertStartupRoute(route);
+      // A changed owner after the ACK/schema wait cannot authorize takeover.
+      await admitQueryProject(root, this.queryAdmissionPolicy);
+      assertStartupRoute(route);
       const lock = tryAcquireDaemonLock(root);
 
       if (lock.kind === 'acquired') {
-        const daemon = new Daemon(root, { handoverFrom });
+        const daemon = new Daemon(root, { handoverFrom, queryPolicy, queryAdmissionPolicy: this.queryAdmissionPolicy, projectRoute: route });
         await daemon.start();
         this.daemon = daemon;
-        this.mode = 'daemon';
         // The detached daemon has no PPID watchdog or stdin lifeline, so a
         // wedged main thread would pin a core forever (#850). The liveness
         // watchdog is its only recovery path.
-        this.livenessWatchdog = installMainThreadWatchdog(watchdogProgressPaths(root));
+        this.livenessWatchdog = installMainThreadWatchdog({ progressPaths: [route.index, `${route.index}-wal`] });
         return; // the net.Server keeps the process alive
       }
 
@@ -628,104 +846,65 @@ export class MCPServer {
   /**
    * Proxy mode (the common case). Serve the MCP handshake LOCALLY for instant
    * tool registration, forwarding tool calls to the shared daemon — which is
-   * connected in the background (probed, then spawned + polled if absent) so the
+   * connected in the background (probed, then spawned + polled if absent; one of
+   * an older release is stopped first, #2335) so the
    * handshake never waits ~600ms on it. Runs until the host disconnects; the
    * proxy falls back to an in-process engine if the daemon never binds, so this
    * never wedges a session.
    */
-  private async runProxyWithLocalHandshake(root: string): Promise<void> {
-    // Temporary capture until the root joins #29's immutable startup parameter.
-    const prospectivePolicy = resolveQueryPolicy(requestedQueryPolicy(process.env), 'shared-daemon', os.cpus().length);
-    // The daemon may relocate its socket past an in-project filesystem that can't
-    // host one (ExFAT/FAT volumes, WSL2 DrvFs; #997) to the deterministic tmpdir
-    // fallback. Probe the usual ordered candidates first, then the project
-    // owner's recorded rendezvous for historical/noncanonical socket names.
-    const candidates = getDaemonSocketCandidates(root);
-    const connectAnyCandidate = async (): Promise<Awaited<ReturnType<typeof connectWithHello>>> => {
-      for (const candidate of candidates) {
-        const s = await connectWithHello(candidate, CodeGraphPackageVersion, prospectivePolicy, root);
-        // Incompatible/unknown hello throws a terminal refusal, never null.
-        if (s) return s;
-      }
-      return null;
-    };
+  private proxyDependencies(route: McpIndexRoute, startup: QueryStartupRequest, initialSeed: BootstrapSeed | undefined,
+    signal: AbortSignal, controls: LocalHandshakePreparationControls): LocalHandshakeDeps {
+    const root = route.root;
+    const prospective = this.queryAdmissionPolicy;
+    let seed = initialSeed;
+    const connectAnyCandidate = () => connectHeldService(route, prospective, signal);
     const getDaemonSocket = async () => {
-      // Fast path: a daemon may already be listening (on either candidate).
+      // Every attempt performs current permission; a bootstrap seed is evidence
+      // for its one actual spawn, never a cached caller verdict or attachment.
+      cancelled(signal);
+      const capturedSeed = seed;
+      seed = undefined;
+      if (capturedSeed && (capturedSeed.route.root !== root || capturedSeed.route.index !== route.index)) {
+        throw unknownStartup(root, 'The bootstrap seed does not belong to the held route.');
+      }
+      await admitQueryProject(root, prospective, signal);
+      cancelled(signal);
+      assertStartupRoute(route);
       const probe = await connectAnyCandidate();
       if (probe) return probe;
-      const connectRecordedOwner = async () => {
-        const owners = readQueryServiceOwners(root);
-        assertReadableQueryOwners(root, owners);
-        if (owners.daemon.kind === 'live' && canProbeDaemonIdentity(owners.daemon.value)) {
-          return connectWithHello(owners.daemon.value.socketPath, CodeGraphPackageVersion, prospectivePolicy, root);
-        }
-        return null;
-      };
-      // A live owner may be a racing compatible daemon still binding. Wait and
-      // inspect, without taking its slot or spawning a competing candidate.
-      let owners = readQueryServiceOwners(root);
-      assertReadableQueryOwners(root, owners);
-      if (owners.daemon.kind === 'live') {
-        for (let attempt = 0; attempt < DAEMON_CONNECT_MAX_RETRIES; attempt++) {
-          const existing = await connectRecordedOwner();
-          if (existing) return existing;
-          await sleep(DAEMON_CONNECT_RETRY_DELAY_MS);
-          const usual = await connectAnyCandidate();
-          if (usual) return usual;
-          owners = readQueryServiceOwners(root);
-          assertReadableQueryOwners(root, owners);
-          if (owners.daemon.kind !== 'live') break;
-        }
-      }
-      assertNoLiveQueryDaemon(root, owners);
-      // No unproved daemon remains. A separate ordinary writer can still make
-      // a genuinely unavailable candidate select accurate read-only fallback.
-      // #29's serial bootstrap join supplies the permitted/candidate-PID gate.
-      spawnDetachedDaemon(root);
-      for (let attempt = 0; attempt < DAEMON_CONNECT_MAX_RETRIES; attempt++) {
-        await sleep(DAEMON_CONNECT_RETRY_DELAY_MS);
-        const usual = await connectAnyCandidate();
-        if (usual) return usual;
-        const recorded = await connectRecordedOwner();
-        if (recorded) return recorded;
-      }
       assertNoLiveQueryDaemon(root);
+      const bootstrapResult = capturedSeed?.result ?? await spawnDetachedDaemon(route, startup, false, signal);
+      if (bootstrapResult.kind === 'refused') throw bootstrapResult.refusal;
+      cancelled(signal);
+      assertStartupRoute(route);
+      if (bootstrapResult.kind === 'permitted') {
+        await waitAcknowledgedCandidate(route, bootstrapResult.candidatePid, prospective, signal);
+        const attached = await connectAnyCandidate();
+        if (attached) return attached;
+        if (processPresence(bootstrapResult.candidatePid) !== 'absent') throw unknownStartup(root,
+          `Acknowledged candidate PID ${bootstrapResult.candidatePid} lost its proved attachment while still alive or ambiguous.`);
+      }
+      // Genuine pre-service unavailability, or v5's exact absent-candidate
+      // exception, still requires the same valid route and fresh owner proof.
+      await admitQueryProject(root, prospective, signal);
+      cancelled(signal);
+      assertStartupRoute(route);
+      const appeared = await connectAnyCandidate();
+      if (appeared) return appeared;
+      assertNoLiveQueryDaemon(root);
+      const writer = readQueryServiceOwners(root).writer;
+      selectedQueryPolicy(startup, writer.kind === 'live' ? 'read-only-fallback' : 'writable-fallback', root);
       return null;
     };
-    await runLocalHandshakeProxy({ getDaemonSocket, makeEngine: () => makeFallbackEngine(root), root });
+    return { getDaemonSocket, makeEngine: () => {
+      cancelled(signal);
+      if (this.stopped) throw new Error('MCP startup is closed.');
+      assertStartupRoute(route);
+      return makeFallbackEngine(route, startup, prospective, controls, reservation => this.startupWriters.add(reservation));
+    }, root, stop: () => this.stop() };
   }
 
-  /** Standard SIGINT/SIGTERM handlers that route to our `stop()` (direct mode). */
-  private installSignalHandlers(): void {
-    process.on('SIGINT', () => this.stop());
-    process.on('SIGTERM', () => this.stop());
-  }
 
-  /**
-   * PPID watchdog (#277) — direct mode only. Daemon mode is detached on purpose
-   * and reaps via idle timeout; proxy mode installs its own watchdog inside
-   * {@link runProxy}. So this only ever runs for an in-process direct session.
-   */
-  private installPpidWatchdog(): void {
-    if (this.mode !== 'direct') return;
-    const pollMs = parsePpidPollMs(process.env.CODEGRAPH_PPID_POLL_MS);
-    if (pollMs <= 0) return;
-    this.ppidWatchdog = setInterval(() => {
-      const reason = supervisionLostReason({
-        originalPpid: this.originalPpid,
-        currentPpid: process.ppid,
-        hostPpid: this.hostPpid,
-        isAlive: isProcessAlive,
-      });
-      if (reason) {
-        process.stderr.write(
-          `[CodeGraph MCP] Parent process exited (${reason}); shutting down.\n`
-        );
-        this.stop();
-      }
-    }, pollMs);
-    this.ppidWatchdog.unref();
-  }
 }
 
 function sleep(ms: number): Promise<void> {

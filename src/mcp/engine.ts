@@ -31,7 +31,7 @@ import { isServicePolicyRefusal, type ServicePolicyRefusal } from './query-servi
 const RETRY_SUBSCAN_TTL_MS = 5_000;
 
 export interface MCPEngineOptions {
-  /** Internal common boundary. Public callers continue to use the legacy adapter. */
+  /** Internal selected-mode boundary; absent injection preserves legacy callers. */
   queryPolicy?: ResolvedQueryPolicy;
   /** Prospective shared-service policy from the same captured startup request. */
   queryAdmissionPolicy?: ResolvedQueryPolicy;
@@ -307,7 +307,9 @@ export class MCPEngine {
     }
     return immutable({ schemaVersion: 1,
       implementation: { packageVersion: CodeGraphPackageVersion, policySchemaVersion: 1,
-        support: { independentControls: true, combinedPreset: false, idleRetirement: true } },
+        support: { independentControls: true,
+          combinedPreset: effective.source === 'strict' && (effective.executionMode === 'direct' || effective.executionMode === 'writable-fallback'),
+          idleRetirement: true } },
       requested, effective,
       ownership: { writerAuthority: this.execution.ownership.writer, synchronizationAuthority: this.execution.ownership.synchronization,
         capability: this.execution.capability,
