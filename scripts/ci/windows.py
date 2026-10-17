@@ -15,7 +15,7 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
 STAGES = (("install", ("ci",), 600), ("build", ("run", "build"), 600),
-          ("test", ("test",), 1800))
+          ("test", ("test", "--", "--reporter=default", "--reporter=json"), 1800))
 TOTAL_SECONDS = 3300
 LOG_BYTES = 10 * 1024 * 1024
 EXCERPT_BYTES = 8192
