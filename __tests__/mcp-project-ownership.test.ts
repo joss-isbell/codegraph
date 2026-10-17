@@ -178,12 +178,17 @@ describe('real MCP project ownership precedes native writes', () => {
     const reservation: ProjectWriterReservation = retainStartupProjectWriter(held, acquired.info); cleanup.push(() => reservation.release());
     const first = make({ projectRoute: held, projectWriter: reservation }), second = make({ projectRoute: held });
     native.begin([root]); await Promise.all([first.ensureInitialized(root), second.ensureInitialized(root)]);
+    // Native publication precedes catch-up readiness. Snapshot the complete
+    // authority record only after the real query joins that existing gate.
+    expect((await search(second, 'alphaOriginal')).content[0]?.text).toContain('alphaOriginal');
+    await until(() => readWriterLock(root)?.pid === process.pid && readWriterLock(root)?.ready === true, 'shared writer catch-up readiness');
     const ownerBefore = readWriterLock(root), bytesBefore = fs.readFileSync(getWriterPidPath(root), 'utf8');
+    expect(ownerBefore).toMatchObject({ pid: process.pid, ready: true });
     expect(() => retainStartupProjectWriter(held, { ...acquired.info, startedAt: acquired.info.startedAt + 1 })).toThrow('exact acquired native writer');
     expect(fs.readFileSync(getWriterPidPath(root), 'utf8')).toBe(bytesBefore);
-    expect((await search(second, 'alphaOriginal')).content[0]?.text).toContain('alphaOriginal');
     await first.stop(); await reservation.release();
-    expect(readWriterLock(root)).toEqual(ownerBefore); expect((await search(second, 'alphaOriginal')).content[0]?.text).toContain('alphaOriginal');
+    expect(readWriterLock(root)).toEqual(ownerBefore); expect(fs.readFileSync(getWriterPidPath(root), 'utf8')).toBe(bytesBefore);
+    expect((await search(second, 'alphaOriginal')).content[0]?.text).toContain('alphaOriginal');
     await second.stop(); expect(readWriterLock(root)).toBeNull(); ownedNativeOpens();
   }), 30_000);
 
@@ -225,8 +230,15 @@ describe('real MCP project ownership precedes native writes', () => {
     const policy = resolveQueryPolicy({ poolSize: '0' }, 'shared-daemon', 3), lifetime = new AbortController();
     native.begin([root]); const lease = await acquireProject({ route: route(root), intent: 'watch', lifetime: lifetime.signal,
       watchOptions: {}, admit: (selected, signal) => admitQueryProject(selected.root, policy, signal) });
-    cleanup.push(() => lease.release()); await lease.ready(); lease.beginDrain();
-    peer.child.stdin.end(); await bounded(peer.close, 'draining foreign native exit'); await sleep(1250);
+    cleanup.push(() => lease.release());
+    // The real foreign fixture intentionally owns ready:false. Remove this
+    // lease's write demand before joining its gate, rather than waiting for a
+    // readiness transition that only the later foreign EOF could enable.
+    lease.beginDrain(); await lease.ready();
+    expect(lease.cg.searchNodes('alphaOriginal').length).toBeGreaterThan(0);
+    peer.child.stdin.end(); await bounded(peer.close, 'draining foreign native exit');
+    expect(peer.snapshot()).toMatchObject({ exit: { code: 0, signal: null }, didClose: true, stdoutEnd: true, stderrEnd: true });
+    await sleep(1250);
     expect(readWriterLock(root)).toBeNull(); expect(native.facts().records.every(record => record.readOnly)).toBe(true);
     expect(lease.cg.searchNodes('alphaOriginal').length).toBeGreaterThan(0);
     await lease.release(); expect(() => lease.cg.getStats()).toThrow();

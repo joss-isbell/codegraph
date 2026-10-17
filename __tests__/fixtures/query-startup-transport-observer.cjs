@@ -8,6 +8,8 @@ const cp = require('node:child_process');
 const metadata = 'CODEGRAPH_INTERNAL_QUERY_STARTUP_CPU_V1';
 const controls = ['CODEGRAPH_QUERY_MODE', 'CODEGRAPH_QUERY_POOL_SIZE', 'CODEGRAPH_QUERY_BUSY_TIMEOUT_MS', metadata];
 const raw = env => Object.fromEntries(controls.filter(key => env[key] !== undefined).map(key => [key, env[key]]));
+const deeplyFrozen = value => !value || typeof value !== 'object'
+  || (Object.isFrozen(value) && Object.values(value).every(deeplyFrozen));
 const record = value => {
   const line = Buffer.from(JSON.stringify({ eventTimeNs: process.hrtime.bigint().toString(),
     pid: process.pid, threadId: threads.threadId, ...value }) + '\n');
@@ -185,7 +187,7 @@ if (!threads.isMainThread && threads.workerData?.execution) {
   const originalAdmit = admission.admitQueryProject;
   admission.admitQueryProject = async function(root, policy, signal) {
     const result = await originalAdmit(root, policy, signal);
-    record({ event: 'startup-admitted', root, policy, sameProspective: policy === server?.queryAdmissionPolicy });
+    record({ event: 'startup-admitted', root, policy, frozen: deeplyFrozen(policy), sameProspective: policy === server?.queryAdmissionPolicy });
     return result;
   };
   const bootstrap = require('../../dist/mcp/query-bootstrap');
@@ -203,6 +205,45 @@ if (!threads.isMainThread && threads.workerData?.execution) {
     record({ event: 'startup-refusal-produced', refusal }); return originalReport(refusal);
   };
   require('./query-unlimited-preload.cjs');
+  // File-backed child stdio has no parent pipe EOF. Observe the actual inherited
+  // descriptor's identity and real close, independently of ChildProcess.close
+  // (which Node #65646 may omit after an explicit IPC disconnect).
+  const descriptorIdentity = fd => {
+    const stat = fs.fstatSync(fd, { bigint: true });
+    return { dev: String(stat.dev), ino: String(stat.ino), birthtimeNs: String(stat.birthtimeNs) };
+  };
+  const candidateDescriptors = new Map();
+  const originalOpenSync = fs.openSync, originalCloseSync = fs.closeSync;
+  fs.openSync = function(...args) {
+    const fd = originalOpenSync.apply(this, args), prior = candidateDescriptors.get(fd);
+    if (prior && !prior.closed) record({ event: 'startup-candidate-parent-fd-failure', candidatePid: prior.candidatePid,
+      descriptor: fd, failure: 'owned descriptor reused without observed close' });
+    candidateDescriptors.delete(fd); // a new open owns a new descriptor generation
+    return fd;
+  };
+  fs.closeSync = function(fd, ...args) {
+    const owned = candidateDescriptors.get(fd);
+    if (!owned) return originalCloseSync.call(this, fd, ...args);
+    let observedIdentity = null, failure = owned.closed ? 'duplicate owned descriptor close' : null;
+    try {
+      observedIdentity = descriptorIdentity(fd);
+      if (JSON.stringify(observedIdentity) !== JSON.stringify(owned.creationIdentity)) failure ??= 'owned descriptor identity changed before close';
+    } catch (error) { failure ??= `owned descriptor pre-close read: ${String(error).slice(0, 1024)}`; }
+    let result;
+    try { result = originalCloseSync.call(this, fd, ...args); owned.closeCount++; }
+    catch (error) {
+      record({ event: 'startup-candidate-parent-fd-failure', candidatePid: owned.candidatePid,
+        descriptor: fd, failure: failure ?? `owned descriptor close: ${String(error).slice(0, 1024)}` });
+      throw error;
+    }
+    let afterClose = 'open';
+    try { fs.fstatSync(fd); failure ??= 'owned descriptor still open after close'; }
+    catch (error) { afterClose = error.code; if (afterClose !== 'EBADF') failure ??= `owned descriptor post-close read: ${String(error).slice(0, 1024)}`; }
+    owned.closed = true;
+    record({ event: 'startup-candidate-parent-fd-close', candidatePid: owned.candidatePid, descriptor: fd,
+      creationIdentity: owned.creationIdentity, observedIdentity, closeCount: owned.closeCount, afterClose, failure });
+    return result;
+  };
   const originalSpawn = cp.spawn;
   cp.spawn = function(command, args, options) {
     if (!options?.detached || options.env?.CODEGRAPH_DAEMON_INTERNAL !== '1') return originalSpawn.call(this, command, args, options);
@@ -211,7 +252,19 @@ if (!threads.isMainThread && threads.workerData?.execution) {
     if (corruption === 'extra-key') options.env[metadata] = '{"protocol":1,"cpuCount":3,"extra":true}';
     if (corruption === 'control') options.env.CODEGRAPH_QUERY_POOL_SIZE = '';
     const child = originalSpawn.call(this, command, args, options);
-    record({ event: 'startup-candidate-spawn', candidatePid: child.pid, raw: raw(options.env), selector: options.env.CODEGRAPH_DIR });
+    const inheritedDescriptors = [...new Set(options.stdio.filter(value => typeof value === 'number'))];
+    for (const descriptor of inheritedDescriptors) {
+      let creationIdentity = null;
+      try { creationIdentity = descriptorIdentity(descriptor); }
+      catch (error) { record({ event: 'startup-candidate-parent-fd-failure', candidatePid: child.pid, descriptor,
+        failure: `owned descriptor creation read: ${String(error).slice(0, 1024)}` }); }
+      candidateDescriptors.set(descriptor, { candidatePid: child.pid, creationIdentity, closeCount: 0, closed: false });
+    }
+    record({ event: 'startup-candidate-spawn', candidatePid: child.pid, raw: raw(options.env), selector: options.env.CODEGRAPH_DIR,
+      stdio: options.stdio, parentStdioNull: child.stdio.map(stream => stream === null), inheritedDescriptors,
+      descriptorIdentities: inheritedDescriptors.map(descriptor => ({ descriptor, identity: candidateDescriptors.get(descriptor).creationIdentity })) });
+    child.once('exit', (code, signal) => record({ event: 'startup-candidate-exit', candidatePid: child.pid, code, signal }));
+    child.once('disconnect', () => record({ event: 'startup-candidate-disconnect', candidatePid: child.pid, connected: child.connected }));
     child.on('message', status => record({ event: 'startup-bootstrap-status', candidatePid: child.pid, status }));
     const originalSend = child.send;
     child.send = function(status, ...rest) {

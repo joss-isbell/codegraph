@@ -468,6 +468,9 @@ describe('one captured startup through actual CLI and native candidate', () => {
           expect(result.content[0].text).toContain('app.ts');
         }
       }
+      // Observe delivered history only after the same session has processed a
+      // subsequent request; a tool's wire response alone is not that barrier.
+      expect(await client.request('ping')).toEqual({});
       const captured = events().filter(event => event.event === 'startup-capture');
       expect(captured.filter(event => !event.qualified).map(event => [event.startup, event.cpuObservations]))
         .toEqual([[{ requested: {}, cpuCount: 3 }, 1]]);
@@ -486,8 +489,13 @@ describe('one captured startup through actual CLI and native candidate', () => {
         source: 'strict', concurrency: { kind: 'finite', maximum: 2 } });
       if (mode === 'direct') expect(actualEngine[0].sameDirect).toBe(true);
       const admitted = events().filter(event => event.event === 'startup-admitted');
-      expect(admitted.some(event => event.sameProspective)).toBe(true);
-      for (const event of admitted) expect(event.policy).toEqual(actualEngine[0].options.queryAdmissionPolicy);
+      // Engines defensively copy the captured prospective policy. Its value
+      // and immutability, not private reference identity, are the contract.
+      expect(admitted.length).toBeGreaterThan(0);
+      for (const event of admitted) {
+        expect(event.policy).toEqual(actualEngine[0].options.queryAdmissionPolicy);
+        expect(event.frozen).toBe(true);
+      }
       const sqliteOpens = events().filter(event => event.event === 'startup-sqlite-open');
       expect(sqliteOpens.length).toBeGreaterThan(0);
       expect(sqliteOpens.every(open => admitted.some(permission => permission.pid === open.pid
@@ -615,10 +623,12 @@ describe('one captured startup through actual CLI and native candidate', () => {
     const refusals: any[] = [], cleanup: any[] = [];
     let spawnLog: ReturnType<typeof boundedSpawnLog> = null;
     let mergedLog: ReturnType<typeof boundedNativeLog> | null = null;
+    const candidateAbsences: Array<{ stage: string; pid: number; presence: ReturnType<typeof nativePresence> }> = [];
+    let candidateLogIdentity: { dev: string; ino: string; birthtimeNs: string } | null = null;
     const events = () => evidence.events();
     const persist = (stage: string) => evidence.persist(stage, () => ({ corruption, root, before, after,
       registryBefore, registryAfter, refusals, primaryFailed, primaryFailure: primaryFailed ? boundedFailure(primaryFailure) : null,
-      capture: client?.capture(), cleanup, spawnLog, mergedLog, fixtureRemoved: !fs.existsSync(root) }));
+      capture: client?.capture(), cleanup, spawnLog, mergedLog, candidateAbsences, candidateLogIdentity, fixtureRemoved: !fs.existsSync(root) }));
     try {
       const graph = await CodeGraph.init(root); graph.close();
       before = inventory(index); registryBefore = inventory(registry);
@@ -662,6 +672,48 @@ describe('one captured startup through actual CLI and native candidate', () => {
     } catch (error) { primaryFailed = true; primaryFailure = error; }
     finally {
       persist('before-cleanup');
+      // Keep the actual observer host alive through its child's native exit,
+      // IPC disconnection and real inherited-file-descriptor close. Node can
+      // omit ChildProcess.close after explicit disconnect; never synthesize it.
+      try {
+        const produced = events().filter(event => event.event === 'startup-candidate-spawn');
+        expect(produced).toHaveLength(1);
+        const candidate = produced[0];
+        expect(candidate.stdio).toEqual(['ignore', expect.any(Number), candidate.stdio[1], 'ipc']);
+        expect(candidate.parentStdioNull).toEqual([true, true, true, true]);
+        expect(candidate.inheritedDescriptors).toEqual([candidate.stdio[1]]);
+        const logStat = fs.statSync(path.join(index, 'daemon.log'), { bigint: true });
+        candidateLogIdentity = { dev: String(logStat.dev), ino: String(logStat.ino), birthtimeNs: String(logStat.birthtimeNs) };
+        expect(candidate.descriptorIdentities).toEqual([{ descriptor: candidate.stdio[1], identity: candidateLogIdentity }]);
+        await untilNative(() => {
+          const all = events();
+          const failed = all.find(event => event.event.startsWith('startup-candidate-parent-fd-') && event.failure);
+          if (failed) throw new Error(failed.failure);
+          return all.some(event => event.event === 'startup-candidate-exit' && event.candidatePid === candidate.candidatePid)
+            && all.some(event => event.event === 'startup-candidate-disconnect' && event.candidatePid === candidate.candidatePid)
+            && all.some(event => event.event === 'startup-candidate-parent-fd-close' && event.candidatePid === candidate.candidatePid)
+            && nativePresence(candidate.candidatePid) === 'absent';
+        });
+        const all = events();
+        expect(all.filter(event => event.event === 'startup-candidate-own-exit').map(event => [event.pid, event.code]))
+          .toEqual([[candidate.candidatePid, 1]]);
+        expect(all.filter(event => event.event === 'startup-candidate-exit').map(event => [event.candidatePid, event.code, event.signal]))
+          .toEqual([[candidate.candidatePid, 1, null]]);
+        expect(all.filter(event => event.event === 'startup-candidate-disconnect').map(event => [event.candidatePid, event.connected]))
+          .toEqual([[candidate.candidatePid, false]]);
+        const descriptors = all.filter(event => event.event === 'startup-candidate-parent-fd-close');
+        expect(descriptors).toHaveLength(1);
+        expect(descriptors[0]).toMatchObject({ candidatePid: candidate.candidatePid, descriptor: candidate.stdio[1],
+          creationIdentity: candidate.descriptorIdentities[0].identity, observedIdentity: candidate.descriptorIdentities[0].identity,
+          closeCount: 1, afterClose: 'EBADF', failure: null });
+        const genuineClose = all.filter(event => event.event === 'startup-candidate-close');
+        expect(genuineClose.length).toBeLessThanOrEqual(1);
+        for (const event of genuineClose) expect(event).toMatchObject({ candidatePid: candidate.candidatePid, code: 1, signal: null });
+        candidateAbsences.push({ stage: 'before-host-close', pid: candidate.candidatePid, presence: nativePresence(candidate.candidatePid) });
+        expect(candidateAbsences).toEqual([{ stage: 'before-host-close', pid: candidate.candidatePid, presence: 'absent' }]);
+        cleanup.push({ phase: 'native-candidate-before-host-close', outcome: 'closed', genuineCloseObserved: genuineClose.length === 1 });
+      }
+      catch (error) { cleanup.push({ phase: 'native-candidate-before-host-close', failure: boundedFailure(error) }); }
       try {
         if (client) {
           const result = await client.close();
@@ -672,14 +724,28 @@ describe('one captured startup through actual CLI and native candidate', () => {
       catch (error) { cleanup.push({ phase: 'host-close', failure: boundedFailure(error) }); }
       try {
         await settleLosingCandidates(root, () => null, 15000);
-        await untilNative(() => events().filter(event => event.event === 'startup-candidate-spawn').length === events().filter(event => event.event === 'startup-candidate-close').length);
-        expect(events().filter(event => event.event === 'startup-candidate-own-exit').map(event => event.code)).toEqual([1]);
-        expect(events().filter(event => event.event === 'startup-candidate-close').map(event => [event.code, event.signal])).toEqual([[1, null]]);
-        cleanup.push({ phase: 'native-candidate', outcome: 'closed' });
+        const all = events();
+        const absent = all.filter(event => event.event === 'startup-candidate-spawn')
+          .map(event => ({ stage: 'after-host-close', pid: event.candidatePid, presence: nativePresence(event.candidatePid) }));
+        candidateAbsences.push(...absent);
+        expect(absent).toHaveLength(1);
+        expect(absent.every(candidate => candidate.presence === 'absent')).toBe(true);
+        expect(all.filter(event => event.event.startsWith('startup-candidate-parent-fd-') && event.failure)).toEqual([]);
+        expect(all.filter(event => event.event === 'startup-candidate-parent-fd-close')).toHaveLength(1);
+        const genuineClose = all.filter(event => event.event === 'startup-candidate-close');
+        expect(genuineClose.length).toBeLessThanOrEqual(1);
+        for (const event of genuineClose) expect(event).toMatchObject({ candidatePid: absent[0].pid, code: 1, signal: null });
+        expect(evidence.owners().every(owner => owner.writer === null && owner.daemon === null)).toBe(true);
+        cleanup.push({ phase: 'native-candidate-after-host-close', outcome: 'absent' });
       }
       catch (error) { cleanup.push({ phase: 'native-candidate', failure: boundedFailure(error) }); }
-      try { after = inventory(index); } catch (error) { cleanup.push({ phase: 'index-inventory', failure: boundedFailure(error) }); }
-      try { registryAfter = inventory(registry); } catch (error) { cleanup.push({ phase: 'registry-inventory', failure: boundedFailure(error) }); }
+      try {
+        after = inventory(index);
+        expect(after.filter((entry: any) => entry.relative !== 'daemon.log')).toEqual(before);
+        expect(after.filter((entry: any) => entry.relative === 'daemon.log')).toHaveLength(1);
+      } catch (error) { cleanup.push({ phase: 'index-inventory', failure: boundedFailure(error) }); }
+      try { registryAfter = inventory(registry); expect(registryAfter).toEqual(registryBefore); }
+      catch (error) { cleanup.push({ phase: 'registry-inventory', failure: boundedFailure(error) }); }
       try { spawnLog = boundedSpawnLog(spawnLogFor(root)); if (spawnLog?.failure) throw new Error(spawnLog.failure); }
       catch (error) { cleanup.push({ phase: 'spawn-log', failure: boundedFailure(error) }); }
       try { mergedLog = boundedNativeLog(path.join(index, 'daemon.log'), true); if (mergedLog.failure) throw new Error(mergedLog.failure); }
@@ -804,7 +870,7 @@ describe('actual direct client selection and lossless native capture', () => {
       expect((await client.request('tools/list')).tools.length).toBeGreaterThan(0);
       const selectedRoot = selection === 'explicit-path' ? roots[0] : roots[1];
       const symbol = selection === 'explicit-path' ? 'alphaClientSymbol' : 'betaClientSymbol';
-      const query = client.request('tools/call', { name: 'codegraph_search', arguments: { query: symbol } });
+      const query = client.request('tools/call', { name: 'codegraph_explore', arguments: { query: symbol } });
       // Own an early rejection while roots discovery is being answered.
       const queryOutcome = query.then(value => ({ ok: true as const, value }), error => ({ ok: false as const, error }));
       if (selection === 'roots') {
@@ -816,6 +882,9 @@ describe('actual direct client selection and lossless native capture', () => {
       expect(result.isError).toBeFalsy(); expect(result.content[0].text).toContain(symbol);
       expect(result.content[0].text).not.toContain(selection === 'explicit-path' ? 'betaClientSymbol' : 'alphaClientSymbol');
       if (selection === 'explicit-path') expect(client.replies.filter(reply => reply.method === 'roots/list')).toEqual([]);
+      // Explore history commits after successful delivery, before a later
+      // request can be processed by this same host session.
+      expect(await client.request('ping')).toEqual({});
       const engines = events().filter(event => event.event === 'startup-engine');
       expect(engines).toHaveLength(1); expect(engines[0].options.projectRoute).toBeUndefined();
       expect(engines[0].hasResourceObserver).toBe(true); expect(engines[0].hasDefaultOutcomeCallback).toBe(true);
@@ -871,7 +940,7 @@ describe('actual direct client selection and lossless native capture', () => {
       const closed = await Promise.allSettled([client.close()]);
       expect(closed[0].status).toBe(wire === 'split' ? 'fulfilled' : 'rejected');
       expect(client.capture().nativeClose).toEqual({ code: 0, signal: null });
-      expect(client.capture().failure).toBe(wire === 'split' ? null : expect.stringContaining('UTF-8'));
+      expect(client.capture().failure).toEqual(wire === 'split' ? null : expect.stringContaining('UTF-8'));
       for (const stream of [client.capture().stdout, client.capture().stderr]) {
         const bytes = Buffer.from(stream.base64, 'base64');
         expect(bytes.length).toBe(stream.retainedBytes); expect(stream.truncated).toBe(false);

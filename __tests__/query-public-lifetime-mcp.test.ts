@@ -589,7 +589,10 @@ describe('selected public query lifetime', () => {
     };
     const attributeMembership = (directory: string, members: any[], rows: Map<string, any> | null) => {
       if (process.platform !== 'win32') return;
-      const observed = [...rows!.values()].filter(row => row.path === directory || row.path.startsWith(`${directory}${path.sep}`))
+      // Validated optional-absence rows remain in the probe evidence, not the
+      // directory membership: they have no native attributes to classify.
+      const observed = [...rows!.values()].filter(row => row.present === true
+        && (row.path === directory || row.path.startsWith(`${directory}${path.sep}`)))
         .map(row => ({ relative: path.relative(directory, row.path).replace(/\\/g, '/') || '.',
           kind: (BigInt(row.attributes) & 16n) !== 0n ? 'directory' : 'file' })).sort((left, right) => left.relative.localeCompare(right.relative));
       const expected = members.map(member => ({ relative: member.relative, kind: member.kind }))
