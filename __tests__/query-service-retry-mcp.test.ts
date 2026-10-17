@@ -30,29 +30,42 @@ describe('shared service compatibility after an actual transport loss', () => {
         QUERY_COMPAT_NETWORK_OBSERVATIONS: network, QUERY_COMPAT_UNKNOWN_HELLO: unknownHello };
       const owner = new CompatibilityClient(root, 'healthy-owner', env, 80000, preloads);
       clients.push(owner); await owner.initialize();
-      expect((await owner.tool('codegraph_explore', { query: 'ownerFirst' }, 100)).result.content[0].text).toContain('ownerFirst');
-      const before = parseQueryDiagnostics((await owner.tool('codegraph_status')).result);
+      const ownerFirst = await owner.tool('codegraph_explore', { query: 'ownerFirst' }, 100); evidence.ownerFirst = ownerFirst;
+      expect(ownerFirst.result.content[0].text).toContain('ownerFirst');
+      const beforeReply = await owner.tool('codegraph_status'); evidence.beforeReply = beforeReply;
+      const before = parseQueryDiagnostics(beforeReply.result); evidence.before = before;
       daemonPid = before.ownership.pid;
       const locks = ['daemon.pid', 'writer.pid'].map(name => fs.readFileSync(path.join(root, '.codegraph', name), 'utf8'));
+      evidence.locks = locks;
       const peer = new CompatibilityClient(root, 'retrying-peer', { ...env, QUERY_COMPAT_DROP_REQUEST: dropRequest,
         CODEGRAPH_DAEMON_RETRY_MS: '100', CODEGRAPH_DAEMON_RETRY_MAX_MS: '100' }, 80000, preloads);
       clients.push(peer); await peer.initialize();
-      expect((await peer.tool('codegraph_explore', { query: 'peerFirst' }, 100)).result.content[0].text).toContain('peerFirst');
+      const peerFirst = await peer.tool('codegraph_explore', { query: 'peerFirst' }, 100); evidence.peerFirst = peerFirst;
+      expect(peerFirst.result.content[0].text).toContain('peerFirst');
       fs.writeFileSync(unknownHello, 'owned fixture: subsequent hello omits effective policy\n');
+      evidence.unknownHelloArmed = true;
       fs.writeFileSync(dropRequest, 'owned fixture: drop request 200 before forward\n');
       const refused = await peer.tool('codegraph_explore', { query: 'refusedOrphan' }, 200);
       evidence.refused = refused;
       expect(refused.error).toMatchObject({ code: -32603, data: { code: 'CODEGRAPH_QUERY_POLICY_REFUSED', reason: 'unknown', projectRoot: root } });
       expect(refused.error.data.guidance).toContain(root);
       const explicit = await peer.tool('codegraph_explore', { query: 'refusedExplicit', projectPath: root }, 201);
+      evidence.explicit = explicit;
       expect(explicit.error).toMatchObject({ code: -32603, data: { reason: 'unknown', projectRoot: root } });
       for (const id of [200, 201]) expect(peer.replies.filter(reply => reply.id === id)).toHaveLength(1);
       expect(peer.stderr).not.toContain('serving this session in-process');
+      // The stimulus changes every emitted hello, including fresh permission
+      // checks for the healthy owner. Restore truthful service observations
+      // only after both peer refusals have been independently verified.
+      fs.unlinkSync(unknownHello); evidence.unknownHelloDisarmed = true;
       const healthy = await owner.tool('codegraph_explore', { query: 'ownerSurvives' }, 101);
+      evidence.healthy = healthy;
       expect(healthy.error).toBeUndefined(); expect(healthy.result.content[0].text).toContain('ownerSurvives');
-      const after = parseQueryDiagnostics((await owner.tool('codegraph_status')).result);
+      const afterReply = await owner.tool('codegraph_status'); evidence.afterReply = afterReply;
+      const after = parseQueryDiagnostics(afterReply.result); evidence.after = after;
       expect(after.ownership).toEqual(before.ownership); expect(after.effective).toEqual(before.effective);
-      expect(['daemon.pid', 'writer.pid'].map(name => fs.readFileSync(path.join(root, '.codegraph', name), 'utf8'))).toEqual(locks);
+      const afterLocks = ['daemon.pid', 'writer.pid'].map(name => fs.readFileSync(path.join(root, '.codegraph', name), 'utf8'));
+      evidence.afterLocks = afterLocks; expect(afterLocks).toEqual(locks);
       const workerEvents = events(observations), networkEvents = events(network);
       expect(networkEvents.filter(event => event.event === 'owned-link-drop')).toEqual([expect.objectContaining({ pid: peer.child.pid, id: 200, forwarded: false })]);
       expect(networkEvents.filter(event => event.event === 'owned-link-closed')).toHaveLength(1);
@@ -65,7 +78,6 @@ describe('shared service compatibility after an actual transport loss', () => {
       ]);
       expect(new Set(histories.map(event => event.historyId)).size).toBe(2);
       expect(histories[0].historyId).toBe(histories[2].historyId);
-      Object.assign(evidence, { before, after, locks, explicit, healthy, workerEvents, networkEvents });
     } catch (error) { primary = error; throw error; }
     finally {
       const attempt = async (phase: string, action: () => Promise<void>) => { try { await action(); cleanup.push({ phase, error: null }); } catch (error) { cleanup.push({ phase, error: String(error) }); } };
@@ -80,7 +92,7 @@ describe('shared service compatibility after an actual transport loss', () => {
       saveCompatibilityEvidence('compatibility-retry', { ...evidence, workerEvents, networkEvents: events(network),
         primary: primary instanceof Error ? primary.stack : String(primary ?? ''), cleanup, clients: clients.map(client => client.facts()) });
       const failures = cleanup.filter(item => item.error);
-      if (!failures.length) { removeSpawnLog(root); fs.rmSync(fixture, { recursive: true, force: true }); }
+      if (!primary && !failures.length) { removeSpawnLog(root); fs.rmSync(fixture, { recursive: true, force: true }); }
       if (failures.length && !primary) throw new Error('Owned retry cleanup incomplete: ' + JSON.stringify(failures));
     }
   }, 120000);

@@ -191,11 +191,19 @@ async function main() {
         await until(() => oldLinks.every(value => value.closed));
         send({ event: 'barrier-released', token: command.token, snapshot: snapshot() });
       } else if (command.kind === 'remove-loaded-index') {
-        const value = endpoints.get('C'), graph = opened.find(entry => entry.root === missingRoot)?.graph;
-        if (!graph || !value.engine.hasDefaultCodeGraph()) throw new Error('Missing-index fixture did not capture actual loaded C');
-        graph.close(); // fixture precursor: release native SQLite handles on Windows
+        const value = endpoints.get('C'), captured = opened.filter(entry => entry.root === missingRoot);
+        if (!captured.length || !value.engine.hasDefaultCodeGraph()) throw new Error('Missing-index fixture did not capture actual loaded C');
+        // Default watch:false still owns catch-up separately from its reader.
+        // Release every captured exact-root SQLite handle, not just the writer.
+        const fixtureClosedHandles = captured.map((entry, ordinal) => {
+          const closeCallsBefore = entry.closeCalls;
+          entry.graph.close();
+          return { ordinal, root: entry.root, closeCallsBefore, closeCallsAfter: entry.closeCalls };
+        });
+        send({ event: 'loaded-index-handles-closed', token: command.token, fixtureClosedHandles,
+          stillDefaultLoaded: value.engine.hasDefaultCodeGraph(), snapshot: snapshot() });
         fs.unlinkSync(getDatabasePath(missingRoot));
-        send({ event: 'removed-loaded-index', token: command.token, database: getDatabasePath(missingRoot), fixtureClosedHandle: true,
+        send({ event: 'removed-loaded-index', token: command.token, database: getDatabasePath(missingRoot), fixtureClosedHandles,
           stillDefaultLoaded: value.engine.hasDefaultCodeGraph(), snapshot: snapshot() });
       } else if (command.kind === 'stop-engine') {
         await stopEngine(command.engine);

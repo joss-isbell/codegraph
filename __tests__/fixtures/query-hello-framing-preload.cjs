@@ -94,10 +94,12 @@ if (role === 'owner' && process.env.CODEGRAPH_DAEMON_INTERNAL === '1') {
     }
     let armed;
     try { armed = read(control); } catch (error) { failure('arm-read', error); return originalWrite.call(this, chunk, ...args); }
-    if (!armed) { record({ event: 'actual-unmodified-hello', reason: 'not-armed', hello, bytes: bytes.length, sha256: hash(bytes) }); return originalWrite.call(this, chunk, ...args); }
+    if (!armed) { record({ event: 'actual-unmodified-hello', reason: 'not-armed', hello,
+      originalBase64: bytes.toString('base64'), bytes: bytes.length, sha256: hash(bytes) }); return originalWrite.call(this, chunk, ...args); }
     const socket = this;
     try {
-      if (armed.root !== root || !Number.isSafeInteger(armed.requesterPid) || armed.requesterPid <= 0) throw new Error('Framing ownership/one-armed-requester mismatch');
+      if (armed.root !== root || !Number.isSafeInteger(armed.requesterPid) || armed.requesterPid <= 0
+        || !Number.isSafeInteger(armed.socketId) || armed.socketId <= 0 || armed.purpose !== 'attachment') throw new Error('Framing ownership/one-armed-requester mismatch');
       const actualOwners = owners.readQueryServiceOwners(root);
       if (actualOwners.daemon.kind !== 'live' || actualOwners.writer.kind !== 'live'
         || actualOwners.daemon.value.pid !== process.pid || actualOwners.writer.value.pid !== process.pid
@@ -122,7 +124,7 @@ if (role === 'owner' && process.env.CODEGRAPH_DAEMON_INTERNAL === '1') {
       let nativeClose = false;
       socket.once('close', hadError => { nativeClose = true; record({ event: 'decorated-socket-native-close', hadError }); });
       socket.on('error', error => failure('decorated-native-socket-error', error));
-      record({ event: 'actual-decorated-hello', mode, requesterPid: armed.requesterPid, hello, owners: actualOwners,
+      record({ event: 'actual-decorated-hello', mode, requesterPid: armed.requesterPid, socketId: armed.socketId, purpose: armed.purpose, hello, owners: actualOwners,
         originalBase64: bytes.toString('base64'), originalSha256: hash(bytes), frameBase64: frame.toString('base64'),
         frameSha256: hash(frame), preLfBytes: body.length + cr.length, utf16Units: body.toString('utf8').length + cr.length,
         split, tailBase64: positive ? opaque.toString('base64') : '', authorityUnchanged: true });
@@ -135,11 +137,12 @@ if (role === 'owner' && process.env.CODEGRAPH_DAEMON_INTERNAL === '1') {
       record({ event: 'native-prefix-submitted', bytes: prefix.length, lastByte: prefix[prefix.length - 1], hasLf: prefix.includes(10) });
       const accepted = emit(prefix, 'prefix');
       void (async () => {
-        const ack = await waitFor(acknowledgement, value => value.requesterPid === armed.requesterPid && value.rawBytes >= split);
+        const ack = await waitFor(acknowledgement, value => value.requesterPid === armed.requesterPid
+          && value.socketId === armed.socketId && value.rawBytes >= split);
         record({ event: 'actual-prefix-acknowledgement', ack });
         if (mode === 'utf8-tail-split') {
           const consumer = await waitFor(consumerAcknowledgement, value => value.root === root && value.requesterPid === armed.requesterPid
-            && value.socketId === 1 && value.rawBytes === split && value.sawLf === true);
+            && value.socketId === armed.socketId && value.rawBytes === split && value.sawLf === true);
           record({ event: 'actual-tail-consumer-acknowledgement', ack: consumer });
           if (nativeClose || socket.destroyed) throw new Error('UTF8 tail socket closed before controlled continuation');
           record({ event: 'held-continuation-released', bytes: continuation.length, firstByte: continuation[0] });
@@ -149,7 +152,7 @@ if (role === 'owner' && process.env.CODEGRAPH_DAEMON_INTERNAL === '1') {
               sha256: hash(continuation), error: error ? String(error).slice(0, 2048) : null });
             if (error) reject(error); else resolve();
           }));
-          writeBarrier(consumerRelease, { root, requesterPid: armed.requesterPid, socketId: 1,
+          writeBarrier(consumerRelease, { root, requesterPid: armed.requesterPid, socketId: armed.socketId,
             phase: 'actual-native-continuation-write-completed', continuationSha256: hash(continuation) });
           record({ event: 'actual-tail-consumer-release-written', requesterPid: armed.requesterPid, continuationSha256: hash(continuation) });
           return;
@@ -162,11 +165,11 @@ if (role === 'owner' && process.env.CODEGRAPH_DAEMON_INTERNAL === '1') {
           let close;
           do {
             close = read(closeAcknowledgement);
-            if (close?.requesterPid === armed.requesterPid) break;
+            if (close?.requesterPid === armed.requesterPid && close.socketId === armed.socketId) break;
             if (firstError) throw new Error(firstError);
             await new Promise(resolve => setTimeout(resolve, 10));
           } while (Date.now() < deadline);
-          if (close?.requesterPid === armed.requesterPid) {
+          if (close?.requesterPid === armed.requesterPid && close.socketId === armed.socketId) {
             if (close.hadError) throw new Error('Byte refusal native close had transmission error');
             record({ event: 'continuation-withheld-after-native-byte-refusal', close, continuationBase64: continuation.toString('base64') });
             return;
@@ -186,12 +189,29 @@ if (role === 'owner' && process.env.CODEGRAPH_DAEMON_INTERNAL === '1') {
 if (role !== 'requester') return;
 const candidates = new Set(require('../../dist/mcp/daemon-paths').getDaemonSocketCandidates(root));
 const originalConnect = net.createConnection;
-let sockets = 0;
+let sockets = 0, phase = null, targetSocketId = null, pendingHello = null;
 net.createConnection = function(...args) {
-  const socket = originalConnect.apply(this, args);
   const endpoint = typeof args[0] === 'string' ? args[0] : args[0]?.path;
-  if (!candidates.has(endpoint)) return socket;
-  const socketId = ++sockets, originalPush = socket.push, originalOn = socket.on, originalRemove = socket.removeListener;
+  if (!candidates.has(endpoint)) return originalConnect.apply(this, args);
+  const stack = (new Error().stack ?? '').replace(/\\/g, '/').slice(0, 8192);
+  const purpose = phase === 'prepare' && stack.includes('admitQueryProject') ? 'prepare-admission'
+    : phase === 'acquisition' && stack.includes('admitQueryProject') ? 'attempt-admission'
+      : phase === 'acquisition' && stack.includes('connectHeldService') ? 'attachment' : null;
+  const socketId = ++sockets;
+  try {
+    if (!purpose || !stack.includes('connectObservedService')) throw new Error('Unclassified actual framing socket');
+    if (purpose === 'attachment') {
+      if (targetSocketId !== null || !consumed.has(100) || !consumed.has(101)) throw new Error('Attachment armed before buffered input or more than once');
+      const intent = read(control + '.request');
+      if (intent?.root !== root || intent.requesterPid !== process.pid) throw new Error('Attachment arming intent does not select this requester');
+      targetSocketId = socketId;
+      writeBarrier(control, { ...intent, socketId, purpose });
+      record({ event: 'actual-attachment-decoration-armed', socketId, purpose, endpoint, stack });
+    }
+  } catch (error) { failure('actual-socket-purpose', error); throw error; }
+  const socket = originalConnect.apply(this, args);
+  pendingHello = { socketId, purpose, endpoint };
+  const originalPush = socket.push, originalOn = socket.on, originalRemove = socket.removeListener;
   const originalEncoding = socket.setEncoding;
   const originalSocketWrite = socket.write;
   const listeners = new Map(); let rawBytes = 0, rawFrame = Buffer.alloc(0), sawLf = false, parserObserved = false;
@@ -282,14 +302,16 @@ net.createConnection = function(...args) {
     write(closeAcknowledgement, { requesterPid: process.pid, socketId, hadError, rawBytes, sawLf });
   });
   originalOn.call(socket, 'error', error => failure('requester-native-socket-error', error));
-  record({ event: 'actual-native-socket-observer-installed', socketId, endpoint });
+  record({ event: 'actual-native-socket-observer-installed', socketId, purpose, endpoint, stack });
   return socket;
 };
 const originalTimeout = global.setTimeout;
 global.setTimeout = function(callback, delay, ...args) {
   if (delay !== 3000 || !(new Error().stack ?? '').includes('readHelloLine')) return originalTimeout.call(this, callback, delay, ...args);
-  const installedNs = now(); record({ event: 'actual-hello-timer-installed', delay, installedNs });
-  return originalTimeout.call(this, function(...values) { record({ event: 'actual-hello-timer-fired', installedNs }); return callback.apply(this, values); }, delay, ...args);
+  const identity = pendingHello; pendingHello = null;
+  if (!identity) { failure('hello-timer-correlation', new Error('Actual hello timer has no native socket')); throw new Error(firstError); }
+  const installedNs = now(); record({ event: 'actual-hello-timer-installed', ...identity, delay, installedNs });
+  return originalTimeout.call(this, function(...values) { record({ event: 'actual-hello-timer-fired', ...identity, installedNs }); return callback.apply(this, values); }, delay, ...args);
 };
 const consumed = new Set(), originalStdinOn = process.stdin.on;
 let observedInput = false, input = Buffer.alloc(0), inputBytes = 0;
@@ -315,10 +337,11 @@ process.stdin.on = function(event, listener) {
 };
 process.stdin.once('end', () => record({ event: 'actual-input-EOF', partialBytes: input.length, firstError }));
 const proxy = require('../../dist/mcp/proxy'), originalRun = proxy.runLocalHandshakeProxy;
-proxy.runLocalHandshakeProxy = function(deps) {
-  record({ event: 'requester-factory-observer-installed' });
-  return originalRun.call(this, { ...deps, makeEngine: () => { record({ event: 'requester-factory-invoked' }); return deps.makeEngine(); },
-    getDaemonSocket: async () => {
+function observedDeps(deps, branch) {
+  if (deps.root !== root || typeof deps.makeEngine !== 'function' || typeof deps.getDaemonSocket !== 'function') throw new Error('Unexpected actual proxy dependencies');
+  record({ event: 'requester-factory-observer-installed', branch, root: deps.root });
+  return { ...deps, makeEngine: function(...args) { record({ event: 'requester-factory-invoked' }); return deps.makeEngine.apply(deps, args); },
+    getDaemonSocket: async function(...args) {
       const deadline = Date.now() + 10000;
       while (!consumed.has(100) || !consumed.has(101)) {
         if (firstError) throw new Error(firstError);
@@ -326,7 +349,20 @@ proxy.runLocalHandshakeProxy = function(deps) {
         await new Promise(resolve => setTimeout(resolve, 10));
       }
       record({ event: 'actual-acquisition-released-after-buffered-input', consumed: [...consumed] });
-      return deps.getDaemonSocket();
-    } });
+      phase = 'acquisition';
+      try { return await deps.getDaemonSocket.apply(deps, args); }
+      finally { phase = null; }
+    } };
+}
+proxy.runLocalHandshakeProxy = function(input) {
+  if (typeof input.prepare !== 'function') return originalRun.call(this, observedDeps(input, 'legacy-deps'));
+  return originalRun.call(this, { ...input, prepare: async function(...args) {
+    phase = 'prepare';
+    try {
+      const prepared = await input.prepare.apply(input, args);
+      if (prepared.kind !== 'proxy') throw new Error('Framing requester did not prepare actual proxy dependencies');
+      return { ...prepared, deps: observedDeps(prepared.deps, 'prepared-deps') };
+    } finally { phase = null; }
+  } });
 };
-process.once('exit', () => record({ event: 'requester-observer-final', sockets, firstError }));
+process.once('exit', () => record({ event: 'requester-observer-final', sockets, targetSocketId, firstError }));

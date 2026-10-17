@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { createHash } from 'crypto';
 import { CodeGraph } from '../src';
 import { MAX_HELLO_LINE_BYTES } from '../src/mcp/daemon';
 import { getDaemonSocketCandidates } from '../src/mcp/daemon-paths';
@@ -64,6 +65,58 @@ async function requireCandidateAbsence(root: string): Promise<void> {
     return absent;
   }, 30000);
 }
+function requireObservedSockets(values: any[], final = false): void {
+  const events = (name: string): any[] => values.filter(value => value.event === name);
+  const installed = events('actual-observed-socket-installed');
+  expect(installed.length, 'actual IO trace must observe its native connection').toBeGreaterThan(0);
+  const verified = events('actual-verified-socket');
+  expect(installed.map(value => value.purpose).sort()).toEqual(verified.length
+    ? ['prepare-admission', 'attempt-admission', 'attachment'].sort() : ['prepare-admission']);
+  expect(new Set(installed.map(value => value.socketId)).size).toBe(installed.length);
+  for (const identity of installed) {
+    expect(identity.stack).toContain('connectObservedService');
+    expect(identity.stack).toContain(identity.purpose === 'attachment' ? 'connectHeldService' : 'admitQueryProject');
+    const own = (name: string): any[] => events(name).filter(value => value.socketId === identity.socketId);
+    expect(own('actual-observed-socket-connect')).toEqual([expect.objectContaining({ endpoint: identity.endpoint, purpose: identity.purpose })]);
+    if (final || identity.purpose !== 'attachment') expect(own('actual-observed-socket-close'))
+      .toEqual([expect.objectContaining({ hadError: false, destroyed: true, endpoint: identity.endpoint, purpose: identity.purpose })]);
+    const chunks = own('actual-observed-socket-hello'); let raw = Buffer.alloc(0);
+    for (const chunk of chunks) {
+      const bytes = Buffer.from(chunk.base64, 'base64'); expect(bytes.length).toBe(chunk.bytes);
+      raw = Buffer.concat([raw, bytes]); expect(raw.length).toBe(chunk.totalBytes);
+      expect(createHash('sha256').update(raw).digest('hex')).toBe(chunk.sha256);
+    }
+    if (verified.length) {
+      expect(raw.indexOf(10)).toBe(raw.length - 1); expect(raw.length).toBeGreaterThan(1);
+      const hello = JSON.parse(raw.toString('utf8')), owner = verified[0].owners;
+      expect(hello).toMatchObject({ pid: owner.daemon.value.pid, socketPath: identity.endpoint, protocol: 1 });
+      expect(hello.queryExecution.ownership.pid).toBe(owner.writer.value.pid);
+      expect(hello.fixturePadding).toBeUndefined();
+    }
+  }
+  const ids = installed.map(value => value.socketId).sort();
+  expect(events('actual-observed-socket-connect').map(value => value.socketId).sort()).toEqual(ids);
+  if (final) {
+    expect(events('actual-observed-socket-close').map(value => value.socketId).sort()).toEqual(ids);
+    expect(events('returned-close-observer-final')).toEqual([expect.objectContaining({ sockets: installed.length, mutations: verified.length, firstError: null })]);
+  }
+  if (verified.length) {
+    expect(verified).toHaveLength(1);
+    const selected = installed.filter(value => value.purpose === 'attachment'); expect(selected).toHaveLength(1);
+    const socketId = selected[0].socketId;
+    for (const name of ['actual-verified-socket', 'actual-socket-close-release-observed', 'actual-socket-native-close', 'returned-destroyed-socket']) {
+      expect(events(name)).toEqual([expect.objectContaining({ socketId, purpose: 'attachment', endpoint: selected[0].endpoint })]);
+    }
+    expect(events('actual-socket-close-release-observed')[0].consumed).toEqual([100, 101]);
+    expect(events('actual-preparation-rejected')).toEqual([]);
+    expect(events('fallback-prepared-deps-observer-installed')).toEqual([expect.objectContaining({ branch: 'prepared-deps' })]);
+  } else {
+    // The actual prepare throws before a proxy/factory can be published. The
+    // constructor-independent worker trace is separately required to be empty.
+    expect(events('actual-preparation-rejected')).toEqual([expect.objectContaining({ code: 'CODEGRAPH_QUERY_POLICY_REFUSED', reason: 'unknown' })]);
+    expect(events('fallback-prepared-deps-observer-installed')).toEqual([]);
+  }
+}
 function requireTrace(trace: UnprovedTrace, values: any[]): void {
   expect(trace.firstError).toBeNull(); expect(trace.truncated).toBe(false);
   const identity = (value: any) => value.pid + ':' + value.threadId;
@@ -80,8 +133,9 @@ function requireTrace(trace: UnprovedTrace, values: any[]): void {
     expect(values.filter(value => value.event === 'owned-socket-failure-cleanup')).toEqual([]);
   }
   if (values.some(value => value.event === 'actual-actionable-input-consumed')) {
-    expect(values.filter(value => value.event === 'fallback-factory-observer-installed')).toHaveLength(1);
+    expect(values.filter(value => value.event === 'fallback-factory-observer-installed')).toEqual([expect.objectContaining({ branch: 'prepare-entry' })]);
     expect(values.filter(value => value.event === 'actual-input-EOF')).toEqual([expect.objectContaining({ partialBytes: 0, firstError: null })]);
+    requireObservedSockets(values, true);
   }
 }
 async function settle(root: string, clients: UnprovedClient[], traces: UnprovedTrace[], cleanup: Cleanup): Promise<void> {
@@ -220,7 +274,7 @@ describe('unproved transport observation cannot become unavailable', () => {
     const fixture = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-policy-returned-close-'))), root = path.join(fixture, 'project');
     const observations = path.join(fixture, 'workers.jsonl'), seamFile = path.join(fixture, 'socket-seam.jsonl'), release = path.join(fixture, 'release');
     const trace = new UnprovedTrace(observations), seam = new UnprovedTrace(seamFile), traces = [trace, seam];
-    const clients: UnprovedClient[] = [], cleanup: Cleanup = [], evidence: Record<string, unknown> = { controlledSeam: 'actual connectWithHello result closed before dependency return' };
+    const clients: UnprovedClient[] = [], cleanup: Cleanup = [], evidence: Record<string, unknown> = { controlledSeam: 'same actual verified prepared.deps.getDaemonSocket attachment result closed before dependency return; admission sockets untouched' };
     let primary: unknown, daemonPid: number | undefined;
     try {
       await index(root);
@@ -254,6 +308,7 @@ describe('unproved transport observation cannot become unavailable', () => {
       for (const reply of [...replies, next]) requireRefusal(reply, root);
       await wait(350); // terminal refusal cannot arm the configured100ms retry
       const finalSeam = seam.read();
+      requireObservedSockets(finalSeam);
       for (const name of ['actual-verified-socket', 'actual-socket-native-close', 'returned-destroyed-socket']) expect(finalSeam.filter(value => value.event === name)).toHaveLength(1);
       for (const id of [100, 101, 102]) expect(peer.values.filter(value => value.id === id)).toHaveLength(1);
       expect(finalSeam.filter(value => value.event === 'fallback-factory-invoked')).toEqual([]);

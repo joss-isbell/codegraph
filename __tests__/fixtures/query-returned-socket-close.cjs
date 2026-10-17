@@ -2,6 +2,8 @@
 // a real socket from the actual owned daemon. Close that SAME native socket
 // before returning it; never fabricate any hello, handler or query result.
 const fs = require('node:fs');
+const net = require('node:net');
+const crypto = require('node:crypto');
 const threads = require('node:worker_threads');
 if (threads.isMainThread && process.env.QUERY_UNPROVED_SOCKET_OBSERVATIONS) {
   let firstError = null, failureCount = 0, recordedBytes = 0, recordedEvents = 0;
@@ -22,6 +24,9 @@ if (threads.isMainThread && process.env.QUERY_UNPROVED_SOCKET_OBSERVATIONS) {
   const record = value => {
     try { rawRecord(value); }
     catch (error) { fixtureFailure('observation-write', error); throw error; }
+  };
+  const nativeRecord = value => {
+    try { record(value); } catch (error) { fixtureFailure('native-socket-observation', error); }
   };
   // Observe only after an existing actual product stdin listener consumes the
   // same bytes. This never starts stdin early or changes the delivered input.
@@ -57,22 +62,85 @@ if (threads.isMainThread && process.env.QUERY_UNPROVED_SOCKET_OBSERVATIONS) {
     catch (error) { fixtureFailure('actual-input-EOF', error); }
   });
   const proxy = require('../../dist/mcp/proxy');
-  // Factory observation is independent of the root-specific lifetime seam:
-  // all three negative rendezvous cases must exclude a cold local engine too.
+  const requestedRoot = process.env.QUERY_UNPROVED_RETURNED_SOCKET_ROOT;
+  const owners = require('../../dist/mcp/query-service-owner');
+  const socketIdentities = new WeakMap();
+  let phase = null, selectedRoot = null, candidates = null, sockets = 0, mutations = 0;
+  const originalConnection = net.createConnection;
+  net.createConnection = function(...args) {
+    const endpoint = typeof args[0] === 'string' ? args[0] : args[0]?.path;
+    if (!candidates?.has(endpoint)) return originalConnection.apply(this, args);
+    const stack = (new Error().stack ?? '').replace(/\\/g, '/').slice(0, 8192);
+    const purpose = phase === 'prepare' && stack.includes('admitQueryProject') ? 'prepare-admission'
+      : phase === 'acquisition' && stack.includes('admitQueryProject') ? 'attempt-admission'
+        : phase === 'acquisition' && stack.includes('connectHeldService') ? 'attachment' : null;
+    if (!purpose || !stack.includes('connectObservedService')) {
+      const error = new Error('Unclassified actual returned-close socket'); fixtureFailure('socket-purpose', error); throw error;
+    }
+    const socket = originalConnection.apply(this, args), identity = { socketId: ++sockets, purpose, endpoint };
+    socketIdentities.set(socket, identity);
+    let bytes = Buffer.alloc(0), sawLf = false;
+    const originalPush = socket.push;
+    socket.push = function(chunk, ...rest) {
+      if (Buffer.isBuffer(chunk) && !sawLf) {
+        const nl = chunk.indexOf(10), prefix = nl < 0 ? chunk : chunk.subarray(0, nl + 1);
+        if (bytes.length + prefix.length > 16384) fixtureFailure('raw-hello-cap', new Error('Owned raw greeting cap'));
+        else bytes = Buffer.concat([bytes, prefix]);
+        sawLf = nl >= 0;
+        nativeRecord({ event: 'actual-observed-socket-hello', ...identity, bytes: prefix.length, base64: prefix.toString('base64'),
+          totalBytes: bytes.length, sawLf, sha256: crypto.createHash('sha256').update(bytes).digest('hex') });
+      }
+      if (chunk === null) nativeRecord({ event: 'actual-observed-socket-EOF', ...identity, rawBytes: bytes.length, sawLf });
+      return originalPush.call(this, chunk, ...rest);
+    };
+    socket.on('connect', () => nativeRecord({ event: 'actual-observed-socket-connect', ...identity }));
+    socket.on('close', hadError => nativeRecord({ event: 'actual-observed-socket-close', ...identity,
+      hadError, destroyed: socket.destroyed, rawBytes: bytes.length, sawLf }));
+    socket.on('error', error => fixtureFailure('actual-observed-socket-error', error));
+    record({ event: 'actual-observed-socket-installed', ...identity, stack });
+    return socket;
+  };
+  // Adapt the actual prepared API: a refusal during preparation publishes no
+  // factory at all. Successful preparation exposes the real makeEngine hook.
   const originalRun = proxy.runLocalHandshakeProxy;
-  proxy.runLocalHandshakeProxy = function(deps) {
-    return originalRun.call(this, { ...deps, makeEngine: () => {
-      record({ event: 'fallback-factory-invoked' }); return deps.makeEngine();
+  function observedDeps(deps, branch) {
+    if (deps.root !== selectedRoot || typeof deps.makeEngine !== 'function' || typeof deps.getDaemonSocket !== 'function') throw new Error('Unexpected actual unproved proxy dependencies');
+    record({ event: 'fallback-prepared-deps-observer-installed', root: deps.root, branch });
+    return { ...deps, makeEngine: function(...args) {
+      record({ event: 'fallback-factory-invoked' }); return deps.makeEngine.apply(deps, args);
+    }, getDaemonSocket: async function(...args) {
+      phase = 'acquisition';
+      let socket;
+      try { socket = await deps.getDaemonSocket.apply(deps, args); }
+      finally { phase = null; }
+      if (!requestedRoot || !socket) return socket;
+      return closeReturnedSocket(socket);
+    } };
+  }
+  proxy.runLocalHandshakeProxy = function(input) {
+    selectedRoot = fs.realpathSync(input.hint ?? input.root);
+    if (requestedRoot && requestedRoot !== selectedRoot) throw new Error('Returned-close root differs from actual preparation hint');
+    candidates = new Set(require('../../dist/mcp/daemon-paths').getDaemonSocketCandidates(selectedRoot));
+    record({ event: 'fallback-factory-observer-installed', root: selectedRoot,
+      branch: typeof input.prepare === 'function' ? 'prepare-entry' : 'legacy-deps' });
+    if (typeof input.prepare !== 'function') return originalRun.call(this, observedDeps(input, 'legacy-deps'));
+    return originalRun.call(this, { ...input, prepare: async function(...args) {
+      phase = 'prepare';
+      let prepared;
+      try { prepared = await input.prepare.apply(input, args); }
+      catch (error) { record({ event: 'actual-preparation-rejected', code: error?.code, reason: error?.reason, projectRoot: error?.projectRoot,
+        message: String(error).slice(0, 2048) }); throw error; }
+      finally { phase = null; }
+      if (prepared.kind !== 'proxy') throw new Error('Unproved requester did not prepare actual proxy dependencies');
+      return { ...prepared, deps: observedDeps(prepared.deps, 'prepared-deps') };
     } });
   };
-  record({ event: 'fallback-factory-observer-installed' });
-  const root = process.env.QUERY_UNPROVED_RETURNED_SOCKET_ROOT;
-  if (!root) return;
-  const owners = require('../../dist/mcp/query-service-owner');
-  const originalConnect = proxy.connectWithHello;
-  proxy.connectWithHello = async function(socketPath, version, policy, projectRoot) {
-    const socket = await originalConnect.apply(this, arguments);
-    if (!socket || projectRoot !== root) return socket;
+  async function closeReturnedSocket(socket) {
+    const identity = socketIdentities.get(socket);
+    if (!identity || identity.purpose !== 'attachment' || ++mutations !== 1) {
+      const error = new Error('Returned-close seam did not select exactly one actual attachment');
+      fixtureFailure('returned-socket-identity', error); socket.destroy(); throw error;
+    }
     // Take ownership before any record or release await can fail. Native close
     // observation never performs throwing I/O inside an EventEmitter callback.
     let nativeClose = null, returned = false;
@@ -90,17 +158,19 @@ if (threads.isMainThread && process.env.QUERY_UNPROVED_SOCKET_OBSERVATIONS) {
       } finally { clearTimeout(timer); }
     };
     try {
-      record({ event: 'actual-verified-socket', socketPath, version, policy, owners: owners.readQueryServiceOwners(root) });
+      record({ event: 'actual-verified-socket', ...identity, socketPath: identity.endpoint,
+        owners: owners.readQueryServiceOwners(selectedRoot) });
       const releaseDeadline = Date.now() + 10000;
       while (!fs.existsSync(process.env.QUERY_UNPROVED_RELEASE)) {
         if (Date.now() >= releaseDeadline) throw new Error('Owned returned-socket release deadline');
         await new Promise(resolve => setTimeout(resolve, 10));
       }
-      record({ event: 'actual-socket-close-release-observed' });
+      record({ event: 'actual-socket-close-release-observed', ...identity, consumed: [...seen] });
+      if (!seen.has(100) || !seen.has(101)) throw new Error('Attachment close released before actual buffered inputs');
       await closeOwned();
-      record({ event: 'actual-socket-native-close', ...nativeClose });
+      record({ event: 'actual-socket-native-close', ...identity, ...nativeClose });
       if (firstError) throw new Error(firstError);
-      record({ event: 'returned-destroyed-socket', destroyed: socket.destroyed });
+      record({ event: 'returned-destroyed-socket', ...identity, destroyed: socket.destroyed });
       returned = true; return socket;
     } catch (error) {
       fixtureFailure('returned-socket-before-return', error); throw error;
@@ -111,5 +181,6 @@ if (threads.isMainThread && process.env.QUERY_UNPROVED_SOCKET_OBSERVATIONS) {
         catch (error) { fixtureFailure('returned-socket-failure-cleanup-record', error); }
       }
     }
-  };
+  }
+  process.once('exit', () => record({ event: 'returned-close-observer-final', sockets, mutations, firstError }));
 }
