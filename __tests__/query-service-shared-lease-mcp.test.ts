@@ -256,7 +256,12 @@ describe('caller admission with shared native freshness resources', () => {
       expect(parseQueryDiagnostics(ready.status.result).lifecycle.workers).toBe(0);
       host.command({ kind: 'remove-loaded-index', token: 'remove' });
       const removed = await host.event('removed-loaded-index', 'remove'); evidence.removed = removed;
-      expect(removed.fixtureClosedHandle).toBe(true); expect(removed.stillDefaultLoaded).toBe(true);
+      expect(removed.fixtureClosedHandles).toEqual([
+        { ordinal: 0, root, closeCallsBefore: 0, closeCallsAfter: 1 },
+        { ordinal: 1, root, closeCallsBefore: 0, closeCallsAfter: 1 },
+      ]);
+      expect(betaGraph(removed, root)).toEqual([{ root, closeCalls: 1 }, { root, closeCalls: 1 }]);
+      expect(removed.stillDefaultLoaded).toBe(true);
       expect(fs.existsSync(removed.database)).toBe(false);
       const reply = await host.call('C', 'missingOwnSymbol', undefined, 100); evidence.reply = reply;
       expect(reply.reply.error).toBeUndefined(); expect(reply.reply.result.isError).toBeFalsy();
@@ -265,7 +270,10 @@ describe('caller admission with shared native freshness resources', () => {
       expect(reply.reply.result.content[0].text).not.toMatch(/internal error|retry once|ENOENT|export function/i);
       expect(fs.existsSync(removed.database)).toBe(false);
       expect(engineFact(reply, 'C').diagnostics.lifecycle).toMatchObject({ state: 'cold', workers: 0, queued: 0, executing: 0, starting: 0 });
-      expect(engineFact(reply, 'C').history).toEqual([]); expect(events()).toEqual([]);
+      expect(engineFact(reply, 'C').history).toEqual([]);
+      const observed = events();
+      expect(observed).toHaveLength(1);
+      expect(observed[0]).toMatchObject({ event: 'engine-constructor', pid: host.child.pid, threadId: 0 });
       expect(trace.firstError).toBeNull(); expect(trace.truncated).toBe(false);
     } catch (error) { primary = error; throw error; }
     finally {

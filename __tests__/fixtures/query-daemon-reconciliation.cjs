@@ -154,6 +154,37 @@ if (threads.isMainThread) {
     }
   };
   const cp = require('node:child_process'), spawn = cp.spawn;
+  // Detached candidates inherit file descriptors, not stdout/stderr pipes.
+  // Observe the parent's actual native close separately from the child's
+  // native exit; neither is a manufactured ChildProcess.close event.
+  const candidateFiles = new Map(), nativeCloseSync = fs.closeSync, nativeFstatSync = fs.fstatSync;
+  fs.closeSync = function(fd) {
+    const owners = candidateFiles.get(fd);
+    let identity = null, identityError;
+    if (owners) try {
+      const stat = nativeFstatSync.call(fs, fd, { bigint: true });
+      identity = { dev: String(stat.dev), ino: String(stat.ino), mode: String(stat.mode) };
+    } catch (error) { identityError = String(error).slice(0, 2048); }
+    let result;
+    try { result = nativeCloseSync.apply(this, arguments); }
+    catch (error) {
+      if (owners) {
+        for (const owner of owners) record({ event: 'candidate-parent-file-fd-close-error', ...owner,
+          creationIdentity: owner.identity, identity, identityError, fd, error: String(error).slice(0, 2048) });
+        failure(error);
+      }
+      throw error;
+    }
+    if (owners) {
+      candidateFiles.delete(fd); // Remove before trace I/O can reuse this fd.
+      for (const owner of owners) record({ event: 'candidate-parent-file-fd-close', ...owner,
+        creationIdentity: owner.identity, identity, identityError, fd });
+      if (!identity || owners.some(owner => identity.dev !== owner.identity.dev || identity.ino !== owner.identity.ino || identity.mode !== owner.identity.mode)) {
+        failure(identityError || 'Candidate inherited fd identity changed before its native close');
+      }
+    }
+    return result;
+  };
   cp.spawn = function(command, args, options) {
     const child = spawn.call(this, command, args, options);
     if (!options?.detached || options.env?.CODEGRAPH_DAEMON_INTERNAL !== '1') return child;
@@ -162,7 +193,25 @@ if (threads.isMainThread) {
     if (!Number.isInteger(child.pid) || child.pid <= 0 || !roots.includes(selectedRoot)) { failure('Actual candidate identity/root is not owned'); return child; }
     try { fs.writeFileSync(path.join(traceDir, `candidate-spawn-${child.pid}.json`), JSON.stringify({ candidatePid: child.pid, launcherPid: process.pid, root: selectedRoot, command, args, identity: 'actual-delegated-child-spawn' }), { flag: 'wx' }); }
     catch (error) { failure(error); }
-    record({ event: 'candidate-spawn', candidatePid: child.pid, args, command, attempt: declared?.attempt,
+    const stdio = options.stdio.map((binding, index) => {
+      const stream = child.stdio[index];
+      if (stream) {
+        stream.once('end', () => record({ event: 'candidate-stdio-end', candidatePid: child.pid, index }));
+        stream.once('close', () => record({ event: 'candidate-stdio-close', candidatePid: child.pid, index }));
+        stream.on('error', error => { record({ event: 'candidate-stdio-error', candidatePid: child.pid, index, error: String(error).slice(0, 2048) }); failure(error); });
+        return { index, kind: 'pipe', readable: stream.readable, writable: stream.writable };
+      }
+      if (typeof binding === 'number') {
+        const stat = nativeFstatSync.call(fs, binding, { bigint: true });
+        const identity = { dev: String(stat.dev), ino: String(stat.ino), mode: String(stat.mode) };
+        const owner = { candidatePid: child.pid, index, identity };
+        const owners = candidateFiles.get(binding) || [];
+        owners.push(owner); candidateFiles.set(binding, owners);
+        return { index, kind: stat.isFile() ? 'file-fd' : 'native-fd', fd: binding, identity };
+      }
+      return { index, kind: binding === 'ipc' ? 'ipc' : binding === 'ignore' ? 'ignore' : 'unknown', binding };
+    });
+    record({ event: 'candidate-spawn', candidatePid: child.pid, args, command, stdio, attempt: declared?.attempt,
       startupCpu: options.env.CODEGRAPH_INTERNAL_QUERY_STARTUP_CPU_V1 ?? null,
       controls: Object.fromEntries(['CODEGRAPH_QUERY_MODE','CODEGRAPH_QUERY_POOL_SIZE','CODEGRAPH_QUERY_BUSY_TIMEOUT_MS'].map(key => [key, options.env[key] ?? null])) });
     child.on('message', message => { statuses++; record({ event: 'candidate-status', candidatePid: child.pid, message }); });
@@ -174,6 +223,8 @@ if (threads.isMainThread) {
       return send.apply(this, values);
     };
     child.on('exit', (code, signal) => record({ event: 'candidate-exit', candidatePid: child.pid, code, signal, statuses, acknowledgements }));
+    child.on('disconnect', () => record({ event: 'candidate-disconnect', candidatePid: child.pid,
+      connected: child.connected, channelPresent: child.channel != null, statuses, acknowledgements }));
     child.on('close', (code, signal) => record({ event: 'candidate-close', candidatePid: child.pid, code, signal, statuses, acknowledgements }));
     child.on('error', error => record({ event: 'candidate-error', candidatePid: child.pid, error: String(error).slice(0, 2048) }));
     if (declared && ['stop-before-status', 'exit78-before-status', 'hold-before-status'].includes(declared.fault)) {

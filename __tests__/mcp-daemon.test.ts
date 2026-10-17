@@ -280,14 +280,51 @@ async function proveTypedUnsupported(server: SpawnedServer, root: string): Promi
   const records = trace().filter(record => record.pid === server.child.pid);
   const candidates = records.filter(record => record.event === 'candidate-spawn'); expect(candidates).toHaveLength(1);
   const pid = candidates[0].candidatePid;
-  const status = records.find(record => record.event === 'candidate-status' && record.candidatePid === pid);
+  const statuses = records.filter(record => record.event === 'candidate-status' && record.candidatePid === pid);
+  expect(statuses).toHaveLength(1);
+  const status = statuses[0];
   expect(status?.message).toMatchObject({ protocol: 1, kind: 'refused', refusal: { code: 'CODEGRAPH_QUERY_POLICY_REFUSED', reason: 'unsupported-mode', projectRoot: root, guidance: expect.any(String) } });
   expect(records.filter(record => record.event === 'candidate-parent-send' && record.candidatePid === pid)).toEqual([]);
-  await waitFor(() => trace().find(record => record.pid === server.child.pid && record.event === 'candidate-close' && record.candidatePid === pid), 5000);
-  const closed = trace().find(record => record.pid === server.child.pid && record.event === 'candidate-close' && record.candidatePid === pid);
-  expect(closed).toMatchObject({ signal: null, acknowledgements: 0 }); expect(isAlive(pid)).toBe(false);
+  // Node's explicit parent IPC disconnect can suppress aggregate child.close
+  // (nodejs/node#65646). Prove the actual native tail for EACH observed stdio
+  // shape instead; do not fabricate an aggregate event or infer EOF from exit.
+  const stdio = candidates[0].stdio;
+  expect(stdio.map((channel: any) => channel.index)).toEqual([0,1,2,3]);
+  const tail = await waitFor(() => {
+    const native = trace().filter(record => record.pid === server.child.pid && record.candidatePid === pid);
+    const exited = native.find(record => record.event === 'candidate-exit');
+    const disconnected = native.find(record => record.event === 'candidate-disconnect');
+    if (!exited || !disconnected) return null;
+    const channels = stdio.map((channel: any) => {
+      if (channel.kind === 'ignore') return { ...channel, tail: 'ignored-stdio-no-parent-owned-handle', childBindingRetiredByNativeExit: exited };
+      if (channel.kind === 'ipc') return { ...channel, disconnected };
+      if (channel.kind === 'pipe') {
+        const ended = native.find(record => record.event === 'candidate-stdio-end' && record.index === channel.index);
+        const closed = native.find(record => record.event === 'candidate-stdio-close' && record.index === channel.index);
+        return closed && (!channel.readable || ended) ? { ...channel, ended: ended ?? null, closed } : null;
+      }
+      if (channel.kind === 'file-fd' || channel.kind === 'native-fd') {
+        const parentClosed = native.find(record => record.event === 'candidate-parent-file-fd-close' && record.index === channel.index && record.fd === channel.fd);
+        // The child copy closes on actual native process exit, not IPC release.
+        return parentClosed ? { ...channel, parentClosed, childCopyClosedByNativeExit: exited } : null;
+      }
+      throw new Error(`Unproved candidate stdio shape: ${channel.kind}`);
+    });
+    if (channels.some((channel: any) => !channel) || isAlive(pid)) return null;
+    return { exited, disconnected, channels, aggregateClose: native.find(record => record.event === 'candidate-close') ?? null };
+  }, 5000, 25, 'typed-refused candidate native exit, IPC and every actual stdio tail');
+  expect(tail.exited).toMatchObject({ code: 1, signal: null, statuses: 1, acknowledgements: 0 });
+  expect(tail.disconnected).toMatchObject({ connected: false, channelPresent: false, statuses: 1, acknowledgements: 0 });
+  for (const channel of tail.channels) if (channel.parentClosed) {
+    expect(channel.parentClosed.identityError).toBeUndefined();
+    expect(channel.parentClosed.identity).toEqual(channel.identity);
+  }
+  if (tail.aggregateClose) expect(tail.aggregateClose).toMatchObject({ code: 1, signal: null, statuses: 1, acknowledgements: 0 });
+  expect(trace().filter(record => record.pid === server.child.pid && record.candidatePid === pid &&
+    ['candidate-stdio-error','candidate-parent-file-fd-close-error'].includes(record.event))).toEqual([]);
   expect(trace().filter(record => record.pid === pid && record.event === 'candidate-controlled-exit')).toEqual([]);
-  current.observations.push({ event: 'actual-typed-unsupported-terminal', candidatePid: pid, status, closed });
+  current.observations.push({ event: 'actual-typed-unsupported-terminal', candidatePid: pid, status,
+    ...tail, missingAggregateCloseAtNativeTail: tail.aggregateClose === null });
 }
 function snapshot(root: string) {
   const dir = path.join(root, '.codegraph');
