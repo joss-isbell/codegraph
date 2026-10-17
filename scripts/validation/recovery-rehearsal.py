@@ -46,25 +46,39 @@ write(out / "effective-rehearsal-settings.json", {
     "CODEGRAPH_NO_DAEMON": "1 (disposable direct sessions only)"},
     "launchRecipe": str(restored / "restored-launch.json"), "originalSettingsBytesUnchanged": True,
     "liveInheritedEnvironment": "unknown; no installed owner environment is inferred"})
+result = None
+final_files_unchanged = False
+final_component_manifest = {}
 try:
-    result = subprocess.run(command, env=env, cwd=out)
+    if os.name == "nt":
+        witness.check()
+    # Restoration's earlier hash is not a baseline protected by this observer.
+    if file_manifest(components) != manifest["files"]:
+        raise ValueError("restored B changed before native integrity baseline")
+    result = subprocess.run(command, env={**env, "PYTHONDONTWRITEBYTECODE": "1"}, cwd=out)
 finally:
-    witness.close()
+    try:
+        final_component_manifest = file_manifest(components)
+        final_files_unchanged = final_component_manifest == manifest["files"]
+    finally:
+        closed = witness.close()
     write(out / "restored-B-integrity.json", {"changes": witness.changes, "errors": witness.errors,
-          "filesUnchanged": file_manifest(components) == manifest["files"]})
+          "filesUnchanged": final_files_unchanged,
+          **({"windowsWitness": closed} if os.name == "nt" else {})})
+
 
 scenario = scenarios[-1]
 event("start", scenario=scenario)
-assertion(scenario, "whole B recovery probe exited successfully", result.returncode == 0, exitCode=result.returncode)
+assertion(scenario, "whole B recovery probe exited successfully", result is not None and result.returncode == 0, exitCode=result.returncode if result is not None else None)
 assertion(scenario, "restored B files remained immutable throughout launch and recovery",
-          not witness.changes and not witness.errors and file_manifest(components) == manifest["files"])
+          not witness.changes and not witness.errors and final_files_unchanged)
 identities = [json.loads(line) for line in identity_path.read_text().splitlines()]
 runtimes = [row for row in identities if row["type"] == "runtime"]
 workers = [row for row in identities if row["type"] == "worker-spawn"]
 expected_runtime = str((components / "engine/node.exe").resolve())
 assertion(scenario, "all observed Node processes and threads use B's copied runtime",
           bool(runtimes) and all(row["executable"] == expected_runtime for row in runtimes)
-          and digest(expected_runtime) == manifest["files"]["engine/node.exe"]["sha256"], observations=len(runtimes))
+          and final_component_manifest["engine/node.exe"]["sha256"] == manifest["files"]["engine/node.exe"]["sha256"], observations=len(runtimes))
 assertion(scenario, "exact copied launcher and upstream CLI actually executed",
           any(str(components / "launcher/proxy.mjs") in row["argv"] for row in runtimes) and
           any(str(components / "engine/lib/dist/bin/codegraph.js") in row["argv"] for row in runtimes))
@@ -77,9 +91,10 @@ assertion(scenario, "all launched worker modules belong to and match copied B",
 assertion(scenario, "all spawned B workers completed teardown",
           all(any(end["type"] == "worker-exit" and end["pid"] == row["pid"] and end["threadId"] == row["threadId"]
                   for end in identities) for row in workers), workers=len(workers))
-write(out / "B-runtime-summary.json", {"runtimeSha256": digest(expected_runtime), "versions": runtimes[0]["versions"],
+write(out / "B-runtime-summary.json", {"runtimeSha256": final_component_manifest["engine/node.exe"]["sha256"], "versions": runtimes[0]["versions"],
       "runtimeObservations": len(runtimes), "workerSpawns": len(workers),
       "queryWorkerSpawns": sum(row["file"].endswith("query-worker.js") for row in workers),
       "protectedManifestSha256": digest(protected / "manifest.json")})
 event("complete", scenario=scenario)
 event("final", passed=True, scenarios=scenarios)
+

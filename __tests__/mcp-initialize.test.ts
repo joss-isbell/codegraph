@@ -18,6 +18,11 @@ import * as os from 'os';
 import { CodeGraph } from '../src';
 import { once } from 'events';
 import { WASM_RUNTIME_FLAGS } from '../src/extraction/wasm-runtime-flags';
+import { MCPSession } from '../src/mcp/session';
+import { ParsedMessageTransport, JsonRpcResponse } from '../src/mcp/transport';
+
+// Exercise the shipped lazy CodeGraph loader in the already-verified branch.
+const { MCPEngine: BuiltMCPEngine } = require('../dist/mcp/engine') as typeof import('../src/mcp/engine');
 
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
 
@@ -131,6 +136,8 @@ describe('MCP initialize handshake (issue #172)', () => {
     expect(json.id).toBe(0);
     expect(json.result.protocolVersion).toBeDefined();
     expect(json.result.capabilities.tools).toBeDefined();
+    expect(json.result.instructions).toContain('verification is pending');
+    expect(json.result.instructions).toContain('## How to query');
     expect(json.result.instructions).toContain('Query execution observations');
   }, 10000);
 
@@ -160,7 +167,47 @@ describe('MCP initialize handshake (issue #172)', () => {
     const json = JSON.parse(response.text);
     expect(json.id).toBe(0);
     expect(json.result.serverInfo.name).toBe('codegraph');
+    expect(json.result.instructions).toContain('verification is pending');
     expect(json.result.instructions).toContain('Query execution observations');
+  }, 20000);
+
+  it('an already verified permitted engine gives a new real session the full default playbook', async () => {
+    fs.writeFileSync(path.join(tempDir, 'index.ts'), 'export function verifiedHello() { return 7; }\n');
+    const cg = await CodeGraph.init(tempDir, { index: true });
+    cg.close();
+    const engine = new BuiltMCPEngine({ watch: false, queryPool: false });
+    const replies: JsonRpcResponse[] = [];
+    const transport = new ParsedMessageTransport(line => { replies.push(JSON.parse(line) as JsonRpcResponse); });
+    const session = new MCPSession(transport, engine, { explicitProjectPath: tempDir });
+    let primary: unknown;
+    let hadPrimary = false;
+    try {
+      // Natural admitted initialization is the pre-existing state this branch
+      // describes, never a schema predictor added to a fresh handshake.
+      await engine.ensureInitialized(tempDir);
+      expect(engine.hasVerifiedDefaultRoute()).toBe(true);
+      session.start();
+      await transport.accept({ jsonrpc: '2.0', id: 0, method: 'initialize', params: { capabilities: {} } });
+      const response = replies.find(reply => reply.id === 0)!;
+      expect(response.error).toBeUndefined();
+      const instructions = (response.result as { instructions: string }).instructions;
+      expect(instructions).toContain('## How to query');
+      expect(instructions).toContain('Query execution observations');
+      expect(instructions).not.toContain('verification is pending');
+      await transport.accept({ jsonrpc: '2.0', id: 1, method: 'tools/call',
+        params: { name: 'codegraph_search', arguments: { query: 'verifiedHello' } } });
+      const queried = replies.find(reply => reply.id === 1)!;
+      expect(queried.error).toBeUndefined();
+      const result = queried.result as { content: Array<{ text: string }>; isError?: boolean };
+      expect(result.isError).toBeUndefined();
+      expect(result.content[0]!.text).toContain('verifiedHello');
+    } catch (error) { hadPrimary = true; primary = error; throw error; }
+    finally {
+      const cleanup: unknown[] = [];
+      try { session.stop(); } catch (error) { cleanup.push(error); }
+      try { await engine.stop(); } catch (error) { cleanup.push(error); }
+      if (cleanup.length) throw new AggregateError(hadPrimary ? [primary, ...cleanup] : cleanup, 'Verified session cleanup failed');
+    }
   }, 20000);
 
   it('answers resources/list and prompts/list with empty lists, not -32601 (issue #621)', async () => {

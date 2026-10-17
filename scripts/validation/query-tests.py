@@ -42,8 +42,17 @@ assertion(scenario, 'Vitest reported no unhandled errors through process exit',
           all(item['errorCount'] == 0 for item in checkpoints),
           checkpoints=[{key: item[key] for key in ['phase', 'exitCode', 'errorCount', 'omittedErrors']}
                        for item in checkpoints])
+
+test_name_pattern = os.environ.get('QUERY_TEST_NAME_PATTERN')
+selection_path = out / 'query-selection.json'
+selection = json.loads(selection_path.read_text()) if selection_path.is_file() else {}
+expected_selection = {'schemaVersion': 1, 'suites': sys.argv[1:], 'testNamePattern': test_name_pattern}
+assertion(scenario, 'Vitest selection matches the declared suites and optional test name pattern',
+          selection == expected_selection, path=str(selection_path), declared=expected_selection, returned=selection)
+
 tests = [test for suite in report.get('testResults', []) for test in suite.get('assertionResults', [])]
 pending = [test['fullName'] for test in tests if test['status'] in ['skipped', 'pending', 'todo']]
+# Name filtering never approves skips implicitly; declare every skipped fullName.
 expected_skips = json.loads(os.environ.get('QUERY_EXPECTED_SKIPS', '[]'))
 declared_files = sorted(str((root / name).resolve()) for name in sys.argv[1:])
 returned_files = sorted(str(Path(suite['name']).resolve()) for suite in report.get('testResults', []))
@@ -53,8 +62,10 @@ for test in [test for test in tests if test['status'] == 'failed'][:5]:
     print(test['fullName'] + ': ' + '\n'.join(test.get('failureMessages', []))[:1800], file=sys.stderr)
 assertion(scenario, 'all declared tests completed successfully', result.returncode == 0 and report.get('success') is True
           and report.get('numTotalTests', 0) > 0 and sorted(pending) == sorted(expected_skips)
+          and (test_name_pattern is None or report.get('numPassedTests', 0) > 0)
           and all(test['status'] in ['passed', 'skipped', 'pending', 'todo'] for test in tests),
           exitCode=result.returncode, total=report.get('numTotalTests'), passedTests=report.get('numPassedTests'),
-          failed=report.get('numFailedTests'), pending=pending, expectedSkips=expected_skips)
+          failed=report.get('numFailedTests'), pending=pending, expectedSkips=expected_skips,
+          testNamePattern=test_name_pattern)
 event('complete', scenario=scenario)
 event('final', passed=True, scenarios=[scenario])

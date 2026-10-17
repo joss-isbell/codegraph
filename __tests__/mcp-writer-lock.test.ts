@@ -8,6 +8,7 @@ import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { createHash } from 'crypto';
 import { CodeGraph } from '../src';
 import type { MCPEngine } from '../src/mcp/engine';
 
@@ -207,35 +208,78 @@ describe('issue #1740 — direct-mode writer lock', () => {
 
 describe('reader-only MCP engine (#1963)', () => {
   let root: string;
-  let engine: MCPEngine;
+  let engine: MCPEngine | undefined;
+  const ordinaryOwners: MCPEngine[] = [];
+  const retainedFacts: unknown[] = [];
+  let bodyFailed = false;
+  let bodyFailure: string | undefined;
+  let secondary: string[] = [];
+  const retainSecondary = (error: unknown): void => { if (secondary.length < 16) secondary.push(String(error).slice(0, 2048)); };
+  const cleanupPhase = async (work: () => void | Promise<void>): Promise<void> => {
+    try { await work(); } catch (error) { retainSecondary(error); }
+  };
 
   beforeEach(async () => {
+    engine = undefined;
+    bodyFailed = false; bodyFailure = undefined; secondary = [];
     root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg1963-reader-')));
     fs.writeFileSync(path.join(root, 'app.ts'), 'export function originalSymbol() { return 1; }\n');
     const cg = await CodeGraph.init(root);
     try { await cg.indexAll(); } finally { cg.close(); }
   });
 
-  afterEach(async () => {
-    await engine?.stop();
-    fs.rmSync(root, { recursive: true, force: true });
+  afterEach(async context => {
+    await cleanupPhase(() => engine?.stop());
+    for (const owner of ordinaryOwners.splice(0)) await cleanupPhase(() => owner.stop());
+    const primary = bodyFailure ?? context.task.result?.errors?.slice(0, 4).map(error => String(error.message).slice(0, 2048)).join('; ').slice(0, 2048);
+    let index: Record<string, string> | undefined;
+    try {
+      const dir = path.join(root, '.codegraph');
+      index = Object.fromEntries(fs.readdirSync(dir).sort().map(name => [name,
+        createHash('sha256').update(fs.readFileSync(path.join(dir, name))).digest('hex')]));
+    } catch (error) { retainSecondary(error); }
+    // Keep every reader workspace inert after cleanup; failed roots/captures
+    // cannot be erased by a later successful afterEach.
+    const row = { test: context.task.name, root, primary, secondary: [...secondary], index, retained: true };
+    retainedFacts.push(row);
+    try {
+      if (process.env.VALIDATION_OUT) {
+        const encoded = JSON.stringify(retainedFacts);
+        if (Buffer.byteLength(encoded) > 1024 * 1024) throw new Error('Reader/writer facts exceeded 1 MiB');
+        fs.writeFileSync(path.join(process.env.VALIDATION_OUT, 'writer-lock-reader-facts.json'), encoded);
+      }
+    } catch (error) {
+      retainSecondary(error); row.secondary = [...secondary];
+      // At most sixteen 2KiB errors plus the 2KiB primary: bounded fallback
+      // retains all collected failures if the ordinary artifact cannot be saved.
+      process.stderr.write(`Reader/writer evidence persistence failed: ${JSON.stringify({ root, primary, secondary })}\n`);
+    }
+    // The original body error keeps its original throw; every cleanup failure
+    // remains separately retained. Cleanup alone is still an acceptance failure.
+    if (secondary.length && !primary && !bodyFailed) throw new Error(`Owned reader/writer cleanup failed: ${secondary.join('; ')}`);
   });
 
   it.each(['async', 'retry', 'explicit'] as const)('%s initialization never updates the index or owner lock', async (mode) => {
     const lockPath = getWriterPidPath(root);
-    const owner = JSON.stringify({ pid: process.pid, mode: 'daemon', startedAt: Date.now() });
-    fs.writeFileSync(lockPath, owner);
+    // A real ordinary owner holds the slot; it makes no daemon claim and does
+    // not watch subsequent edits. The separate reader must never take it over.
+    const ordinaryOwner = new BuiltMCPEngine({ watch: false, queryPool: false, writerLockRoot: root });
+    ordinaryOwners.push(ordinaryOwner);
+    await ordinaryOwner.ensureInitialized(root);
+    await ordinaryOwner.getToolHandler().execute('codegraph_status', {});
+    const owner = fs.readFileSync(lockPath, 'utf8');
+    expect(JSON.parse(owner).mode).toBe('fallback');
     fs.writeFileSync(path.join(root, 'app.ts'), 'export function changedSymbol() { return 2; }\n');
     const { db } = createDatabase(path.join(root, '.codegraph', 'codegraph.db'), { readOnly: true });
-    const version = db.pragma('data_version', { simple: true });
     // readOnly overrides watching, pool workers, and writer acquisition.
-    engine = new BuiltMCPEngine({ readOnly: true, watch: true, queryPool: true, writerLockRoot: root });
     try {
+      const version = db.pragma('data_version', { simple: true });
+      engine = new BuiltMCPEngine({ readOnly: true, watch: true, queryPool: true, writerLockRoot: root });
       if (mode === 'async') await engine.ensureInitialized(root);
       if (mode === 'retry') {
         const empty = path.join(root, 'empty');
         fs.mkdirSync(empty);
-        engine.retryInitializeSync(empty);
+        await engine.retryInitialize(empty);
       }
       const args = mode === 'explicit' ? { projectPath: root } : {};
       const result = await engine.getToolHandler().execute('codegraph_search', { ...args, query: 'originalSymbol' });
@@ -249,7 +293,30 @@ describe('reader-only MCP engine (#1963)', () => {
       await engine.stop();
       expect(db.pragma('data_version', { simple: true })).toBe(version);
       expect(fs.readFileSync(lockPath, 'utf8')).toBe(owner);
-    } finally { db.close(); }
+    } catch (error) {
+      bodyFailed = true; bodyFailure = String(error).slice(0, 2048); throw error;
+    } finally {
+      await cleanupPhase(() => engine?.stop());
+      await cleanupPhase(() => db.close());
+      await cleanupPhase(() => ordinaryOwner.stop());
+    }
+  });
+
+  it.each(['async', 'retry', 'explicit'] as const)('%s refuses an unproved live daemon without any index or owner byte change', async mode => {
+    const owner = JSON.stringify({ pid: process.pid, mode: 'daemon', startedAt: Date.now() });
+    fs.writeFileSync(getWriterPidPath(root), owner);
+    const indexDir = path.join(root, '.codegraph');
+    const snapshot = () => Object.fromEntries(fs.readdirSync(indexDir).sort().map(name => [name,
+      createHash('sha256').update(fs.readFileSync(path.join(indexDir, name))).digest('hex')]));
+    const before = snapshot();
+    engine = new BuiltMCPEngine({ readOnly: true, watch: true, queryPool: true });
+    const pending = mode === 'async' ? engine.ensureInitialized(root)
+      : mode === 'retry' ? engine.retryInitialize(root)
+      : engine.getToolHandler().execute('codegraph_search', { projectPath: root, query: 'originalSymbol' });
+    await expect(pending).rejects.toMatchObject({ reason: 'unknown', projectRoot: root });
+    expect(snapshot()).toEqual(before);
+    await engine.stop();
+    expect(snapshot()).toEqual(before);
   });
 
   it('watch:false still performs the normal startup catch-up', async () => {
