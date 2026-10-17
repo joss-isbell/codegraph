@@ -245,6 +245,69 @@ describe('real MCP project ownership precedes native writes', () => {
     await engine.stop(); expect(retained.size).toBe(0);
   }), 30_000);
 
+  it('an explicit project reacquired during prior eviction keeps its new lease through the next idle release', owned(async () => {
+    const root = temp(), missing = temp(); await indexed(root); const held = route(root);
+    const policy = resolveQueryPolicy({ poolSize: '0' }, 'shared-daemon', 3);
+    // Another real reader keeps the coordinator's shared graph alive while the
+    // first engine lease returns its writer and then waits for outer observation.
+    const keeper = await acquireProject({ route: held, intent: 'read', lifetime: new AbortController().signal,
+      watchOptions: {}, admit: (selected, signal) => admitQueryProject(selected.root, policy, signal) });
+    cleanup.push(() => keeper.release());
+    let enterOldRelease!: () => void, resumeOldRelease!: () => void;
+    const oldReleaseEntered = new Promise<void>(resolve => { enterOldRelease = resolve; });
+    const oldReleaseGate = new Promise<void>(resolve => { resumeOldRelease = resolve; });
+    const retained = new Set<number>(), engineLeases: number[] = [], released: number[] = [];
+    let nextProgress = 0;
+    const observer: ProjectResourceObserver = { acquireIndexProgress: async (selected, signal) => {
+      expect(selected).toEqual(held);
+      const id = ++nextProgress; retained.add(id);
+      // Public per-request observation has no request signal in this fixture;
+      // the engine-owned acquisition always carries its actual lifetime signal.
+      if (signal) engineLeases.push(id);
+      let release: Promise<void> | undefined;
+      return { release: () => release ??= (async () => {
+        if (id === engineLeases[0]) { enterOldRelease(); await oldReleaseGate; }
+        retained.delete(id); released.push(id);
+      })() };
+    } };
+    const engine = make({ watch: true, resourceObserver: observer });
+    vi.stubEnv('CODEGRAPH_PROJECT_IDLE_TIMEOUT_MS', '0'); native.begin([root]);
+    const expireCache = async () => {
+      vi.stubEnv('CODEGRAPH_PROJECT_IDLE_TIMEOUT_MS', '1'); await sleep(5);
+      const answer = await search(engine, 'unused', missing);
+      expect(answer.isError).not.toBe(true); expect(answer.content[0]?.text).toContain("isn't indexed");
+      vi.stubEnv('CODEGRAPH_PROJECT_IDLE_TIMEOUT_MS', '0');
+    };
+    try {
+      expect((await search(engine, 'alphaOriginal', root)).content[0]?.text).toContain('alphaOriginal');
+      expect(engineLeases).toHaveLength(1); expect(readWriterLock(root)).toMatchObject({ pid: process.pid, ready: true });
+      await expireCache(); await bounded(oldReleaseEntered, 'old explicit observation release');
+      expect(readWriterLock(root)).toBeNull(); expect(keeper.cg.searchNodes('alphaOriginal').length).toBeGreaterThan(0);
+
+      // Re-enter through the normal public tool boundary while the old cache
+      // close is still pending, rather than reading or mutating engine lookups.
+      expect((await search(engine, 'alphaOriginal', root)).content[0]?.text).toContain('alphaOriginal');
+      expect(engineLeases).toHaveLength(2); expect(retained.has(engineLeases[1])).toBe(true);
+      expect(readWriterLock(root)).toMatchObject({ pid: process.pid, ready: true });
+      resumeOldRelease(); await until(() => released.includes(engineLeases[0]), 'old observation released');
+      // Join the old release's continuation before triggering another eviction.
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect((await search(engine, 'alphaOriginal', root)).content[0]?.text).toContain('alphaOriginal');
+      expect(retained.has(engineLeases[1])).toBe(true);
+
+      await expireCache();
+      await until(() => released.includes(engineLeases[1]), 'reacquired explicit observation released before engine stop');
+      expect(readWriterLock(root)).toBeNull(); expect(retained.size).toBe(0);
+      expect(keeper.cg.searchNodes('alphaOriginal').length).toBeGreaterThan(0);
+      await keeper.release(); expect(() => keeper.cg.getStats()).toThrow();
+      await engine.stop(); ownedNativeOpens();
+    } finally {
+      resumeOldRelease();
+      facts.push({ kind: 'explicit-eviction-reacquire', root, engineLeases: [...engineLeases],
+        released: [...released], retained: [...retained], owner: readWriterLock(root) });
+    }
+  }), 30_000);
+
   it.each(['unknown', 'missing', 'abort'])('%s after observer registration is rechecked before schema and primary outcome', async action => {
     await owned(async () => {
       const root = temp(); await indexed(root); const held = route(root), outcomes: InitialDefaultOutcome[] = [];

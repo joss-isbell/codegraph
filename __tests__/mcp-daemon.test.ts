@@ -1375,6 +1375,8 @@ describe('Shared MCP daemon (issue #411)', () => {
     expect(firstLocal[0].diagnostics.effective.executionMode).toBe('writable-fallback');
     const firstGeneration = firstLocal[0].generation;
     expect(firstGeneration).toBe(firstLocal[0].diagnostics.ownership.generation);
+    const firstLocalWriter = JSON.parse(fs.readFileSync(path.join(realRoot, '.codegraph/writer.pid'), 'utf8'));
+    expect(firstLocalWriter).toMatchObject({ pid: proxyPid, mode: 'fallback' });
     let nextId = 4;
     const send = (): void => {
       sendMessage(a.child, { jsonrpc: '2.0', id: nextId++, method: 'tools/call', params: { name: 'codegraph_status', arguments: {} } });
@@ -1395,6 +1397,12 @@ describe('Shared MCP daemon (issue #411)', () => {
     expect(retirement).toBeDefined();
     const replacement = trace().find(record => record.pid === proxyPid && record.event === 'engine-constructor' && record.diagnostics.ownership.generation === localCalls[1].generation);
     expect(retirement.sequence).toBeLessThan(replacement.sequence);
+    const secondLocalWriter = JSON.parse(fs.readFileSync(path.join(realRoot, '.codegraph/writer.pid'), 'utf8'));
+    expect(secondLocalWriter).toMatchObject({ pid: proxyPid, mode: 'fallback' });
+    // The same proxy must relinquish the first native reservation after drain,
+    // then acquire a NEW writer for the actual replacement engine. Keeping the
+    // old live-PID record would silently downgrade this session to read-only.
+    expect(secondLocalWriter.startedAt).toBeGreaterThan(firstLocalWriter.startedAt);
     const localHistory = actualHistory().filter(record => record.pid === proxyPid && record.root === realRoot);
     expect(localHistory.map(record => record.index)).toEqual([1,2]);
     expect(new Set(localHistory.map(record => record.historyId)).size).toBe(1);
@@ -1439,6 +1447,23 @@ describe('Shared MCP daemon (issue #411)', () => {
     expect(daemonWriter!.pid).not.toBe(firstDaemon);
     const branch = trace().filter(record => record.event === 'engine-diagnostics').map(record => record.diagnostics);
     expect(branch.some(value => value.ownership.pid === daemonWriter!.pid && value.effective.executionMode === 'shared-daemon')).toBe(true);
+    const localEngines = trace().filter(record => record.pid === proxyPid && record.event === 'engine-constructor');
+    expect(localEngines.map(record => record.diagnostics.effective.executionMode)).toEqual(['writable-fallback', 'writable-fallback']);
+    const finalDrain = trace().find(record => record.pid === proxyPid && record.event === 'engine-drain-complete' && record.generation === localCalls[1].generation);
+    const finalCandidate = trace().find(record => record.pid === proxyPid && record.event === 'candidate-spawn' && record.attempt === 'handover');
+    expect(finalDrain).toBeDefined();
+    const localGenerations = new Set(localCalls.map(record => record.generation));
+    const localWorkers = trace().filter(record => record.pid === proxyPid && record.event === 'worker-spawn' && localGenerations.has(record.execution.generation));
+    expect(new Set(localWorkers.map(record => record.execution.generation))).toEqual(localGenerations);
+    const workerKey = (record: any) => record.pid + ':' + record.workerThreadId;
+    const localWorkerKeys = localWorkers.map(workerKey).sort();
+    expect(new Set(localWorkerKeys).size).toBe(localWorkerKeys.length);
+    const localExits = trace().filter(record => record.pid === proxyPid && record.event === 'worker-exit' && localWorkerKeys.includes(workerKey(record)));
+    expect(localExits.map(workerKey).sort()).toEqual(localWorkerKeys);
+    expect(localExits.every(record => record.code === 0 || record.code === 1)).toBe(true);
+    // Another real session may win daemon election; when this proxy spawns
+    // the candidate itself, its native drain must precede that exact spawn.
+    if (finalCandidate) expect(finalDrain.sequence).toBeLessThan(finalCandidate.sequence);
 
     // The session that started during the lockout ends up on the shared daemon too.
     await waitFor(
