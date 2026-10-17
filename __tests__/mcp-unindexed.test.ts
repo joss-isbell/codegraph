@@ -4,8 +4,8 @@
  * A server whose own root has no .codegraph/ still exposes its tools — gating
  * tool AVAILABILITY on whether `./` is indexed broke monorepos (only
  * sub-projects indexed) and hid the tools from a session that started before
- * `codegraph init`. So `initialize` returns the per-project instructions
- * variant (not the full single-project playbook, and NOT an "inactive" note),
+ * `codegraph init`. So `initialize` returns truthful pending instructions
+ * with the useful query playbook, without asserting absence or permission,
  * `tools/list` exposes the tool surface, and a query against an indexed project
  * by `projectPath` works even with no default project. Safety is preserved by
  * the response SHAPE, not by hiding tools: a call against an un-indexed path
@@ -110,7 +110,7 @@ describe('No-root-index session policy', () => {
     fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
-  it('initialize returns the per-project instructions (not "inactive", not the full playbook)', async () => {
+  it('initialize gives useful pending instructions without claiming the root lacks an index', async () => {
     fs.writeFileSync(path.join(tempDir, 'index.ts'), 'export const x = 1;\n');
     child = spawnServer(tempDir);
 
@@ -123,9 +123,10 @@ describe('No-root-index session policy', () => {
     expect(instructions).toMatch(/projectPath/);
     expect(instructions).toMatch(/codegraph_explore/);
     expect(instructions).toMatch(/codegraph init/);
-    // ...but it is NOT the full single-project playbook (that's sent only when
-    // the root itself is indexed — keeps the common case tight).
-    expect(instructions).not.toMatch(/## How to query/);
+    // The one-time instructions stay useful if a default is verified later.
+    expect(instructions).toMatch(/verification is pending/);
+    expect(instructions).toMatch(/## How to query/);
+    expect(instructions).not.toMatch(/This server started somewhere with no|so there is no\s+default project/);
   });
 
   it('tools/list exposes the tools even when the server root has no index (#964)', async () => {
@@ -167,7 +168,7 @@ describe('No-root-index session policy', () => {
     expect(result.content[0]!.text).not.toMatch(/isn't indexed/);
   });
 
-  it('an INDEXED workspace still gets the full playbook and the explore tool', async () => {
+  it('a fresh INDEXED workspace gets pending instructions and tools before a real default query', async () => {
     fs.writeFileSync(path.join(tempDir, 'index.ts'), 'export function hello(): string { return "hi"; }\n');
     const cg = await CodeGraph.init(tempDir, { index: true });
     cg.close();
@@ -175,16 +176,26 @@ describe('No-root-index session policy', () => {
     child = spawnServer(tempDir);
     const init = await request(child, { id: 0, method: 'initialize', params: initializeParams(tempDir) });
     const instructions = (init.result as { instructions: string }).instructions;
+    expect(instructions).toMatch(/verification is pending/);
     expect(instructions).toMatch(/How to query/);
     expect(instructions).not.toMatch(/inactive/i);
+    expect(instructions).not.toMatch(/This server started somewhere with no|so there is no\s+default project/);
 
     const list = await request(child, { id: 1, method: 'tools/list' });
     const tools = (list.result as { tools: Array<{ name: string }> }).tools;
-    // The default surface is pared to explore alone (see DEFAULT_MCP_TOOLS) — the
-    // contract under test is "indexed → tools are PRESENT", in contrast to the
-    // unindexed empty list above.
+    // Discovery remains available before actionable default verification.
     expect(tools.length).toBeGreaterThanOrEqual(1);
     expect(tools.map((t) => t.name)).toContain('codegraph_explore');
+
+    const queried = await request(child, {
+      id: 2, method: 'tools/call',
+      params: { name: 'codegraph_search', arguments: { query: 'hello' } },
+    });
+    expect(queried.error).toBeUndefined();
+    const result = queried.result as { content: Array<{ text: string }>; isError?: boolean };
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0]!.text).toContain('hello');
+    expect(result.content[0]!.text).not.toMatch(/No CodeGraph project is loaded|isn't indexed/);
   });
 });
 

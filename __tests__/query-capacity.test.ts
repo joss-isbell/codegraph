@@ -146,7 +146,11 @@ describe('dispatcher keeps configured pooling authoritative', () => {
     await cg.indexAll();
     const context = execution();
     const handler = new ToolHandler(route === 'default' ? cg : null, context);
-    handler.setProjectLifecycle({ open: project => CodeGraph.openSync(project), activate: async () => {}, release: graph => graph.close() });
+    handler.setProjectLifecycle({ open: async (project, signal) => {
+      signal?.throwIfAborted();
+      expect(project).toEqual({ root, index: fs.realpathSync(path.join(root, '.codegraph/codegraph.db')) });
+      return CodeGraph.openSync(project.root);
+    }, activate: async () => {}, release: graph => graph.close() });
     const pool = new QueryPool({ root: null, execution: context,
       createWorker: () => new Worker(path.join(__dirname, 'fixtures/query-capacity-worker.cjs'), { workerData: { readyDelay: 150 } }) });
     handler.setQueryPool(pool);

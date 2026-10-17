@@ -44,6 +44,9 @@ import * as fs from 'fs';
 import * as net from 'net';
 import * as path from 'path';
 import { MCPEngine } from './engine';
+import type { ResolvedQueryPolicy } from './query-policy';
+import { getCodeGraphDir, captureMcpIndexRoute, assertMcpIndexRoute, McpIndexRouteUnavailableError, type McpIndexRoute } from '../directory';
+import { retainStartupProjectWriter, rollbackStartupProjectWriter, type ProjectWriterReservation } from './project-lifecycle';
 import type { QueryDiagnostics } from './query-diagnostics';
 import { MCPSession } from './session';
 import { SocketTransport } from './transport';
@@ -57,9 +60,10 @@ import {
 } from './daemon-paths';
 import { CodeGraphPackageJsonPath, CodeGraphPackageVersion } from './version';
 import {
-  releaseWriterLock,
   swapWriterLock,
   tryAcquireWriterLock,
+  getWriterPidPath,
+  decodeWriterLockInfo,
   assertNoRebuild,
   writerLockHeldMessage,
   type WriterLockInfo,
@@ -229,23 +233,32 @@ export class Daemon {
   private pidPath: string;
   /** The launcher holding the writer slot for this daemon, when it replaced an older one (#2335). */
   private handoverFrom: number | null;
+  private projectRoute: McpIndexRoute | undefined;
+  private projectWriter: ProjectWriterReservation | null = null;
+  private stopPromise: Promise<void> | null = null;
+  private engineDrainPromise: Promise<void> | null = null;
 
   constructor(
     private projectRoot: string,
-    opts: { idleTimeoutMs?: number; maxIdleMs?: number; handoverFrom?: number | null } = {},
+    opts: { idleTimeoutMs?: number; maxIdleMs?: number; handoverFrom?: number | null;
+      queryPolicy?: ResolvedQueryPolicy; queryAdmissionPolicy?: ResolvedQueryPolicy; projectRoute?: McpIndexRoute } = {},
   ) {
     this.socketPath = getDaemonSocketPath(projectRoot);
     this.pidPath = getDaemonPidPath(projectRoot);
     this.idleTimeoutMs = opts.idleTimeoutMs ?? resolveIdleTimeoutMs();
     this.maxIdleMs = opts.maxIdleMs ?? resolveMaxIdleMs();
     this.handoverFrom = opts.handoverFrom ?? null;
+    this.projectRoute = opts.projectRoute;
     // Daemon mode serves many concurrent clients on one event loop, so off-load
     // read-tool dispatch to a worker pool — otherwise concurrent explores
     // serialize and starve the MCP transport (clients time out). Direct mode
     // (one stdio client) leaves the pool off; `CODEGRAPH_QUERY_POOL_SIZE=0`
     // disables it here too.
-    this.engine = new MCPEngine({ queryPool: true, executionMode: 'shared-daemon' });
-    this.engine.setProjectPathHint(projectRoot);
+    this.engine = new MCPEngine({ queryPool: true, executionMode: 'shared-daemon',
+      queryPolicy: opts.queryPolicy, queryAdmissionPolicy: opts.queryAdmissionPolicy, projectRoute: opts.projectRoute });
+    // A legacy caller has not captured its canonical own route yet. Leave its
+    // engine inert; the opaque reservation binds that identity before init.
+    if (opts.projectRoute) this.engine.setProjectPathHint(opts.projectRoute.root);
   }
 
   /**
@@ -256,24 +269,61 @@ export class Daemon {
   async start(): Promise<DaemonStartResult> {
     // #1740: claim the project writer lock before opening/watching so a
     // concurrent direct-mode serve --mcp cannot start a second watcher.
-    assertNoRebuild(this.projectRoot);
-    let writer = tryAcquireWriterLock(this.projectRoot, 'daemon');
-    // The launcher that stopped an older daemon has held the slot for us since
-    // (#2335); take it over without letting it fall free.
-    if (writer.kind === 'taken' && this.handoverFrom !== null &&
-        writer.existing?.pid === this.handoverFrom && writer.existing.mode === 'handover') {
-      const info: WriterLockInfo = { pid: process.pid, mode: 'daemon', startedAt: Date.now(), ready: false };
-      if (swapWriterLock(this.projectRoot, this.handoverFrom, info)) {
-        writer = { kind: 'acquired', pidPath: writer.pidPath, info };
-        process.stderr.write(`[CodeGraph daemon] Took over the writer lock from launcher pid ${this.handoverFrom}, which stopped an older daemon.\n`);
+    let route: McpIndexRoute;
+    try {
+      const captured = this.projectRoute ?? captureMcpIndexRoute(this.projectRoot);
+      if (!captured) throw new McpIndexRouteUnavailableError({ root: this.projectRoot,
+        index: path.join(getCodeGraphDir(this.projectRoot), 'codegraph.db') }, 'missing');
+      assertMcpIndexRoute(captured);
+      assertNoRebuild(this.projectRoot);
+      route = captured;
+    } catch (primary) {
+      // The detached entry may already hold daemon.pid. Route failure cannot
+      // leave that exact owned record behind, and cannot create an index.
+      try { await this.cleanupLockfile(); }
+      catch (cleanup) { this.reportCleanup('missing held route cleanup', cleanup); }
+      throw primary;
+    }
+    this.projectRoute = route;
+    this.projectRoot = route.root;
+    let tookHandover = false;
+    try {
+      // No await or external callback separates observation, native acquisition
+      // (including handover), and the fallible coordinator retain.
+      const pidPath = getWriterPidPath(route.root);
+      const locator = path.join(fs.realpathSync(path.dirname(pidPath)), path.basename(pidPath));
+      let previous: WriterLockInfo | null = null;
+      try {
+        previous = decodeWriterLockInfo(fs.readFileSync(locator, 'utf8'));
+        if (!previous) throw new Error('The previous native writer record is malformed.');
+      } catch (error) { if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error; }
+      let writer = tryAcquireWriterLock(route.root, 'daemon');
+      // The launcher that stopped an older daemon has held the slot for us since
+      // (#2335); take it over without letting it fall free.
+      if (writer.kind === 'taken' && this.handoverFrom !== null &&
+          writer.existing?.pid === this.handoverFrom && writer.existing.mode === 'handover') {
+        const info: WriterLockInfo = { pid: process.pid, mode: 'daemon', startedAt: Date.now(), ready: false };
+        if (swapWriterLock(route.root, this.handoverFrom, info)) {
+          writer = { kind: 'acquired', pidPath: writer.pidPath, info };
+          tookHandover = true;
+        }
       }
+      if (writer.kind === 'taken') {
+        throw new Error(writerLockHeldMessage(writer.existing, writer.pidPath));
+      }
+      try { this.projectWriter = retainStartupProjectWriter(route, writer.info); }
+      catch (primary) {
+        try { rollbackStartupProjectWriter(route, writer, { pidPath, locator, previous }); }
+        catch (cleanup) { this.reportCleanup('unretained startup writer rollback', cleanup); }
+        throw primary;
+      }
+      this.engine.setProjectWriter(this.projectWriter);
+    } catch (primary) {
+      try { await this.cleanupLockfile(); }
+      catch (cleanup) { this.reportCleanup('writer attachment cleanup', cleanup); }
+      throw primary;
     }
-    if (writer.kind === 'taken') {
-      const msg = writerLockHeldMessage(writer.existing, writer.pidPath);
-      process.stderr.write(`[CodeGraph daemon] ${msg}\n`);
-      this.cleanupLockfile();
-      throw new Error(msg);
-    }
+    if (tookHandover) process.stderr.write(`[CodeGraph daemon] Took over the writer lock from launcher pid ${this.handoverFrom}, which stopped an older daemon.\n`);
 
     let initialLockContents: string;
     try {
@@ -281,9 +331,10 @@ export class Daemon {
       if (decodeLockInfo(initialLockContents)?.pid !== process.pid) {
         throw new Error('daemon lock belongs to another process');
       }
-    } catch {
-      releaseWriterLock(this.projectRoot);
-      throw new Error('Lost daemon lock ownership before startup.');
+    } catch (primary) {
+      try { await this.cleanupLockfile(); }
+      catch (cleanup) { this.reportCleanup('lost daemon lock cleanup', cleanup); }
+      throw primary;
     }
 
     // Walk the ordered socket candidates and bind the first that works. The
@@ -326,7 +377,8 @@ export class Daemon {
       // spin respawning us on a stale lock pointing at our now-dying pid. Then
       // re-throw so the caller (the bin's try/catch) exits this detached daemon
       // cleanly and every launcher falls back to direct mode (#974).
-      this.cleanupLockfile();
+      try { await this.cleanupLockfile(); }
+      catch (cleanup) { this.reportCleanup('bind cleanup', cleanup); }
       if (process.platform !== 'win32') {
         for (const candidate of candidates) {
           try { fs.unlinkSync(candidate); } catch { /* may not exist */ }
@@ -355,7 +407,8 @@ export class Daemon {
       refreshDaemonLock(this.pidPath, initialLockContents, lock);
     } catch (err) {
       try { bound.server.close(); } catch { /* best-effort */ }
-      this.cleanupLockfile();
+      try { await this.cleanupLockfile(); }
+      catch (cleanup) { this.reportCleanup('bound ownership cleanup', cleanup); }
       throw err;
     }
 
@@ -395,8 +448,11 @@ export class Daemon {
   }
 
   /** Graceful shutdown: close all sessions, the engine, and clean up the lock. */
-  async stop(reason: string = 'stop'): Promise<void> {
-    if (this.stopping) return;
+  stop(reason: string = 'stop'): Promise<void> {
+    return this.stopPromise ??= this.stopResources(reason);
+  }
+
+  private async stopResources(reason: string): Promise<void> {
     this.stopping = true;
     if (this.idleTimer) {
       clearTimeout(this.idleTimer);
@@ -425,12 +481,22 @@ export class Daemon {
       await new Promise<void>((resolve) => this.server!.close(() => resolve()));
       this.server = null;
     }
-    await this.engine.stop();
-    this.cleanupLockfile();
-    deregisterDaemon(this.projectRoot);
+    // A failed native drain retains writer/daemon authority and registry
+    // evidence. The cached rejection cannot become a later no-op success.
+    await this.drainEngine();
+    let failed = false, primary: unknown;
+    try { await this.cleanupLockfile(); } catch (error) {
+      if (!failed) { failed = true; primary = error; }
+      else this.reportCleanup('shutdown writer/daemon record cleanup', error);
+    }
+    try { deregisterDaemon(this.projectRoot); } catch (error) {
+      if (!failed) { failed = true; primary = error; }
+      else this.reportCleanup('shutdown registry cleanup', error);
+    }
     if (process.platform !== 'win32') {
       try { fs.unlinkSync(this.socketPath); } catch { /* may already be gone */ }
     }
+    if (failed) throw primary;
     // POSIX exits here; Windows drains first (engine.stop() above began closing
     // the file watcher, and exiting mid-teardown aborts the process). See
     // finalizeDaemonExit / DAEMON_SHUTDOWN_BACKSTOP_MS.
@@ -613,19 +679,31 @@ export class Daemon {
     return reaped;
   }
 
-  private cleanupLockfile(): void {
-    releaseWriterLock(this.projectRoot);
-    try {
-      if (fs.existsSync(this.pidPath)) {
-        // Only remove if it still belongs to us — another daemon may have
-        // already taken over while we were shutting down (extremely rare).
-        const raw = fs.readFileSync(this.pidPath, 'utf8');
-        const info = decodeLockInfo(raw);
-        if (info && info.pid === process.pid) {
-          fs.unlinkSync(this.pidPath);
-        }
+  private reportCleanup(phase: string, error: unknown): void {
+    try { process.stderr.write(`[CodeGraph daemon] ${phase}: ${String(error).slice(0, 2048)}\n`); } catch { /* preserve primary */ }
+  }
+
+  private drainEngine(): Promise<void> {
+    return this.engineDrainPromise ??= (async () => { await this.engine.stop(); })();
+  }
+
+  private async cleanupLockfile(): Promise<void> {
+    if (this.projectWriter) {
+      // Startup failure may follow reservation attachment but precede bind.
+      // Even that cleanup proves actual engine drain before releasing authority.
+      await this.drainEngine();
+      await this.projectWriter.release();
+      this.projectWriter = null;
+    }
+    if (fs.existsSync(this.pidPath)) {
+      // Only remove if it still belongs to us — another daemon may have
+      // already taken over while we were shutting down (extremely rare).
+      const raw = fs.readFileSync(this.pidPath, 'utf8');
+      const info = decodeLockInfo(raw);
+      if (info && info.pid === process.pid) {
+        fs.unlinkSync(this.pidPath);
       }
-    } catch { /* best-effort; we're exiting anyway */ }
+    }
   }
 }
 

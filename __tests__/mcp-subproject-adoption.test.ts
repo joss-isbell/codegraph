@@ -101,6 +101,10 @@ async function driveStatusCall(
     params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: CLIENT_INFO },
   });
   const initResult = await waitForMessage(messages, (m) => m.id === 0 && !!m.result, 5000);
+  send(child, { jsonrpc: '2.0', id: 2, method: 'tools/list' });
+  const listed = await waitForMessage(messages, (m) => m.id === 2, 5000);
+  expect(listed.error).toBeUndefined();
+  expect(listed.result.tools.some((tool: { name: string }) => tool.name === 'codegraph_explore')).toBe(true);
   send(child, { jsonrpc: '2.0', method: 'notifications/initialized' });
   send(child, { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'codegraph_status', arguments: {} } });
   const resp = await waitForMessage(messages, (m) => m.id === 1, 10000);
@@ -143,10 +147,12 @@ describe('MCP workspace sub-project adoption (#1606) + no-default diagnostics (#
     // The adoption is announced on stderr (#1607 discoverability).
     expect(stderr.text()).toContain('adopted the single indexed sub-project');
     expect(stderr.text()).toContain('service-a');
-    // Instructions match what the engine adopted: the FULL single-project
-    // playbook, not the per-project variant.
+    // Initialize preceded adoption: it must not predict an absent default
+    // or lose the useful playbook after this later verification.
     const instructions = initResult.result.instructions as string;
-    expect(instructions).not.toContain('per-project; pass projectPath');
+    expect(instructions).toContain('verification is pending');
+    expect(instructions).toContain('## How to query');
+    expect(instructions).not.toMatch(/This server started somewhere with no|so there is no\s+default project/);
   }, 20000);
 
   it('lists several indexed sub-projects instead of adopting one, in stderr and in tool responses', async () => {
@@ -170,9 +176,11 @@ describe('MCP workspace sub-project adoption (#1606) + no-default diagnostics (#
     // stderr carries the same facts for the host's log.
     expect(stderr.text()).toContain('no default project, live sync disabled');
     expect(stderr.text()).toContain('Indexed sub-projects found:');
-    // Ambiguous root → per-project instructions variant.
+    // The initial reply predates this conclusive ambiguous-root result.
     const instructions = initResult.result.instructions as string;
-    expect(instructions).toContain('per-project; pass projectPath');
+    expect(instructions).toContain('verification is pending');
+    expect(instructions).toContain('projectPath');
+    expect(instructions).toContain('## How to query');
   }, 20000);
 
   it('does not scan below a base that is not a workspace (no manifest, no .git)', async () => {

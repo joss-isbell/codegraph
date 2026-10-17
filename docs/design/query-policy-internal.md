@@ -1,24 +1,61 @@
-# Internal query policy and request context (Issue #9)
+# Query policy and request context
 
-This is an internal preparation seam. Public startup still uses the original
-permissive numeric parser and default 45-second pooled busy timer. Independent
-pool and waiting sentinels are available; `CODEGRAPH_QUERY_MODE` does not activate a preset yet.
-Read-only fallback remains unpooled by default; Issue #11 permits an explicitly
-selected positive finite or unlimited pool. Service compatibility and replacement
-behavior are unchanged. No installation or live service is changed.
+The Issue #29 candidate validates public query settings before MCP startup and
+captures their original values once. Direct stdio and writable fallback bind the
+strict policy selected for that mode. The combined
+`CODEGRAPH_QUERY_MODE=unlimited` preset is explicitly refused on the unwired
+shared-daemon and read-only fallback routes; those routes retain the existing
+independent-control behavior. Read-only fallback remains unpooled by default.
+This describes candidate source, not a released cross-mode capability or an
+installed-runtime change. The later sections retain the implementation history
+of Issues #9–#14.
+
+## Migrating query settings from permissive parsing
+
+Present query settings now have to be valid even when a different setting
+disables pooling. An invalid request stops before startup or service attachment;
+its error identifies the setting, original rejected value and supported values.
+Remove a setting entirely to select its mode's default. An empty or
+whitespace-only environment value is a present, invalid setting.
+
+| Former setting | Required correction in the candidate |
+| --- | --- |
+| `CODEGRAPH_QUERY_POOL_SIZE=1e3`, `0x10` or `+2` | Write decimal whole numbers, such as `1000`, `16` or `2`. Leading zeroes and surrounding whitespace are accepted. |
+| A fractional pool or timeout value, such as `2.9` or `1000.9` | Choose an explicit whole number; values are no longer silently floored. |
+| An empty, malformed, negative or formerly ignored value | Remove the environment variable for the default, or replace it with a supported value. |
+| A finite pool count above an old clamp | Supported counts now apply exactly as lazy demand ceilings, including counts above 16. The maximum is `9007199254740991`; larger counts are invalid. Use `unlimited` to remove the configured ceiling. |
+| A finite busy timeout outside `1000`–`2147483647` ms | Choose a whole number in that range, remove the setting for the default, or use `unlimited` to omit the pooled busy timer. An oversized finite timer is not the unlimited setting. |
+
+Sentinels are trimmed and case-sensitive: `default` and `unlimited` are valid
+mode values; `Default` and `UNLIMITED` are invalid. Pool size `0` deliberately
+disables pooled execution and makes the busy deadline inapplicable, while its
+timeout input still must be valid. Pool and timeout overrides take precedence
+independently. For direct/writable candidate execution, the combined preset
+removes both configured limits and requests idle retirement; a finite or zero
+override makes that policy custom. Independent
+`CODEGRAPH_QUERY_BUSY_TIMEOUT_MS=unlimited` removes only the busy timer and keeps
+ordinary finite-pool retention. Shared/read-only combined-preset refusal must be
+resolved by selecting a supported route or using supported independent controls;
+it never silently activates a legacy preset.
+
+Removing CodeGraph's query limits does not remove a host deadline or increase
+hardware capacity. Active workers can increase memory and CPU use, and a query
+after idle retirement pays the cost of starting workers again.
 
 ## Policy boundary
 
 - `query-policy.ts` keeps raw `RequestedQueryPolicy` separate from immutable
   `ResolvedQueryPolicy`. `resolveQueryPolicy` implements the settled strict
-  contract. It is not the public environment adapter until Issue #15.
+  contract. Issue #29's `captureQueryStartup` validates and freezes the public
+  request before the eventual direct/writable constructor binds that policy.
 - `resolveLegacyQueryPolicy` snapshots existing settings at engine construction.
   It preserves numeric coercion and flooring,
   ignored malformed input and numeric timeout flooring. Issue #13 adds the
   trimmed, case-sensitive independent `CODEGRAPH_QUERY_BUSY_TIMEOUT_MS=unlimited`
-  sentinel and prevents timer overflow; malformed numeric input still falls back
-  to 45 seconds until strict public validation in #15. It deliberately ignores
-  the new mode input. Its direct/writable defaults are bounded to two workers;
+  sentinel and prevents timer overflow. The legacy parser remains an internal
+  compatibility seam for existing independent controls; Issue #29's early
+  public validation rejects malformed input before reaching it. The parser
+  deliberately ignores the new mode input. Direct/writable defaults are bounded to two workers;
   shared-daemon defaults use cores minus one bounded to 1–16. Issue #10 removes
   both explicit finite override clamps; supported finite maxima are exact lazy
   demand ceilings. Read-only defaults
@@ -36,8 +73,9 @@ behavior are unchanged. No installation or live service is changed.
   authority. A supplied policy bypasses legacy pool/env reconstruction and caps.
   `QueryPool` represents an absent timer with `null`, never a huge finite timer.
   Startup pacing remains distinct from the maximum. Unlimited pool selection
-  and unused-worker retirement are implemented by #14; the strict public preset
-  and attachment safety remain downstream.
+  and unused-worker retirement are implemented by #14. Issue #29 supplies the
+  direct/writable strict preset; later shared/read-only activation remains a
+  separate delivery boundary.
 - `getQueryExecutionState` separates resolution from current construction and
   dispatch: read-only/disabled execution reports main-thread inapplicability.
   A constructed cold/recovering pool reports worker dispatch with `ready:false`;

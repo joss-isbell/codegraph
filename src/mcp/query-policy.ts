@@ -1,4 +1,4 @@
-/** Internal query contract. Public startup uses the legacy adapter until #15. */
+/** Internal query contract, captured once before public startup inspects a project. */
 export type QueryExecutionMode = 'direct' | 'writable-fallback' | 'read-only-fallback' | 'shared-daemon';
 export type QueryConcurrency = Readonly<{ kind: 'disabled' }> | Readonly<{ kind: 'finite'; maximum: number }> | Readonly<{ kind: 'unlimited' }>;
 export type QueryDeadline = Readonly<{ kind: 'finite'; milliseconds: number }> | Readonly<{ kind: 'absent' }> | Readonly<{ kind: 'inapplicable' }>;
@@ -20,6 +20,10 @@ export interface ResolvedQueryPolicy extends QueryDefaults {
   readonly preset: 'default' | 'unlimited';
   readonly classification: 'default' | 'custom' | 'unlimited';
   readonly source: 'strict' | 'legacy';
+}
+export interface QueryStartupRequest {
+  readonly requested: RequestedQueryPolicy;
+  readonly cpuCount: number;
 }
 
 export const QUERY_BUSY_TIMEOUT_MS = 45_000;
@@ -43,6 +47,13 @@ export function requestedQueryPolicy(env: NodeJS.ProcessEnv): RequestedQueryPoli
   });
 }
 
+/** Syntax preflight is independent of the execution mode selected later. */
+export function captureQueryStartup(env: NodeJS.ProcessEnv, cpuCount: number): QueryStartupRequest {
+  const requested = requestedQueryPolicy(env);
+  resolveQueryPolicy(requested, 'direct', cpuCount);
+  return immutable({ requested, cpuCount });
+}
+
 export function queryDefaults(mode: QueryExecutionMode, cpuCount: number): QueryDefaults {
   if (mode === 'read-only-fallback') return immutable({ concurrency: { kind: 'disabled' }, deadline: { kind: 'inapplicable' }, retention: 'ordinary' });
   const maximum = Math.max(1, Math.min(cpuCount - 1, mode === 'shared-daemon' ? 16 : 2));
@@ -63,7 +74,7 @@ function numericOverride(setting: string, raw: string, min: number, max: number)
   return number;
 }
 
-/** Strict final resolver, intentionally not wired to public environment input. */
+/** Resolve a captured request for the selected execution mode. */
 export function resolveQueryPolicy(requested: RequestedQueryPolicy, executionMode: QueryExecutionMode, cpuCount: number): ResolvedQueryPolicy {
   const defaults = queryDefaults(executionMode, cpuCount);
   const mode = requested.mode?.trim() ?? 'default';

@@ -39,7 +39,7 @@ const { MCPEngine } = require('../../dist/mcp/engine');
   let defaultLoaded;
   try {
     if (mode === 'initial') await engine.ensureInitialized(broken);
-    else engine.retryInitializeSync(broken);
+    else await engine.retryInitialize(broken);
     defaultLoaded = engine.hasDefaultCodeGraph();
     result = await engine.getToolHandler().execute('codegraph_search', { projectPath: valid, query: 'survivingExplicitSymbol' });
     state = engine.getQueryExecutionState();
