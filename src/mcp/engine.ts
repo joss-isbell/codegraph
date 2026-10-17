@@ -468,7 +468,7 @@ export class MCPEngine {
     const results = await Promise.allSettled(snapshot.map(lease => this.releaseProjectAcquisition(lease.acquisition)));
     // A new cache owner can join this same reader while old cleanup awaits.
     // Return only successfully released snapshot holders, never its new lease.
-    results.forEach((result, index) => { if (result.status === 'fulfilled') leases.delete(snapshot[index]); });
+    snapshot.forEach((lease, index) => { if (results[index]?.status === 'fulfilled') leases.delete(lease); });
     if (this.explicitProjects.get(cg) === leases && leases.size === 0) this.explicitProjects.delete(cg);
     const failures = results.flatMap(result => result.status === 'rejected' ? [result.reason] : []);
     if (failures.length) throw new AggregateError(failures, 'Explicit project cleanup failed');
