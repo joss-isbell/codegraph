@@ -50,6 +50,8 @@ describe('bounded freshness validation (#1959)', () => {
     await vi.advanceTimersByTimeAsync(8000);
     expect(await pending).toBeNull();
     expect(workers[0].terminate).toHaveBeenCalledOnce();
+    workers[0].emit('exit', 1);
+    await endFreshnessMeasurements();
   });
 
   it('answers unknown on deadline but never terminates a worker still loading its modules', async () => {
@@ -64,6 +66,8 @@ describe('bounded freshness validation (#1959)', () => {
     workers[0].emit('message', { type: 'loaded' });
     await vi.advanceTimersByTimeAsync(0);
     expect(workers[0].terminate).toHaveBeenCalledOnce();
+    workers[0].emit('exit', 1);
+    await endFreshnessMeasurements();
   });
 
   it('a server shutting down ends measurements once they have loaded', async () => {
@@ -75,9 +79,11 @@ describe('bounded freshness validation (#1959)', () => {
     expect(ended).toBe(false);
     expect(workers[0].terminate).not.toHaveBeenCalled();
     workers[0].emit('message', { type: 'loaded' });
-    await ending;
+    await vi.advanceTimersByTimeAsync(0);
     expect(workers[0].terminate).toHaveBeenCalled();
+    expect(ended).toBe(false);
     workers[0].emit('exit', 1); // what a terminated worker does
+    await ending;
     expect(await pending).toBeNull();
   });
 
@@ -91,6 +97,12 @@ describe('bounded freshness validation (#1959)', () => {
     expect(await pending).toBeNull();
     release();
     await Promise.resolve();
+    let ended = false;
+    const ending = endFreshnessMeasurements().then(() => { ended = true; });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ended).toBe(false);
+    workers[0].emit('exit', 1);
+    await ending;
   });
 
   it('aborts stalled file reads and reports all remaining paths as unchecked', async () => {
@@ -115,10 +127,40 @@ describe('bounded freshness validation (#1959)', () => {
     workers[1].emit('message', { type: 'counts', counts: { added: -1, modified: 0, removed: 0 } });
     expect(await first).toBeNull();
     expect(await second).toBeNull();
-    await new Promise((r) => setTimeout(r, 0)); // the slots free once each worker is terminated
+    workers[0].emit('exit', 1);
+    workers[1].emit('exit', 1);
+    await new Promise((r) => setTimeout(r, 0)); // slots free on observed native exit
     const retry = measurePendingChanges('/freshness-three');
     workers[2].emit('message', { type: 'loaded' });
     workers[2].emit('message', { type: 'counts', counts: { added: 0, modified: 1, removed: 0 } });
     expect(await retry).toEqual({ added: 0, modified: 1, removed: 0 });
+    workers[2].emit('exit', 1);
+    await endFreshnessMeasurements();
+  });
+
+  it('retains both measurement slots and shutdown until exit despite a rejected termination request', async () => {
+    vi.useFakeTimers();
+    const first = measurePendingChanges('/freshness-rejected-termination');
+    const second = measurePendingChanges('/freshness-fulfilled-without-exit');
+    workers[0].terminate.mockRejectedValue(new Error('Native termination failed'));
+    workers[0].emit('message', { type: 'loaded' });
+    workers[1].emit('message', { type: 'loaded' });
+    await vi.advanceTimersByTimeAsync(8000);
+    expect(await first).toBeNull(); expect(await second).toBeNull();
+    let ended = false;
+    const ending = endFreshnessMeasurements().then(() => { ended = true; });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(workers[0].terminate).toHaveBeenCalledOnce();
+    expect(workers[1].terminate).toHaveBeenCalledOnce();
+    expect(ended).toBe(false);
+    expect(await measurePendingChanges('/freshness-held-slots')).toBeNull();
+    expect(workers).toHaveLength(2);
+    workers[0].emit('exit', 1); workers[1].emit('exit', 1);
+    await ending; expect(ended).toBe(true);
+    const retry = measurePendingChanges('/freshness-held-slots');
+    expect(workers).toHaveLength(3);
+    workers[2].emit('message', { type: 'counts', counts: { added: 0, modified: 1, removed: 0 } });
+    expect(await retry).toEqual({ added: 0, modified: 1, removed: 0 });
+    workers[2].emit('exit', 1); await endFreshnessMeasurements();
   });
 });

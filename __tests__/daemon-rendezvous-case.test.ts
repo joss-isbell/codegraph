@@ -24,14 +24,17 @@
  * case-insensitive filesystem to converge on.
  */
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { canonicalProjectRoot } from '../src/directory';
 import { getDaemonSocketPath } from '../src/mcp/daemon-paths';
-import { acquireProject } from '../src/mcp/project-lifecycle';
-import type CodeGraph from '../src/index';
+import type { ProjectRequest } from '../src/mcp/project-lifecycle';
+const { acquireProject, admitQueryProject }: typeof import('../src/mcp/project-lifecycle') = require('../dist/mcp/project-lifecycle');
+const { captureMcpIndexRoute }: typeof import('../src/directory') = require('../dist/directory');
+const { resolveQueryPolicy }: typeof import('../src/mcp/query-policy') = require('../dist/mcp/query-policy');
+const { CodeGraph }: typeof import('../src') = require('../dist');
 
 const tmpDirs: string[] = [];
 function makeDir(): string {
@@ -105,19 +108,38 @@ describe('in-process project sharing (#2278)', () => {
   it.runIf(caseInsensitiveTmp())('opens one graph for two casings of one root', async () => {
     const root = path.join(makeDir(), 'Repo');
     fs.mkdirSync(root);
+    fs.writeFileSync(path.join(root, 'app.ts'), 'export function rendezvous() {}\n');
+    const graph = await CodeGraph.init(root);
+    let primary: { error: unknown } | undefined;
+    try { await graph.indexAll(); } catch (error) { primary = { error }; }
+    try { graph.close(); } catch (error) {
+      if (primary) process.stderr.write(`Rendezvous fixture close after ${String(primary.error).slice(0, 2048)}: ${String(error).slice(0, 2048)}\n`);
+      else primary = { error };
+    }
+    if (primary) throw primary.error;
     let opened = 0;
-    const open = () => {
-      opened++;
-      return { close() {}, isIndexing: () => false } as unknown as CodeGraph;
-    };
-    const a = acquireProject(root, open, {});
-    const b = acquireProject(path.join(path.dirname(root), 'REPO'), open, {});
+    const nativeOpen = CodeGraph.openSync;
+    const observation = vi.spyOn(CodeGraph, 'openSync').mockImplementation((...args) => { opened++; return nativeOpen(...args); });
+    const policy = resolveQueryPolicy({ poolSize: '0' }, 'shared-daemon', 3), lifetime = new AbortController();
+    let a: Awaited<ReturnType<typeof acquireProject>> | undefined, b: Awaited<ReturnType<typeof acquireProject>> | undefined;
     try {
+      const own = captureMcpIndexRoute(root), alias = captureMcpIndexRoute(path.join(path.dirname(root), 'REPO'));
+      if (!own || !alias) throw new Error('Rendezvous fixture missing own route');
+      const request: ProjectRequest = { route: own, intent: 'read', lifetime: lifetime.signal, watchOptions: {},
+        admit: (selected, signal) => admitQueryProject(selected.root, policy, signal) };
+      a = await acquireProject({ ...request, route: own });
+      b = await acquireProject({ ...request, route: alias });
       expect(opened).toBe(1);
       expect(b.cg).toBe(a.cg);
-    } finally {
-      await a.release();
-      await b.release();
+    } catch (error) { primary = { error }; }
+    finally {
+      const releases = await Promise.allSettled([a?.release(), b?.release()]);
+      observation.mockRestore();
+      for (const result of releases) if (result.status === 'rejected') {
+        if (primary) process.stderr.write(`Rendezvous lease cleanup after ${String(primary.error).slice(0, 2048)}: ${String(result.reason).slice(0, 2048)}\n`);
+        else primary = { error: result.reason };
+      }
     }
+    if (primary) throw primary.error;
   });
 });

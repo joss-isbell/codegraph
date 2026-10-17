@@ -36,6 +36,8 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
+import { requestedQueryPolicy, resolveQueryPolicy } from './query-policy';
 import { spawn, StdioOptions } from 'child_process';
 import { resolveServerRoot, getCodeGraphDir } from '../directory';
 import { StdioTransport } from './transport';
@@ -48,8 +50,9 @@ import {
   isProcessAlive,
   tryAcquireDaemonLock,
 } from './daemon';
-import { clearStaleDaemonArtifacts, stopOlderDaemon } from './daemon-registry';
+import { clearStaleDaemonArtifacts } from './daemon-registry';
 import { connectWithHello, runLocalHandshakeProxy } from './proxy';
+import { assertNoLiveQueryDaemon, assertReadableQueryOwners, readQueryServiceOwners } from './query-service-owner';
 import { CodeGraphPackageJsonPath, CodeGraphPackageVersion } from './version';
 import {
   readWriterLock,
@@ -317,51 +320,6 @@ function spawnDetachedDaemon(root: string, handover = false): void {
       try { fs.closeSync(logFd); } catch { /* ignore */ }
     }
   }
-}
-
-/**
- * How long a launcher replacing an older daemon waits for one that is partway
- * through its shutdown, past the stop's own 3s wait. Tool calls are held
- * meanwhile, so it is short: a daemon that takes longer leaves the session
- * served in-process until the proxy's next retry (#2277) finds it gone.
- */
-const OLDER_DAEMON_SHUTDOWN_GRACE_MS = 5_000;
-
-/**
- * Stop the daemon serving `root` from an older install so the caller can start
- * one from this install (#2335). A daemon keeps the code it started with: one
- * that outlived an upgrade went on loading grammars from the removed install
- * and wrote every file it re-indexed as empty, and as the project's writer it
- * kept every newer session from syncing. {@link stopOlderDaemon} finds it by
- * the project lock, verifies it, and never stops one of the same, a newer or an
- * unknown version. `answered` says an older daemon answered this launcher's
- * own probe. Resolves `stopped` (this launcher now holds the project's writer
- * slot for the daemon it starts next), `none` (no older daemon holds the
- * project), or `kept` (one does, unverified or still shutting down).
- */
-async function replaceOlderDaemon(root: string, answered: boolean): Promise<'stopped' | 'none' | 'kept'> {
-  const result = await stopOlderDaemon(root, CodeGraphPackageVersion, {
-    shutdownGraceMs: OLDER_DAEMON_SHUTDOWN_GRACE_MS,
-  });
-  // No older daemon in the lock (none, or already replaced), or it had exited.
-  if (!result || result.outcome === 'not-running') return 'none';
-  const daemon = result.version
-    ? `the CodeGraph ${result.version} daemon (pid ${result.pid})`
-    : 'an older CodeGraph daemon';
-  if (result.outcome === 'term' || result.outcome === 'kill') {
-    process.stderr.write(
-      `[CodeGraph MCP] Stopped ${daemon} serving this project; starting one from this install (${CodeGraphPackageVersion}).\n`
-    );
-    return 'stopped';
-  }
-  if (result.outcome === 'still-running') {
-    process.stderr.write(`[CodeGraph MCP] Asked ${daemon} serving this project to stop, but it has not exited yet.\n`);
-  } else if (answered) {
-    process.stderr.write(
-      `[CodeGraph MCP] Found ${daemon} serving this project but could not verify it, so left it running; serving this session in-process.\n`
-    );
-  }
-  return 'kept';
 }
 
 /**
@@ -670,26 +628,23 @@ export class MCPServer {
   /**
    * Proxy mode (the common case). Serve the MCP handshake LOCALLY for instant
    * tool registration, forwarding tool calls to the shared daemon — which is
-   * connected in the background (probed, then spawned + polled if absent; one of
-   * an older release is stopped first, #2335) so the
+   * connected in the background (probed, then spawned + polled if absent) so the
    * handshake never waits ~600ms on it. Runs until the host disconnects; the
    * proxy falls back to an in-process engine if the daemon never binds, so this
    * never wedges a session.
    */
   private async runProxyWithLocalHandshake(root: string): Promise<void> {
+    // Temporary capture until the root joins #29's immutable startup parameter.
+    const prospectivePolicy = resolveQueryPolicy(requestedQueryPolicy(process.env), 'shared-daemon', os.cpus().length);
     // The daemon may relocate its socket past an in-project filesystem that can't
     // host one (ExFAT/FAT volumes, WSL2 DrvFs; #997) to the deterministic tmpdir
-    // fallback. We don't read the bound path from the lockfile — both sides walk
-    // the SAME ordered candidate list, so we converge on whichever the daemon
-    // bound with zero coordination. The in-project candidate is tried first, so a
-    // normal repo pays nothing extra (it connects on the very first probe).
+    // fallback. Probe the usual ordered candidates first, then the project
+    // owner's recorded rendezvous for historical/noncanonical socket names.
     const candidates = getDaemonSocketCandidates(root);
     const connectAnyCandidate = async (): Promise<Awaited<ReturnType<typeof connectWithHello>>> => {
       for (const candidate of candidates) {
-        const s = await connectWithHello(candidate);
-        // A wrong-version daemon IS up — definitive; propagate so the caller
-        // replaces it (an older release) or serves in-process instead of
-        // spawning + polling for 6s. Don't keep probing fallbacks past it.
+        const s = await connectWithHello(candidate, CodeGraphPackageVersion, prospectivePolicy, root);
+        // Incompatible/unknown hello throws a terminal refusal, never null.
         if (s) return s;
       }
       return null;
@@ -697,32 +652,45 @@ export class MCPServer {
     const getDaemonSocket = async () => {
       // Fast path: a daemon may already be listening (on either candidate).
       const probe = await connectAnyCandidate();
-      if (probe === 'version-mismatch') return null; // definitive — serve in-process, don't poll for 6s
-      if (probe && probe !== 'older-version') return probe;
-      // A daemon of an older release answered — or none did, while the project
-      // lock may still name one on a socket we don't probe (on Windows, daemons
-      // before #2278 named their pipe after the root as typed). Either way it
-      // makes way for one from this install (#2335).
-      const answered = probe === 'older-version';
-      const older = await replaceOlderDaemon(root, answered);
-      if (older === 'kept' && answered) return null;
-      // None reachable — spawn one (detached) and poll for its bind. After a
-      // replacement this launcher holds the writer slot for it meanwhile.
-      try {
-        spawnDetachedDaemon(root, older === 'stopped');
-        for (let attempt = 0; attempt < DAEMON_CONNECT_MAX_RETRIES; attempt++) {
-          await sleep(DAEMON_CONNECT_RETRY_DELAY_MS);
-          const s = await connectAnyCandidate();
-          // Another version answering now, older or not, waits for the next
-          // retry: one replacement per attempt, so this can never loop.
-          if (s === 'older-version' || s === 'version-mismatch') return null;
-          if (s) return s;
+      if (probe) return probe;
+      const connectRecordedOwner = async () => {
+        const owners = readQueryServiceOwners(root);
+        assertReadableQueryOwners(root, owners);
+        if (owners.daemon.kind === 'live' && canProbeDaemonIdentity(owners.daemon.value)) {
+          return connectWithHello(owners.daemon.value.socketPath, CodeGraphPackageVersion, prospectivePolicy, root);
         }
-        return null; // never bound — the proxy serves this session in-process
-      } finally {
-        // The new daemon has taken the slot over, or never came; a no-op unless still ours.
-        if (older === 'stopped') releaseWriterLock(root);
+        return null;
+      };
+      // A live owner may be a racing compatible daemon still binding. Wait and
+      // inspect, without taking its slot or spawning a competing candidate.
+      let owners = readQueryServiceOwners(root);
+      assertReadableQueryOwners(root, owners);
+      if (owners.daemon.kind === 'live') {
+        for (let attempt = 0; attempt < DAEMON_CONNECT_MAX_RETRIES; attempt++) {
+          const existing = await connectRecordedOwner();
+          if (existing) return existing;
+          await sleep(DAEMON_CONNECT_RETRY_DELAY_MS);
+          const usual = await connectAnyCandidate();
+          if (usual) return usual;
+          owners = readQueryServiceOwners(root);
+          assertReadableQueryOwners(root, owners);
+          if (owners.daemon.kind !== 'live') break;
+        }
       }
+      assertNoLiveQueryDaemon(root, owners);
+      // No unproved daemon remains. A separate ordinary writer can still make
+      // a genuinely unavailable candidate select accurate read-only fallback.
+      // #29's serial bootstrap join supplies the permitted/candidate-PID gate.
+      spawnDetachedDaemon(root);
+      for (let attempt = 0; attempt < DAEMON_CONNECT_MAX_RETRIES; attempt++) {
+        await sleep(DAEMON_CONNECT_RETRY_DELAY_MS);
+        const usual = await connectAnyCandidate();
+        if (usual) return usual;
+        const recorded = await connectRecordedOwner();
+        if (recorded) return recorded;
+      }
+      assertNoLiveQueryDaemon(root);
+      return null;
     };
     await runLocalHandshakeProxy({ getDaemonSocket, makeEngine: () => makeFallbackEngine(root), root });
   }

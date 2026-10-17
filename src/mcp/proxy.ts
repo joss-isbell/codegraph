@@ -30,15 +30,19 @@ import { EARLY_PPID } from './early-ppid';
 import { supervisionLostReason } from './ppid-watchdog';
 import { armStartupHandshakeTimeout } from './startup-handshake';
 import { treatStdinFailureAsShutdown } from './stdin-teardown';
-import { CodeGraphPackageVersion, isOlderRelease } from './version';
-import { SERVER_INFO, PROTOCOL_VERSION, initializeInstructions } from './session';
-import { SERVER_INSTRUCTIONS } from './server-instructions';
+import { CodeGraphPackageVersion } from './version';
+import { assertCompatibleQueryService, isServicePolicyRefusal, readSharedQueryService, servicePolicyRefusal, type ServicePolicyRefusal } from './query-service-compatibility';
+import { assertQueryServiceOwner } from './query-service-owner';
+import { SERVER_INFO, PROTOCOL_VERSION, initializeInstructions, type MCPSession } from './session';
+import { SERVER_INSTRUCTIONS, SERVER_INSTRUCTIONS_PENDING } from './server-instructions';
 import { getStaticTools } from './tools';
-import { ErrorCodes } from './transport';
+import { ErrorCodes, ParsedMessageTransport, type JsonRpcResponse } from './transport';
+import type { McpIndexRoute } from '../directory';
 import { ExploreSessionState } from './explore-session-state';
 import { getTelemetry, ClientInfo } from '../telemetry';
 import { installMainThreadWatchdog, WatchdogHandle } from './liveness-watchdog';
-import type { MCPEngine } from './engine';
+import type { MCPEngine, InitialDefaultOutcome } from './engine';
+import type { ProjectResourceObserver, IndexProgressLease } from './project-lifecycle';
 import { QUERY_CLEANUP_BOUNDS } from './query-pool';
 
 /** Default poll cadence for the PPID watchdog (same as the direct server). */
@@ -54,13 +58,137 @@ const DEFAULT_DAEMON_RETRY_MS = 5_000;
 const DEFAULT_DAEMON_RETRY_MAX_MS = 300_000;
 
 /**
- * Longest the proxy waits, once it is shutting down, for its in-process engines
- * to stop before exiting anyway. An engine's stop waits up to
+ * Longest the proxy waits, once it is shutting down, for its owned sockets to
+ * close and its in-process engines to stop before exiting anyway. An engine's stop waits up to
  * the distinct startup allowance for a query worker still starting up (exiting
  * mid-start can crash the process on Windows), after the abandoned drain and
  * before final cleanup. These provisional v1 bounds never apply to handover.
  */
 const SHUTDOWN_BACKSTOP_MS = QUERY_CLEANUP_BOUNDS.drainMs + QUERY_CLEANUP_BOUNDS.startupMs + QUERY_CLEANUP_BOUNDS.cleanupMs;
+
+/** Native close is an event, not the stream's earlier closed/destroyed flags.
+ * Weak identity retains prior facts; the strong map holds only open resources. */
+interface OwnedSocketObservation {
+  socket: net.Socket;
+  actualCloseObserved: boolean;
+  hadError: boolean;
+  firstError?: unknown;
+  furtherError?: unknown;
+  unavailableError?: unknown;
+  destroyError?: unknown;
+  completion: Promise<OwnedSocketObservation>;
+  startupClose?: Promise<void>;
+}
+
+const ownedSocketObservations = new WeakMap<net.Socket, OwnedSocketObservation>();
+const activeOwnedSockets = new Map<net.Socket, OwnedSocketObservation>();
+let includeInSocketDrain: ((observation: OwnedSocketObservation) => void) | null = null;
+
+function observeOwnedSocket(socket: net.Socket): OwnedSocketObservation {
+  const existing = ownedSocketObservations.get(socket);
+  if (existing) return existing;
+  let complete!: (observation: OwnedSocketObservation) => void;
+  const observation: OwnedSocketObservation = {
+    socket, actualCloseObserved: false, hadError: false,
+    // Always resolves, even on failure: no rejected orphan cleanup promise.
+    completion: new Promise(resolve => { complete = resolve; }),
+  };
+  const onError = (error: Error): void => {
+    if (observation.firstError === undefined) observation.firstError = error;
+    else observation.furtherError ??= error;
+  };
+  socket.on('error', onError);
+  socket.once('close', (hadError: boolean) => {
+    observation.actualCloseObserved = true;
+    observation.hadError = hadError;
+    socket.removeListener('error', onError);
+    activeOwnedSockets.delete(socket);
+    complete(observation);
+  });
+  ownedSocketObservations.set(socket, observation);
+  activeOwnedSockets.set(socket, observation);
+  // A connection created by an already-running acquisition during shutdown
+  // belongs to the same drain, with native observers installed before destroy.
+  includeInSocketDrain?.(observation);
+  return observation;
+}
+
+function ownedSocketFailure(observation: OwnedSocketObservation): unknown {
+  // An ordinary pre-connect availability cause is not a cleanup failure.
+  const error = observation.firstError === observation.unavailableError
+    ? observation.furtherError ?? observation.destroyError
+    : observation.firstError ?? observation.furtherError ?? observation.destroyError;
+  if (error !== undefined) return error;
+  if (observation.hadError && observation.unavailableError === undefined) {
+    return new Error('owned daemon socket closed with an unobserved error');
+  }
+  return undefined;
+}
+
+/** Join the creation-time native close observation; never infer it from flags
+ * or install a late observer after shutdown may already have closed the peer. */
+export function closeOwnedDaemonSocket(socket: net.Socket): Promise<void> {
+  const observation = ownedSocketObservations.get(socket);
+  if (!observation) return Promise.reject(new Error('Daemon socket has no original ownership observation'));
+  if (observation.startupClose) return observation.startupClose;
+  observation.startupClose = (async () => {
+    const deadline = performance.now() + 1500;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      if (!observation.actualCloseObserved) {
+        const timeout = new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('Owned startup daemon socket native close incomplete')), 1500);
+        });
+        try { socket.destroy(); } catch (error) { observation.destroyError ??= error; }
+        try {
+          await Promise.race([observation.completion, timeout]);
+          if (performance.now() >= deadline) throw new Error('Owned startup daemon socket native close incomplete');
+        } catch (primary) {
+          const retained = ownedSocketFailure(observation);
+          if (retained !== undefined) throw new AggregateError([retained, primary], 'Owned startup daemon socket cleanup incomplete');
+          throw primary;
+        }
+      } else await observation.completion;
+      const error = ownedSocketFailure(observation);
+      if (error !== undefined) throw error;
+    } finally { if (timer) clearTimeout(timer); }
+  })();
+  return observation.startupClose;
+}
+
+function beginOwnedSocketDrain(selected: Iterable<net.Socket>): { complete(): Promise<unknown> } {
+  // This collection exists only during process shutdown, including connections
+  // that close before acquisition returns. Normal retirement keeps no history.
+  const included = new Set<OwnedSocketObservation>();
+  const include = (observation: OwnedSocketObservation): void => {
+    if (included.has(observation)) return;
+    included.add(observation);
+    if (!observation.actualCloseObserved) {
+      try { observation.socket.destroy(); }
+      catch (error) { observation.destroyError ??= error; }
+    }
+  };
+  includeInSocketDrain = include;
+  for (const socket of selected) include(observeOwnedSocket(socket));
+  for (const observation of activeOwnedSockets.values()) include(observation);
+  return {
+    async complete(): Promise<unknown> {
+      // Acquisition and engine stops settle before this final drain. Repeat
+      // for any late observed socket; only its actual close resolves completion.
+      while ([...included].some(observation => !observation.actualCloseObserved)) {
+        await Promise.all([...included].map(observation => observation.completion));
+      }
+      for (const observation of included) {
+        // Retain the original ordinary availability cause without turning a
+        // healthy ENOENT/ECONNREFUSED fallback into cleanup failure. Any other
+        // earlier error, subsequent error or destroy failure stays significant.
+        const error = ownedSocketFailure(observation);
+        if (error !== undefined) return error;
+      }
+      return undefined;
+    },
+  };
+}
 
 /**
  * Env var that opts INTO the "attached to shared daemon" log line. Off by
@@ -120,7 +248,7 @@ export async function runProxy(
   }
 
   const socket = net.createConnection(socketPath);
-  socket.setEncoding('utf8');
+  observeOwnedSocket(socket);
 
   const hello = await readHelloLine(socket).catch((err) => {
     socket.destroy();
@@ -141,6 +269,7 @@ export async function runProxy(
 
   logAttachedDaemon(socketPath, hello);
 
+  socket.setEncoding('utf8');
   sendClientHello(socket);
   startPpidWatchdog(socket);
   await pipeUntilClose(socket);
@@ -151,22 +280,55 @@ export async function runProxy(
 }
 
 /**
- * Connect to a daemon at `socketPath` and verify its hello (exact version match).
- * Returns the live socket (hello already consumed), null if unreachable / stale,
- * or — for a daemon of another version — `'older-version'` when it runs an older
- * release ({@link isOlderRelease}; the launcher replaces it, #2335) and
- * `'version-mismatch'` for any other version, which is left alone. Unlike
- * {@link runProxy} it does NOT pipe — the caller owns the socket. Used by the
- * local-handshake proxy's background connect.
+ * Verify actual shared behavior and exact wire implementation before returning
+ * a socket. Null means native absence before any connection; a connected peer
+ * without a usable proof is a typed unknown refusal.
+ * An explicit project root also requires matching live owner records. Unlike
+ * {@link runProxy} this does not pipe; the caller owns the verified socket.
+ * It remains paused until the caller installs its consumer and resumes it.
  */
 export async function connectWithHello(
   socketPath: string,
   expectedVersion: string = CodeGraphPackageVersion,
   prospectivePolicy: ResolvedQueryPolicy = resolveLegacyQueryPolicy(requestedQueryPolicy(process.env), 'shared-daemon', os.cpus().length),
-): Promise<net.Socket | 'older-version' | 'version-mismatch' | null> {
-  if (process.platform !== 'win32' && !fs.existsSync(socketPath)) return null;
-  const socket = net.createConnection(socketPath);
-  socket.setEncoding('utf8');
+  projectRoot?: string,
+): Promise<net.Socket | null> {
+  const observed = await connectObservedService(socketPath, projectRoot ?? socketPath);
+  if (!observed) return null;
+  const { socket, hello } = observed;
+  try {
+    assertCompatibleQueryService(hello, expectedVersion, prospectivePolicy, projectRoot ?? socketPath);
+    if (projectRoot) assertQueryServiceOwner(projectRoot, hello);
+  }
+  catch (error) { socket.destroy(); throw error; }
+  logAttachedDaemon(socketPath, hello);
+  sendClientHello(socket, prospectivePolicy);
+  return socket;
+}
+
+/** Internal resource channel for status/catch-up only. This validates live
+ * implementation/ownership but never supplies a caller's policy permission.
+ * The caller installs its status consumer before resuming the paused socket. */
+export async function connectForProjectFreshness(socketPath: string, root: string): Promise<net.Socket | null> {
+  const observed = await connectObservedService(socketPath, root);
+  if (!observed) return null;
+  const { socket, hello } = observed;
+  try {
+    readSharedQueryService(hello, CodeGraphPackageVersion, root);
+    assertQueryServiceOwner(root, hello);
+  } catch (error) { socket.destroy(); throw error; }
+  sendClientHello(socket, null);
+  return socket;
+}
+
+/** One bounded hello transport for admission and resource observation alike. */
+async function connectObservedService(socketPath: string, refusalRoot: string): Promise<{ socket: net.Socket; hello: DaemonHello } | null> {
+  let socket: net.Socket;
+  try { socket = net.createConnection(socketPath); }
+  catch { throw servicePolicyRefusal('unknown', refusalRoot, 'shared-service connection could not be observed'); }
+  const ownership = observeOwnedSocket(socket);
+  let connected = false;
+  socket.once('connect', () => { connected = true; });
   // Keep an 'error' listener attached for the socket's ENTIRE life. readHelloLine
   // attaches its own and then REMOVES it on success (its cleanup()), which left a
   // window — from here until the caller attaches its onDaemonLost handler — where
@@ -175,28 +337,35 @@ export async function connectWithHello(
   // process.exit(1); to an MCP client that surfaces as a bare "Transport closed"
   // (#974). The window is rarely hit on a healthy FS but is common on flaky
   // AF_UNIX-over-DrvFs (WSL2 /mnt drives). A no-op guard makes the error
-  // recoverable: the follow-up 'close' drives the caller's normal fallback.
-  socket.on('error', () => { /* absorbed — see #974; 'close' drives the fallback */ });
-  const hello = await readHelloLine(socket).catch(() => null);
+  // recoverable by the caller's classification, without an uncaught exception.
+  socket.on('error', () => { /* observed by hello/acquisition or attached-session listeners */ });
+  const hello = await readHelloLine(socket).catch((error: unknown) => {
+    socket.destroy();
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    if (!connected && (code === 'ENOENT' || code === 'ECONNREFUSED')) {
+      ownership.unavailableError = error;
+      return null;
+    }
+    throw servicePolicyRefusal('unknown', refusalRoot, connected
+      ? 'a connected shared-service peer did not prove a usable hello'
+      : 'shared-service transport availability could not be proved');
+  });
   if (!hello) {
     socket.destroy();
-    return null; // no daemon yet — caller should keep polling
+    return null; // no connection was established; owner classification still follows
   }
-  if (hello.codegraph !== expectedVersion) {
-    // A daemon IS up but it's the wrong version — definitive, not a "not yet".
+  if (socketUnusableForAttachment(socket)) {
     socket.destroy();
-    // An older release is the launcher's to replace (#2335); it says what it did.
-    if (isOlderRelease(hello.codegraph, expectedVersion)) return 'older-version';
-    // Any other: don't poll; the caller serves in-process so we never run stale-vs-new.
-    process.stderr.write(
-      `[CodeGraph MCP] Found a daemon on ${socketPath} but version (${hello.codegraph}) ` +
-      `differs from ours (${expectedVersion}); serving this session in-process.\n`
-    );
-    return 'version-mismatch';
+    throw servicePolicyRefusal('unknown', refusalRoot, 'the observed shared-service socket closed before attachment');
   }
-  logAttachedDaemon(socketPath, hello);
-  sendClientHello(socket, prospectivePolicy);
-  return socket;
+  // Hello framing consumes raw bytes. Decode subsequent RPCs only after the
+  // complete hello, while paused so its exact buffered tail cannot be lost.
+  socket.setEncoding('utf8');
+  return { socket, hello };
+}
+
+function socketUnusableForAttachment(socket: net.Socket): boolean {
+  return socket.destroyed || socket.closed || socket.readableEnded || socket.writableEnded || !socket.readable || !socket.writable;
 }
 
 /**
@@ -208,10 +377,10 @@ export async function connectWithHello(
  * socket-close lifecycle). `hostPid` mirrors the PPID watchdog: the threaded
  * host pid if set, else our own parent (the host, on a no-relaunch bundle).
  */
-function sendClientHello(socket: net.Socket, queryPolicy: ResolvedQueryPolicy = resolveLegacyQueryPolicy(requestedQueryPolicy(process.env), 'shared-daemon', os.cpus().length)): void {
+function sendClientHello(socket: net.Socket, queryPolicy: ResolvedQueryPolicy | null = resolveLegacyQueryPolicy(requestedQueryPolicy(process.env), 'shared-daemon', os.cpus().length)): void {
   const clientHello: DaemonClientHello = {
     codegraph_client: 1,
-    queryPolicy,
+    ...(queryPolicy ? { queryPolicy } : {}),
     pid: process.pid,
     hostPid: parseHostPpid(process.env[HOST_PPID_ENV]) ?? EARLY_PPID,
   };
@@ -223,8 +392,8 @@ type JsonRpc = Record<string, unknown>;
 /** Dependencies the local-handshake proxy needs, injected by MCPServer (which
  *  owns the daemon-spawn machinery and the engine factory). */
 export interface LocalHandshakeDeps {
-  /** Probe (replacing a daemon of an older release, #2335) → spawn → retry →
-   *  hello-verify; resolves a connected daemon socket, or null when the daemon
+  /** Probe ownership/compatibility → optional spawn → retry → hello-verify;
+   *  resolves a connected daemon socket, or null when the daemon
    *  path is genuinely unavailable (→ in-process fallback). */
   getDaemonSocket(): Promise<net.Socket | null>;
   /** Lazily create an in-process engine — used only while the daemon is
@@ -233,7 +402,31 @@ export interface LocalHandshakeDeps {
   makeEngine(): MCPEngine;
   /** Project root for the fallback engine's lazy init. */
   root: string;
+  /** Release caller-owned fallback reservations after engines/borrowers drain.
+   * Resource-only and joined once by the outer cached shutdown; never exits. */
+  stop?: () => Promise<void>;
 }
+
+export interface LocalHandshakePreparationControls {
+  readonly resourceObserver: ProjectResourceObserver;
+  readonly onInitialDefaultOutcome: (outcome: InitialDefaultOutcome) => void;
+}
+
+/** Prepared permission/route decisions belong to the caller, never this shell. */
+export type PreparedLocalHandshake =
+  | { readonly kind: 'proxy'; readonly deps: LocalHandshakeDeps }
+  | {
+      readonly kind: 'direct';
+      readonly route: McpIndexRoute | null;
+      readonly makeSession: (transport: ParsedMessageTransport, signal: AbortSignal) => Promise<MCPSession>;
+      /** Resource-only, cached and safe before factory invocation; never exits. */
+      readonly stop: () => Promise<void>;
+    };
+
+export type LocalHandshakeInput = LocalHandshakeDeps | {
+  readonly hint: string;
+  readonly prepare: (signal: AbortSignal, controls: LocalHandshakePreparationControls) => Promise<PreparedLocalHandshake>;
+};
 
 /**
  * Local-handshake proxy (the cold-start fix).
@@ -254,15 +447,41 @@ export interface LocalHandshakeDeps {
  * proxy retries the daemon with backoff, handing the writer lock back first,
  * and proxies again once one answers.
  */
-export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<void> {
+export async function runLocalHandshakeProxy(input: LocalHandshakeInput): Promise<void> {
   // The proxy is long-lived and can serve fallback tool calls in-process. Match
   // direct/daemon mode by killing this launcher if its main thread wedges, so an
   // MCP host retry cannot accumulate abandoned `serve --mcp` wrapper processes.
-  const livenessWatchdog: WatchdogHandle | null = installMainThreadWatchdog();
-  let daemonStatus: 'connecting' | 'ready' | 'failed' = 'connecting';
+  let livenessWatchdog: WatchdogHandle | null = installMainThreadWatchdog();
+  const preparationLifetime = new AbortController();
+  let selectedKind: 'preparing' | 'proxy' | 'direct' = 'prepare' in input ? 'preparing' : 'proxy';
+  let deps: LocalHandshakeDeps | null = 'prepare' in input ? null : input;
+  const proxyDeps = (): LocalHandshakeDeps => {
+    if (selectedKind !== 'proxy' || !deps) throw new Error('No prepared proxy route');
+    return deps;
+  };
+  const rootHint = 'prepare' in input ? input.hint : input.root;
+  type ProvisionalRequest = { line: string; controller: AbortController; commit?: () => void };
+  const readinessQueue: Array<{ line: string; parsed: unknown; request?: ProvisionalRequest }> = [];
+  let originalInitialize: JsonRpc | undefined;
+  let direct: Extract<PreparedLocalHandshake, { kind: 'direct' }> | null = null;
+  let directTransport: ParsedMessageTransport | null = null;
+  let directSession: MCPSession | null = null;
+  let directReady = false;
+  let activation: Promise<void> | null = null;
+  let selection: Promise<void> | null = null;
+  let directResourceStop: Promise<void> | null = null;
+  let directStopPromise: Promise<void> | null = null;
+  const directCalls = new Set<Promise<void>>();
+  let daemonStatus: 'connecting' | 'ready' | 'failed' | 'refused' = 'connecting';
+  let policyRefusal: ServicePolicyRefusal | null = null;
   let daemonSocket: net.Socket | null = null;
-  let clientInitId: unknown = undefined;   // suppress the daemon's reply to the forwarded initialize
+  // A verified result is not attached authority yet. Retain loss observation
+  // across the await/attachment handoff, including an already-emitted close.
+  const attachmentGuards = new Map<net.Socket, () => void>();
+  const acquisitions = new Set<Promise<net.Socket | null>>();
   let clientInitLine: string | undefined;  // replayed to a daemon that comes up mid-session (#2277)
+  const locallyAnsweredInitializes = new Map<string, unknown>();
+  let primeDaemonInitialize: ((line: string) => void) | null = null;
   // Telemetry attribution for the in-process fallback only — calls routed to
   // the daemon are counted by the daemon's own session (which receives the
   // forwarded initialize, clientInfo included), never double-counted here.
@@ -274,7 +493,113 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   const localCalls = new Set<Promise<void>>();
   // Engines retired but not yet stopped; shutdown() waits for them too.
   const retiring = new Set<MCPEngine>();
+  // Reuse the exact retirement attempt on shutdown. A rejected native drain
+  // cannot become a successful second stop/no-op or release caller authority.
+  const retirementDrains = new WeakMap<MCPEngine, Promise<void>>();
+  let handoverFailure: { readonly reason: unknown } | null = null;
   let shuttingDown = false;
+  const progressReferences = new Map<string, number>();
+  let watchedPaths: string[] = [];
+  let watchdogQueue: Promise<void> = Promise.resolve();
+  let watchdogStop: Promise<void> | null = null;
+  let watchdogFailed = false;
+  let watchdogFailure: unknown;
+  // Cache the bounded actual-close wait too: a failed close cannot acquire an
+  // additional allowance on shutdown or authorize a replacement child.
+  const watchdogCloses = new WeakMap<WatchdogHandle, Promise<void>>();
+  const closeWatchdog = (handle: WatchdogHandle): Promise<void> => {
+    const existing = watchdogCloses.get(handle);
+    if (existing) return existing;
+    const closing = (async () => {
+      let timer: NodeJS.Timeout | undefined;
+      // Start before stop(): native teardown and its observers consume the
+      // same allowance. Neither synchronous observation nor a later shutdown
+      // join can restart this absolute deadline.
+      const deadline = performance.now() + QUERY_CLEANUP_BOUNDS.cleanupMs;
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('Native watchdog close incomplete')), QUERY_CLEANUP_BOUNDS.cleanupMs);
+      });
+      try {
+        handle.stop();
+        await Promise.race([handle.closed, timeout]);
+        if (performance.now() >= deadline) throw new Error('Native watchdog close incomplete');
+      } finally { if (timer) clearTimeout(timer); }
+    })();
+    watchdogCloses.set(handle, closing);
+    return closing;
+  };
+  const replaceWatchdog = (): Promise<void> => {
+    const replacement = watchdogQueue.then(async () => {
+      if (watchdogFailed) throw watchdogFailure;
+      if (shuttingDown || watchdogStop) return;
+      const currentPaths = (): string[] => [...new Set([...progressReferences.keys()].flatMap(index => [index, `${index}-wal`]))].sort();
+      const paths = currentPaths();
+      if (paths.length === watchedPaths.length && paths.every((value, i) => value === watchedPaths[i])) return;
+      if (livenessWatchdog) await closeWatchdog(livenessWatchdog);
+      livenessWatchdog = null;
+      if (shuttingDown || watchdogStop) return;
+      // Cancellation/release can change references during actual native close.
+      // A stale pre-wait set must never arm progress for a cancelled borrower.
+      const livePaths = currentPaths();
+      // Disabled/degraded installation remains null as before. Permission is
+      // independently established by the actual caller after this async wait.
+      livenessWatchdog = installMainThreadWatchdog({ progressPaths: livePaths });
+      watchedPaths = livePaths;
+    });
+    watchdogQueue = replacement.catch(error => { watchdogFailed = true; watchdogFailure = error; });
+    return replacement;
+  };
+  const stopWatchdog = (): Promise<void> => {
+    if (watchdogStop) return watchdogStop;
+    // Set the stop promise before any queued continuation can rearm.
+    watchdogStop = watchdogQueue.then(async () => {
+      progressReferences.clear();
+      if (livenessWatchdog) await closeWatchdog(livenessWatchdog);
+      livenessWatchdog = null;
+      if (watchdogFailed) throw watchdogFailure;
+    });
+    return watchdogStop;
+  };
+  const resourceObserver: ProjectResourceObserver = {
+    async acquireIndexProgress(route, signal): Promise<IndexProgressLease> {
+      if (shuttingDown || watchdogStop || signal?.aborted) throw new Error('Index progress registration cancelled');
+      // route.index is the already captured canonical DATABASE FILE. No root
+      // discovery, selector recapture, schema read or permission verdict here.
+      const index = route.index;
+      progressReferences.set(index, (progressReferences.get(index) ?? 0) + 1);
+      let releasePromise: Promise<void> | null = null;
+      const release = (): Promise<void> => {
+        if (releasePromise) return releasePromise;
+        const count = progressReferences.get(index) ?? 0;
+        if (count <= 1) progressReferences.delete(index);
+        else progressReferences.set(index, count - 1);
+        releasePromise = replaceWatchdog();
+        return releasePromise;
+      };
+      const onAbort = (): void => {
+        // Drop the reference synchronously before a pending native close can
+        // finish. Its queued replacement remains independently joined below.
+        void release().catch(error => {
+          try { process.stderr.write(`[CodeGraph MCP] Cancelled index progress cleanup incomplete: ${String(error).slice(0, 512)}.\n`); }
+          catch { /* preserve original registration failure and sticky watchdog loss */ }
+        });
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
+      try {
+        await replaceWatchdog();
+        if (shuttingDown || watchdogStop || signal?.aborted) throw new Error('Index progress registration cancelled');
+        return { release };
+      } catch (primary) {
+        // Release the failed registration without masking its original cause.
+        try { await release(); }
+        catch (cleanup) {
+          try { process.stderr.write(`[CodeGraph MCP] Index progress cleanup incomplete: ${String(cleanup).slice(0, 512)}.\n`); }
+          catch { /* preserve primary; failed native close remains sticky */ }
+        }
+        throw primary;
+      } finally { signal?.removeEventListener('abort', onAbort); }
+    },
+  };
   const retryBaseMs = parseDelayMs(process.env.CODEGRAPH_DAEMON_RETRY_MS, DEFAULT_DAEMON_RETRY_MS);
   const retryMaxMs = Math.max(retryBaseMs, parseDelayMs(process.env.CODEGRAPH_DAEMON_RETRY_MAX_MS, DEFAULT_DAEMON_RETRY_MAX_MS));
   let retryDelayMs = retryBaseMs;
@@ -285,7 +610,12 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   // new session starts), these would otherwise hang forever; we re-serve them
   // in-process so the host always gets a reply.
   const inflight = new Map<unknown, string>();
-  const requests = new Map<unknown, { line: string; controller: AbortController; commit?: () => void }>();
+  const requests = new Map<unknown, ProvisionalRequest>();
+  const liveReadiness = (item: typeof readinessQueue[number]): boolean => {
+    const message = item.parsed && typeof item.parsed === 'object' ? item.parsed as JsonRpc : {};
+    return message.id === undefined || !message.method || message.method === 'initialize'
+      || requests.get(message.id) === item.request;
+  };
   // Explore call history for the ONE host connection this proxy serves (CG-17).
   // Only the daemon-unavailable fallback below uses it; when the daemon is up,
   // the tracking happens on the daemon's own MCPSession.
@@ -315,29 +645,142 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
       return true; // stream backpressure still means the write was accepted
     } catch { return false; }
   };
+  const refuseLine = (line: string, parsed?: unknown): void => {
+    if (!policyRefusal) return;
+    let message: JsonRpc;
+    try { message = (parsed === undefined ? JSON.parse(line) : parsed) as JsonRpc; } catch { return; }
+    if (!message || typeof message !== 'object') return;
+    if (parsed === undefined ? !liveLine(line) :
+      message.id !== undefined && message.method && message.method !== 'initialize' && requests.get(message.id)?.line !== line) return;
+    if (message.id === undefined || !message.method || message.method === 'initialize') return;
+    const { code, reason, projectRoot, guidance } = policyRefusal;
+    writeClient({ jsonrpc: '2.0', id: message.id, error: { code: -32603,
+      message: policyRefusal.message, data: { code, reason, projectRoot, guidance } } });
+    requests.delete(message.id); inflight.delete(message.id);
+  };
+  const refuseAcquisition = (error: ServicePolicyRefusal): void => {
+    if (shuttingDown || policyRefusal) return;
+    policyRefusal = error;
+    daemonStatus = 'refused';
+    if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+    process.stderr.write(`[CodeGraph MCP] ${error.message}\n`);
+    if (selectedKind === 'proxy') for (const line of pending.splice(0)) refuseLine(line);
+    else {
+      for (const item of readinessQueue) if (liveReadiness(item)) refuseLine(item.line, item.parsed);
+      pending.length = 0;
+    }
+    readinessQueue.length = 0;
+    // The actual session owns delegated pending calls and their history
+    // delivery. Stopping it here would silently abandon their typed answers.
+    directSession?.refuseInitialDefault(error);
+  };
+  const dispatchDirect = (parsed: unknown): void => {
+    if (shuttingDown || !directTransport || !directReady) return;
+    // Never await here: a pending tool can need a roots response or cancellation
+    // from the very next stdin message. The real session owns request lifetime.
+    const call = directTransport.accept(parsed);
+    directCalls.add(call);
+    const done = (): void => { directCalls.delete(call); };
+    void call.then(done, error => {
+      done();
+      process.stderr.write(`[CodeGraph MCP] Direct dispatch failed: ${String(error)}.\n`);
+    });
+  };
+  const stopDirectResources = (): Promise<void> | null => {
+    // No descriptor yet is not a completed stop. Selection may return one
+    // after EOF; that exact descriptor must still receive its one resource stop.
+    if (!direct) return null;
+    if (!directResourceStop) {
+      const descriptor = direct;
+      directResourceStop = Promise.resolve().then(() => descriptor.stop());
+      void directResourceStop.catch(() => { /* joined by stopDirect below */ });
+    }
+    return directResourceStop;
+  };
+  const stopDirect = (): Promise<void> => {
+    if (directStopPromise) return directStopPromise;
+    directReady = false;
+    const failures: unknown[] = [];
+    try { directTransport?.stop(); } catch (error) { failures.push(error); }
+    try { directSession?.stop(); } catch (error) { failures.push(error); }
+    // Initiate cancellation BEFORE joining a factory that may need this very
+    // resource stop to finish. The same promise is retained for the final join.
+    stopDirectResources();
+    directStopPromise = (async () => {
+      // Join raw selection, not its refusal handler (which can itself call us).
+      // Closing selection starts late descriptor cleanup before returning.
+      await Promise.allSettled([selection]);
+      try { directSession?.stop(); } catch (error) { failures.push(error); }
+      const completed = await Promise.allSettled([stopDirectResources(), ...directCalls]);
+      for (const result of completed) if (result.status === 'rejected') failures.push(result.reason);
+      if (failures.length) throw new AggregateError(failures, 'Direct resource cleanup incomplete');
+    })();
+    return directStopPromise;
+  };
   const shutdown = (): void => {
     if (shuttingDown) return; shuttingDown = true;
+    preparationLifetime.abort();
+    directReady = false;
+    const stopPrepared = stopDirect();
     for (const request of requests.values()) request.controller.abort();
     requests.clear(); inflight.clear(); pending.length = 0;
-    try { livenessWatchdog?.stop(); } catch { /* ignore */ }
     if (retryTimer) clearTimeout(retryTimer);
-    try { daemonSocket?.destroy(); } catch { /* ignore */ }
-    // Exit once every engine has stopped, a retiring one included: exiting while
+    const sockets = new Set(attachmentGuards.keys());
+    if (daemonSocket) sockets.add(daemonSocket);
+    for (const release of attachmentGuards.values()) {
+      release();
+    }
+    const socketDrain = beginOwnedSocketDrain(sockets);
+    // Exit once every owned socket has closed and every engine has stopped,
+    // a retiring one included: exiting while
     // a query worker is still starting up can crash the process on Windows (see
     // QueryPool.destroy), and stopping releases the writer lock. The backstop
     // bounds a stop that never settles; it stays ref'd so the process lives
     // until one of the two exits it.
     setTimeout(() => {
-      process.stderr.write(`[CodeGraph MCP] In-process engine did not stop within ${SHUTDOWN_BACKSTOP_MS}ms; exiting anyway.\n`);
+      process.stderr.write(`[CodeGraph MCP] Owned sockets or in-process engines did not stop within ${SHUTDOWN_BACKSTOP_MS}ms; exiting anyway.\n`);
       process.exit(1);
     }, SHUTDOWN_BACKSTOP_MS);
     const stopping = [engine, ...retiring].map((e) => Promise.resolve().then(() => {
+      const retiringDrain = e && retirementDrains.get(e);
+      if (retiringDrain) return retiringDrain;
       e?.cancelQuerySession?.(sessionId);
       return e?.stop();
     }));
-    void Promise.allSettled(stopping).then(results => {
+    // An in-flight acquisition can create/return sockets after stdin closes.
+    // Keep the process-owned drain armed until those producers and engines stop.
+    // Selection can reveal proxy deps after EOF. Join it and every borrowed
+    // engine/call before releasing that exact descriptor's reservation hook.
+    const stopProxyResources = (async () => {
+      await Promise.allSettled([selection, ...acquisitions, ...localCalls]);
+      const drains = await Promise.allSettled(stopping);
+      const failed = drains.filter((result): result is PromiseRejectedResult => result.status === 'rejected');
+      // A failed native drain retains the exact caller reservation/resources.
+      // Repeating engine.stop (possibly a no-op) cannot establish completion.
+      if (failed.length) throw new AggregateError(failed.map(result => result.reason), 'Owned engine drain incomplete; caller resources retained');
+      await deps?.stop?.();
+    })();
+    // Fence replacement immediately via shuttingDown, but retain the current
+    // native protection until actual SQLite/resource work has drained.
+    let resourceDrainIncomplete = false;
+    const stopSupervision = Promise.allSettled([...stopping, stopPrepared, stopProxyResources])
+      .then(results => {
+        const failed = results.filter((result): result is PromiseRejectedResult => result.status === 'rejected');
+        if (failed.length) {
+          resourceDrainIncomplete = true;
+          throw new AggregateError(failed.map(result => result.reason), 'Resource drain incomplete; native protection retained');
+        }
+        return stopWatchdog();
+      });
+    void Promise.allSettled([...acquisitions, ...stopping, stopPrepared, stopProxyResources, stopSupervision]).then(async results => {
+      const socketError = await socketDrain.complete();
       const incomplete = results.filter(result => result.status === 'rejected');
+      if (socketError !== undefined) incomplete.push({ status: 'rejected', reason: socketError });
       for (const result of incomplete) process.stderr.write(`[CodeGraph MCP] Intentional cleanup incomplete: ${String(result.reason)}.\n`);
+      // Failed native/resource drain retains its leases/progress until the
+      // already armed original backstop. Do not claim a clean early exit or
+      // discard protection while a poisoned owned handle remains live.
+      if (resourceDrainIncomplete) return;
       process.exit(incomplete.length ? 1 : 0);
     });
   };
@@ -345,10 +788,17 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   // engine is being retired still finishes on it.
   const ensureEngine = async (): Promise<MCPEngine> => {
     // shutdown() stops only the engines it can see; never start one after it.
+    if (handoverFailure) throw handoverFailure.reason;
     if (!engine && shuttingDown) throw new Error('codegraph is shutting down');
     if (!engine) {
-      engine = deps.makeEngine();
-      engineReady = engine.ensureInitialized(deps.root).catch(() => { /* degraded */ });
+      engine = proxyDeps().makeEngine();
+      engineReady = engine.ensureInitialized(proxyDeps().root).catch(error => {
+        // This is initial engine acquisition, regardless of which canonical
+        // own root a workspace/subfolder hint resolves to. Later explicit-target
+        // refusals from an initialized handler remain scoped to that request.
+        if (isServicePolicyRefusal(error)) { refuseAcquisition(error); throw error; }
+        /* ordinary no-index/open failures retain degraded guidance */
+      });
     }
     const current = engine;
     await engineReady;
@@ -360,22 +810,45 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
     const retired = engine;
     engine = null;
     engineReady = null;
-    if (retired) retiring.add(retired);
-    try {
+    if (!retired) return !handoverFailure;
+    retiring.add(retired);
+    const draining = (async () => {
       await Promise.allSettled([...localCalls]);
-      if (retired) {
-        if (retired.drain) await retired.drain();
-        else await retired.stop();
-      }
-      if (retired) retiring.delete(retired);
+      if (retired.drain) await retired.drain();
+      else await retired.stop();
+    })();
+    retirementDrains.set(retired, draining);
+    try {
+      await draining;
+      retiring.delete(retired);
       return true;
     } catch (error) {
-      process.stderr.write(`[CodeGraph MCP] Fallback handover incomplete; owned engine retained: ${error instanceof Error ? error.message : String(error)}.\n`);
+      // Latch before any new factory/dispatch. Keep this engine and its exact
+      // rejected drain in the existing retiring lifetime through the backstop.
+      if (!handoverFailure) handoverFailure = { reason: error };
+      let message: string;
+      try { message = (error instanceof Error ? error.message : String(error)).slice(0, 512); }
+      catch { message = 'Owned engine cleanup incomplete (unprintable failure)'; }
+      try { process.stderr.write(`[CodeGraph MCP] Fallback handover incomplete; owned engine retained: ${message}.\n`); }
+      catch { /* the original drain remains latched and joined below */ }
+      // These requests still belong to the proxy, never to a replacement
+      // session. Settle once before shutdown fences output, without committing
+      // explore history or inventing a query-policy refusal.
+      for (const [id, request] of [...requests]) {
+        if (requests.get(id) !== request) continue;
+        requests.delete(id); inflight.delete(id);
+        if (!request.controller.signal.aborted) writeClient({ jsonrpc: '2.0', id,
+          error: { code: -32603, message, data: { code: 'CODEGRAPH_CLEANUP_INCOMPLETE' } } });
+        request.controller.abort();
+      }
+      pending.length = 0;
+      shutdown();
       return false;
     }
   };
   // Daemon-unavailable fallback: serve a client message in-process.
   const handleLocally = (line: string): Promise<void> => {
+    if (daemonStatus === 'refused') { refuseLine(line); return Promise.resolve(); }
     const call = serveLocally(line);
     localCalls.add(call);
     const done = (): void => { localCalls.delete(call); };
@@ -404,6 +877,17 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
         getTelemetry().recordUsage('mcp_tool', params.name, !result.isError, telemetryClient);
       } catch (err) {
         if (shuttingDown || !liveLine(line) || request?.controller.signal.aborted) return;
+        if (isServicePolicyRefusal(err)) {
+          // Factory/primary refusal is terminal; a running engine's explicit
+          // target refusal belongs only to this request and leaves alpha alive.
+          let primary = true;
+          try { primary = fs.realpathSync(proxyDeps().root) === err.projectRoot; } catch { /* unproved primary stays terminal */ }
+          if (policyRefusal || !engine || primary) { if (!policyRefusal) refuseAcquisition(err); refuseLine(line); return; }
+          writeClient({ jsonrpc: '2.0', id, error: { code: -32603, message: err.message,
+            data: { code: err.code, reason: err.reason, projectRoot: err.projectRoot, guidance: err.guidance } } });
+          requests.delete(id); inflight.delete(id);
+          return;
+        }
         writeClient({ jsonrpc: '2.0', id, error: { code: -32603, message: err instanceof Error ? err.message : String(err) } });
         requests.delete(id);
       }
@@ -418,10 +902,12 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
     }
     // initialize already answered locally; notifications (initialized) need no reply.
   };
-  const routeToDaemon = (line: string): void => {
+  const routeToDaemon = (line: string, parsed?: unknown): void => {
     if (shuttingDown) return;
+    let request: ProvisionalRequest | undefined;
     try {
-      const message = JSON.parse(line) as JsonRpc;
+      const value = parsed === undefined ? JSON.parse(line) : parsed;
+      const message = value && typeof value === 'object' ? value as JsonRpc : {};
       if (message.method === 'notifications/cancelled') {
         const id = (message.params as { requestId?: unknown } | undefined)?.requestId;
         requests.get(id)?.controller.abort();
@@ -429,13 +915,23 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
         for (let i = pending.length - 1; i >= 0; i--) if (!liveLine(pending[i]!)) pending.splice(i, 1);
       } else if (message.id !== undefined && message.method && message.method !== 'initialize') {
         if (requests.has(message.id)) return;
-        requests.set(message.id, { line, controller: new AbortController() });
+        request = { line, controller: new AbortController() };
+        requests.set(message.id, request);
       }
     } catch { /* preserve ordinary malformed-message handling */ }
+    if (selectedKind !== 'proxy') {
+      if (daemonStatus === 'refused') { refuseLine(line, parsed); return; }
+      readinessQueue.push({ line, parsed, request });
+      pending.push(line);
+      return;
+    }
     if (daemonStatus === 'ready' && daemonSocket) {
       trackInflight(line);
+      primeDaemonInitialize?.(line);
       if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] proxy->daemon ${line.slice(0, 80)}\n`);
       try { daemonSocket.write(line.endsWith('\n') ? line : line + '\n'); } catch { /* close path */ }
+    } else if (daemonStatus === 'refused') {
+      refuseLine(line);
     } else if (daemonStatus === 'failed') {
       void handleLocally(line);
     } else {
@@ -457,10 +953,20 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
       const line = stdinBuf.slice(0, idx).trim();
       stdinBuf = stdinBuf.slice(idx + 1);
       if (!line) continue;
-      let msg: JsonRpc; try { msg = JSON.parse(line) as JsonRpc; } catch { routeToDaemon(line); continue; }
+      let parsed: unknown;
+      try { parsed = JSON.parse(line); }
+      catch {
+        if (selectedKind === 'proxy') routeToDaemon(line);
+        else writeClient({ jsonrpc: '2.0', id: null, error: { code: ErrorCodes.ParseError, message: 'Parse error' } });
+        continue;
+      }
+      if (directReady) { dispatchDirect(parsed); continue; }
+      const msg = parsed && typeof parsed === 'object' ? parsed as JsonRpc : {};
       if (msg.method === 'initialize') {
-        clientInitId = msg.id;
+        if (selectedKind !== 'proxy' && originalInitialize) { routeToDaemon(line, parsed); continue; }
+        if (!originalInitialize) originalInitialize = msg;
         clientInitLine = line;
+        locallyAnsweredInitializes.set(line, msg.id);
         const initParams = (msg.params ?? {}) as { clientInfo?: { name?: unknown; version?: unknown } };
         if (initParams.clientInfo) {
           telemetryClient = {
@@ -468,8 +974,9 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
             version: typeof initParams.clientInfo.version === 'string' ? initParams.clientInfo.version : undefined,
           };
         }
-        writeClient({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: { tools: {} }, serverInfo: SERVER_INFO, instructions: initializeInstructions(SERVER_INSTRUCTIONS) } });
-        routeToDaemon(line); // prime the daemon so it resolves the project (its reply is suppressed below)
+        const instructions = selectedKind === 'proxy' ? SERVER_INSTRUCTIONS : SERVER_INSTRUCTIONS_PENDING;
+        writeClient({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: { tools: {} }, serverInfo: SERVER_INFO, instructions: initializeInstructions(instructions) } });
+        routeToDaemon(line, parsed); // replay after selection; suppress only the one early reply
       } else if (msg.method === 'tools/list') {
         writeClient({ jsonrpc: '2.0', id: msg.id, result: { tools: getStaticTools() } });
       } else if (msg.method === 'resources/list') {
@@ -487,7 +994,7 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
         // daemon connection and was lost if the client closed stdin first. (#2084)
         writeClient({ jsonrpc: '2.0', id: msg.id, error: { code: ErrorCodes.MethodNotFound, message: 'Method not found: server/discover' } });
       } else {
-        routeToDaemon(line);
+        routeToDaemon(line, parsed);
       }
     }
   });
@@ -496,6 +1003,12 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   // instead of a clean close; destroying the stream stops a hung fd from
   // busy-spinning the event loop (#799).
   treatStdinFailureAsShutdown(shutdown);
+  if ('prepare' in input) {
+    // The prepared shell is the sole process supervisor. Its caller must not
+    // retain MCPServer's old direct signal handlers or a second stdin loop.
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
+  }
   startPpidWatchdogNoSocket(shutdown);
   // Backstop for a launch abandoned before any of the above can see it: killed
   // launcher + held-open pipes + reparent that beat the EARLY_PPID capture
@@ -511,31 +1024,60 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   });
 
   // ---- daemon connection (background) ----
-  const connectDaemon = async (): Promise<net.Socket | null> => {
-    let socket: net.Socket | null = null;
-    try { socket = await deps.getDaemonSocket(); } catch { socket = null; }
-    // `socket.destroyed`: the connect-window error guard above can absorb an
-    // 'error' that already destroyed the socket before we got here (#974) — treat
-    // a dead socket as "no daemon" so we cleanly fall back to the in-process engine.
-    if (socket && (socket.destroyed || shuttingDown)) {
-      try { socket.destroy(); } catch { /* ignore */ }
-      socket = null;
-    }
-    return socket;
+  const connectDaemon = (): Promise<net.Socket | null> => {
+    if (shuttingDown || policyRefusal || selectedKind !== 'proxy') return Promise.resolve(null);
+    const acquisition = (async (): Promise<net.Socket | null> => {
+      let socket: net.Socket | null = null;
+      try { socket = await proxyDeps().getDaemonSocket(); }
+      catch (error) {
+        if (isServicePolicyRefusal(error)) refuseAcquisition(error);
+        socket = null;
+      }
+      if (!socket) return null;
+      observeOwnedSocket(socket);
+      if (shuttingDown) { try { socket.destroy(); } catch { /* host shutdown */ } return null; }
+      const observed = socket;
+      const onUnprovedLoss = (): void => refuseBeforeAttachment(observed);
+      const release = (): void => {
+        observed.removeListener('error', onUnprovedLoss);
+        observed.removeListener('close', onUnprovedLoss);
+        attachmentGuards.delete(observed);
+      };
+      attachmentGuards.set(observed, release);
+      observed.once('error', onUnprovedLoss);
+      observed.once('close', onUnprovedLoss);
+      // Listeners precede this recheck: close may already have happened before
+      // the dependency returned, or may arrive before attachDaemon takes over.
+      if (socketUnusableForAttachment(observed)) {
+        refuseBeforeAttachment(observed);
+        return null;
+      }
+      return observed;
+    })();
+    acquisitions.add(acquisition);
+    void acquisition.then(() => { acquisitions.delete(acquisition); }, () => { acquisitions.delete(acquisition); });
+    return acquisition;
+  };
+  const refuseBeforeAttachment = (socket: net.Socket): void => {
+    attachmentGuards.get(socket)?.();
+    if (daemonSocket === socket) daemonSocket = null;
+    try { socket.destroy(); } catch { /* refusal still settles pending work */ }
+    if (!shuttingDown && !policyRefusal) refuseAcquisition(servicePolicyRefusal('unknown', proxyDeps().root,
+      'the verified shared-service socket closed before attachment'));
   };
   // Every buffered call binds to the engine now, so a later retirement waits for all of them.
   const serveBufferedLocally = (): void => {
     for (const line of pending.splice(0)) if (liveLine(line)) void handleLocally(line);
   };
   const scheduleDaemonRetry = (): void => {
-    if (shuttingDown || retryTimer || retryBaseMs <= 0) return;
+    if (shuttingDown || selectedKind !== 'proxy' || daemonStatus === 'refused' || retryTimer || retryBaseMs <= 0) return;
     const delay = retryDelayMs;
     retryDelayMs = Math.min(retryDelayMs * 2, retryMaxMs);
     retryTimer = setTimeout(() => { retryTimer = null; void retryDaemon(); }, delay);
     retryTimer.unref?.();
   };
   const retryDaemon = async (): Promise<void> => {
-    if (shuttingDown || daemonStatus !== 'failed') return;
+    if (shuttingDown || selectedKind !== 'proxy' || daemonStatus !== 'failed') return;
     // While a writing engine owns writer.pid no daemon can start (#2277). Hand
     // the lock back first, once the calls it is serving have answered, and
     // buffer new calls until a daemon answers or we resume in-process. One
@@ -543,10 +1085,10 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
     const handover = engine !== null && !engine.isReadOnly();
     if (handover) {
       daemonStatus = 'connecting';
-      if (!await retireEngine()) { daemonStatus = 'failed'; return; }
+      if (!await retireEngine()) return; // failed drain already owns terminal shutdown
     }
     const socket = await connectDaemon();
-    if (shuttingDown) return;
+    if (shuttingDown || policyRefusal) return;
     if (socket) {
       process.stderr.write('[CodeGraph MCP] Shared daemon reachable; proxying this session to it instead of serving in-process.\n');
       attachDaemon(socket, true);
@@ -560,11 +1102,24 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   };
 
   const attachDaemon = (socket: net.Socket, replayInitialize: boolean): void => {
+    if (shuttingDown || policyRefusal || socketUnusableForAttachment(socket)) {
+      refuseBeforeAttachment(socket);
+      return;
+    }
     daemonSocket = socket;
     daemonStatus = 'ready';
     attachedAt = Date.now();
     let sockBuf = '';
-    socket.setEncoding('utf8');
+    // Count only initializes actually written to THIS attachment. Consuming
+    // one reply cannot suppress a later ping/tool that reuses its wire ID.
+    const initializeReplies = new Map<unknown, number>();
+    primeDaemonInitialize = (line: string): void => {
+      if (daemonSocket !== socket || !locallyAnsweredInitializes.has(line)) return;
+      const id = locallyAnsweredInitializes.get(line);
+      initializeReplies.set(id, (initializeReplies.get(id) ?? 0) + 1);
+    };
+    // Preserve any pending raw UTF8 prefix decoded after hello by the transport.
+    if (socket.readableEncoding !== 'utf8') socket.setEncoding('utf8');
     socket.on('data', (chunk: string) => {
       if (shuttingDown || daemonSocket !== socket) return; // a retired attachment cannot answer a replacement
       sockBuf += chunk;
@@ -579,7 +1134,12 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
         if (resp && resp.id !== undefined && ('result' in resp || 'error' in resp)) {
           // Suppress the daemon's reply to the initialize we forwarded to prime it
           // (the client already got the local handshake response).
-          if (clientInitId !== undefined && resp.id === clientInitId) continue;
+          const remaining = initializeReplies.get(resp.id) ?? 0;
+          if (remaining) {
+            if (remaining === 1) initializeReplies.delete(resp.id);
+            else initializeReplies.set(resp.id, remaining - 1);
+            continue;
+          }
           const forwarded = inflight.get(resp.id);
           if (!forwarded || !liveLine(forwarded)) continue; // cancelled/duplicate/old-generation response
           inflight.delete(resp.id);
@@ -588,53 +1148,153 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
         writeClient(line);
       }
     });
-    // The daemon going away does NOT end the session (#662). An MCP host can
-    // SIGTERM the shared daemon when another session starts; if we exited here,
-    // this host would silently lose CodeGraph and any in-flight request would
-    // hang. Instead, fall back to the in-process engine until a daemon answers
-    // again, and re-serve whatever the dead daemon never answered.
+    // Losing a transport does not establish service unavailability: the same
+    // live owner may still be reachable, with an unknown/incompatible policy.
+    // Buffer orphaned and new work until acquisition classifies it, even when
+    // periodic fallback retries are disabled. Only genuine unavailability may
+    // replay work through an exceptional local engine.
     const onDaemonLost = (): void => {
       if (shuttingDown || daemonSocket !== socket) return; // host teardown, or already handled
-      daemonStatus = 'failed';
+      daemonStatus = 'connecting';
       daemonSocket = null;
+      primeDaemonInitialize = null;
       try { socket.destroy(); } catch { /* ignore */ }
       process.stderr.write(
-        `[CodeGraph MCP] Shared daemon connection lost; serving this session in-process (degraded), re-serving ${inflight.size} in-flight request(s).\n`
+        `[CodeGraph MCP] Shared daemon connection lost; rechecking service compatibility before replaying ${inflight.size} in-flight request(s).\n`
       );
       const orphaned = [...inflight.values()];
       inflight.clear();
-      for (const line of orphaned) if (liveLine(line)) void handleLocally(line);
+      pending.unshift(...orphaned.filter(liveLine));
       // A link that stayed up past the longest wait starts the backoff over; one
       // that keeps dropping right after it attaches keeps backing off.
       if (Date.now() - attachedAt >= retryMaxMs) retryDelayMs = retryBaseMs;
-      scheduleDaemonRetry();
+      void (async () => {
+        const replacement = await connectDaemon();
+        if (shuttingDown || policyRefusal) return;
+        if (replacement) {
+          attachDaemon(replacement, true);
+          return;
+        }
+        daemonStatus = 'failed';
+        process.stderr.write('[CodeGraph MCP] Shared daemon unavailable; serving this session in-process (degraded).\n');
+        serveBufferedLocally();
+        scheduleDaemonRetry();
+      })();
     };
     socket.on('close', onDaemonLost);
     socket.on('error', onDaemonLost);
+    if (socketUnusableForAttachment(socket)) {
+      refuseBeforeAttachment(socket);
+      return;
+    }
+    // The attached-session loss handlers now own this exact usable socket.
+    attachmentGuards.get(socket)?.();
     // A daemon that came up mid-session has never seen this client: prime its
     // session with the client's own initialize, whose reply is suppressed
     // above like the first one.
     if (replayInitialize && clientInitLine !== undefined) {
+      primeDaemonInitialize(clientInitLine);
       try { socket.write(clientInitLine + '\n'); } catch { /* close path */ }
     }
     for (const line of pending) {
       if (!liveLine(line)) continue;
       trackInflight(line);
+      primeDaemonInitialize(line);
       if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] proxy-flush ${line.slice(0, 80)}\n`);
       try { socket.write(line + '\n'); } catch { /* ignore */ }
     }
     pending.length = 0;
+    // The hello reader paused before unshifting any glued RPC tail. Every
+    // relay/loss handler and buffered request identity is now installed.
+    socket.resume();
   };
 
-  const socket = await connectDaemon();
-  if (socket) {
-    attachDaemon(socket, false);
-  } else if (!shuttingDown) {
-    daemonStatus = 'failed';
-    process.stderr.write('[CodeGraph MCP] Shared daemon unavailable; serving this session in-process (degraded).\n');
-    serveBufferedLocally();
-    scheduleDaemonRetry();
-  }
+  const selectPrepared = async (): Promise<void> => {
+    if ('prepare' in input) {
+      const prepared = await input.prepare(preparationLifetime.signal, {
+        resourceObserver,
+        onInitialDefaultOutcome: outcome => {
+          if (outcome.kind === 'refused') refuseAcquisition(outcome.refusal);
+        },
+      });
+      if (prepared.kind === 'direct') {
+        selectedKind = 'direct'; direct = prepared;
+        if (shuttingDown || preparationLifetime.signal.aborted) { stopDirectResources(); return; }
+        if (policyRefusal) { await stopDirectResources(); return; }
+        activation = (async () => {
+          let suppressInitialize = false;
+          directTransport = new class extends ParsedMessageTransport {
+            override send(response: JsonRpcResponse): boolean {
+              if (suppressInitialize && response.id === originalInitialize?.id) {
+                suppressInitialize = false;
+                return true;
+              }
+              return super.send(response);
+            }
+          }(writeClient);
+          let factoryProgress: IndexProgressLease | null = null;
+          let factoryFailed = false;
+          try {
+            if (prepared.route) factoryProgress = await resourceObserver.acquireIndexProgress(prepared.route, preparationLifetime.signal);
+            if (shuttingDown || preparationLifetime.signal.aborted || policyRefusal) return;
+            // Actual factory/engine admission must refresh after the observer
+            // await. This temporary ref covers known-route factory work; its
+            // real project leases cover subsequent work and late selections.
+            directSession = await prepared.makeSession(directTransport, preparationLifetime.signal);
+          } catch (primary) { factoryFailed = true; throw primary; }
+          finally {
+            try { await factoryProgress?.release(); }
+            catch (cleanup) {
+              if (!factoryFailed) throw cleanup;
+              try { process.stderr.write(`[CodeGraph MCP] Factory progress cleanup incomplete: ${String(cleanup).slice(0, 512)}.\n`); }
+              catch { /* preserve actual factory failure; native loss stays sticky */ }
+            }
+          }
+          if (shuttingDown || preparationLifetime.signal.aborted) return; // cached stop joins/disposes this late session
+          directSession.start();
+          if (policyRefusal) directSession.refuseInitialDefault(policyRefusal);
+          if (originalInitialize) {
+            suppressInitialize = true;
+            try { await directTransport.accept(originalInitialize); }
+            finally { suppressInitialize = false; }
+          }
+          if (shuttingDown || preparationLifetime.signal.aborted) return;
+          // Extract survivors before relinquishing provisional bookkeeping.
+          // The real session alone owns controllers and explore history now.
+          const ready = readinessQueue.splice(0).filter(liveReadiness);
+          requests.clear(); inflight.clear(); pending.length = 0;
+          directReady = true;
+          for (const item of ready) if (item.parsed !== originalInitialize) dispatchDirect(item.parsed);
+        })();
+        await activation;
+        return;
+      }
+      selectedKind = 'proxy'; deps = prepared.deps;
+      if (shuttingDown || preparationLifetime.signal.aborted) return; // cached outer shutdown joins this late hook
+      if (policyRefusal) return;
+      readinessQueue.length = 0;
+    }
+    if (shuttingDown || preparationLifetime.signal.aborted) return;
+    const socket = await connectDaemon();
+    if (socket) attachDaemon(socket, false);
+    else if (!shuttingDown && !policyRefusal) {
+      daemonStatus = 'failed';
+      process.stderr.write('[CodeGraph MCP] Shared daemon unavailable; serving this session in-process (degraded).\n');
+      serveBufferedLocally(); scheduleDaemonRetry();
+    }
+  };
+  // Parser and ONE outer supervision lifetime precede this handled promise.
+  // A failed direct factory is terminal; it never enters daemon/fallback code.
+  selection = Promise.resolve().then(selectPrepared);
+  void selection.catch(async error => {
+    if (shuttingDown) return;
+    refuseAcquisition(isServicePolicyRefusal(error) ? error :
+      servicePolicyRefusal('unknown', rootHint, `prepared MCP route failed: ${error instanceof Error ? error.message : String(error)}`));
+    if (direct) {
+      try { await stopDirect(); }
+      catch (cleanupError) { process.stderr.write(`[CodeGraph MCP] Direct resource cleanup incomplete: ${String(cleanupError)}.\n`); shutdown(); }
+    }
+  });
 
   await new Promise<void>(() => { /* stdin keeps the loop alive; exit via shutdown() */ });
 }
@@ -673,26 +1333,36 @@ function startPpidWatchdogNoSocket(onDeath: () => void): void {
  */
 function readHelloLine(socket: net.Socket): Promise<DaemonHello> {
   return new Promise((resolve, reject) => {
-    let buffer = '';
+    let buffer = Buffer.alloc(0);
     const cleanup = () => {
       socket.removeListener('data', onData);
       socket.removeListener('error', onError);
       socket.removeListener('close', onClose);
       clearTimeout(timer);
     };
-    const onData = (chunk: string | Buffer) => {
-      buffer += typeof chunk === 'string' ? chunk : chunk.toString('utf8');
-      const idx = buffer.indexOf('\n');
-      if (idx === -1) {
-        if (buffer.length > MAX_HELLO_LINE_BYTES) {
-          cleanup();
-          reject(new Error('daemon hello line exceeded size limit'));
-        }
+    const onData = (chunk: Buffer) => {
+      if (!Buffer.isBuffer(chunk)) {
+        cleanup();
+        reject(new Error('daemon hello transport did not provide raw bytes'));
         return;
       }
-      const line = buffer.slice(0, idx);
-      // Re-emit anything past the newline so the pipe-stage sees it.
-      const tail = buffer.slice(idx + 1);
+      const idx = chunk.indexOf(10);
+      const prefix = idx === -1 ? chunk : chunk.subarray(0, idx);
+      // Count RAW bytes before LF, including CR and incomplete UTF8 prefixes.
+      // The check also applies when LF is in this same received chunk; bytes
+      // after LF belong to the next consumer and do not consume this budget.
+      if (buffer.length + prefix.length > MAX_HELLO_LINE_BYTES) {
+        cleanup();
+        reject(new Error('daemon hello line exceeded size limit'));
+        return;
+      }
+      buffer = Buffer.concat([buffer, prefix]);
+      if (idx === -1) return;
+      const line = buffer.toString('utf8');
+      const tail = chunk.subarray(idx + 1);
+      // Removing data listeners does not pause a flowing stream. Preserve the
+      // exact raw tail until the verified caller installs all its handlers.
+      socket.pause();
       cleanup();
       if (tail.length > 0) {
         // Push back via unshift — Node's net.Socket supports it on readable streams.
@@ -761,6 +1431,7 @@ function pipeUntilClose(socket: net.Socket): Promise<void> {
       process.stderr.write(`[CodeGraph MCP] daemon socket error: ${err.message}\n`);
       done();
     });
+    socket.resume();
   });
 }
 

@@ -441,7 +441,7 @@ describe('MCP query pool with real projects (#1465)', () => {
       expect(missing.content[0].text).toContain('No CodeGraph project');
       // A default index can appear after rootless workers are already warm.
       await indexProject('workspace', 'lateSymbol');
-      activeEngine.retryInitializeSync(workspace);
+      await activeEngine.retryInitialize(workspace);
       const late = await handler.execute('codegraph_explore', { query: 'lateSymbol' });
       expect(late.isError).toBeFalsy();
       expect(late.content[0].text).toContain('lateSymbol');
