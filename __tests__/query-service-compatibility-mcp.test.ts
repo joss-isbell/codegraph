@@ -52,6 +52,10 @@ describe('shared query-service compatibility through actual MCP', () => {
       // actual foreign answer rather than stopping before the explicit route.
       const defaultReply = await peer.tool('codegraph_search', { query: 'copiedOwnerAlphaOnly' }, 100);
       const explicitReply = await peer.tool('codegraph_search', { query: 'copiedOwnerAlphaOnly', projectPath: beta }, 101);
+      // Unlike the terminal beta proxy's followup, this is an actual explicit
+      // admission on the still-healthy alpha engine and must independently
+      // prove that beta's copied owner serves beta, not merely this process.
+      const admittedExplicitReply = await owner.tool('codegraph_search', { query: 'copiedOwnerAlphaOnly', projectPath: beta }, 204);
       let freshnessError: unknown;
       try {
         const socket = await connectForProjectFreshness(socketPath, beta);
@@ -59,11 +63,12 @@ describe('shared query-service compatibility through actual MCP', () => {
         evidence.freshnessReturnedSocket = !!socket;
       } catch (error) { freshnessError = error; }
       evidence.defaultReply = defaultReply; evidence.explicitReply = explicitReply;
+      evidence.admittedExplicitReply = admittedExplicitReply;
       evidence.freshnessError = freshnessError instanceof Error ? { message: freshnessError.message, ...freshnessError } : freshnessError;
       evidence.afterState = { alpha: snapshot(alpha), beta: snapshot(beta) };
       const after = parseQueryDiagnostics((await owner.tool('codegraph_status', {}, 202)).result); evidence.after = after;
       const healthy = await owner.tool('codegraph_search', { query: 'copiedOwnerAlphaOnly' }, 203); evidence.healthy = healthy;
-      isUnknown(defaultReply, 100); isUnknown(explicitReply, 101);
+      isUnknown(defaultReply, 100); isUnknown(explicitReply, 101); isUnknown(admittedExplicitReply, 204);
       expect(freshnessError).toMatchObject({ code: 'CODEGRAPH_QUERY_POLICY_REFUSED', reason: 'unknown', projectRoot: beta });
       expect(evidence.freshnessReturnedSocket).toBeUndefined();
       expect(evidence.afterState).toEqual(evidence.beforeState);
@@ -92,6 +97,8 @@ describe('shared query-service compatibility through actual MCP', () => {
           expect(final).toHaveLength(1); isUnknown(final[0], id);
         }
         const owner = clients[0];
+        const explicitFinal = owner.replies.filter(reply => reply.id === 204);
+        expect(explicitFinal).toHaveLength(1); isUnknown(explicitFinal[0], 204);
         for (const id of [200, 201, 202, 203]) {
           const final = owner.replies.filter(reply => reply.id === id);
           expect(final).toHaveLength(1); expect(final[0]).not.toHaveProperty('method'); expect(final[0]).not.toHaveProperty('error');
