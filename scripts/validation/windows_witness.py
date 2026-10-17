@@ -4,6 +4,8 @@ Derived proportionally from the frozen version-three witness. This module never
 validates a consumer's mutable output poststate. Only close(deadline)'s frozen
 ledger can close the observation domain; live snapshots are advisory copies.
 """
+from __future__ import annotations
+
 from dataclasses import dataclass, asdict, replace
 import ctypes
 import hashlib
