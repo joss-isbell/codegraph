@@ -31,7 +31,7 @@ import { encodeLockInfo, getDaemonPidPath, getDaemonSocketCandidates, getDaemonS
 import { isProcessAlive, stopOlderDaemon } from '../src/mcp/daemon-registry';
 import { connectWithHello } from '../src/mcp/proxy';
 import { CodeGraphPackageVersion, isOlderRelease } from '../src/mcp/version';
-import { getWriterPidPath, readWriterLock, swapWriterLock } from '../src/mcp/writer-lock';
+import { getWriterPidPath, readWriterLock, swapWriterLock, tryAcquireWriterLock, releaseWriterLock } from '../src/mcp/writer-lock';
 import { WASM_RUNTIME_FLAGS } from '../src/extraction/wasm-runtime-flags';
 import { recordSpawns, removeSpawnLog, settleLosingCandidates, spawnLogFor } from './daemon-candidates';
 
@@ -39,6 +39,8 @@ const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
 const DIST = path.resolve(__dirname, '../dist');
 const NODE_MODULES = path.resolve(__dirname, '../node_modules');
 const OLDER_DAEMON = path.resolve(__dirname, 'fixtures/older-daemon.cjs');
+const MANAGED_COMPONENT = path.resolve(__dirname, 'fixtures/query-managed-daemon-component.cjs');
+const UPGRADE_PRELOAD = path.resolve(__dirname, 'fixtures/query-upgrade-unavailable-preload.cjs');
 
 /** Plain releases always below / above any version this repo will carry. */
 const OLDER = '0.0.1';
@@ -338,7 +340,7 @@ interface Session {
   stdout: string[];
   stderr: string[];
   root: string;
-  kind: 'launcher' | 'daemon';
+  kind: 'launcher' | 'daemon' | 'component';
   closed: boolean;
   errors: string[];
   capture: { stdout: LineCapture; stderr: LineCapture };
@@ -424,8 +426,8 @@ async function closeSession(session: Session): Promise<void> {
       .catch(error => { session.errors.push(String(error).slice(0, 2048)); });
     throw primary;
   }
-  if (session.kind === 'launcher' && (child.exitCode !== 0 || child.signalCode !== null)) {
-    throw new Error(`Owned launcher cleanup exit ${child.exitCode}/${child.signalCode}`);
+  if (session.kind !== 'daemon' && (child.exitCode !== 0 || child.signalCode !== null)) {
+    throw new Error(`Owned ${session.kind} cleanup exit ${child.exitCode}/${child.signalCode}`);
   }
 }
 
@@ -474,6 +476,7 @@ describe('a launcher meeting a daemon of another version (#2335)', () => {
   const sessions: Session[] = [];
   const daemonPids = new Set<number>();
   const extraInstalls: string[] = [];
+  const observationFiles = new Set<string>();
   let preserveInstalls = false;
 
   beforeAll(() => {
@@ -530,6 +533,18 @@ describe('a launcher meeting a daemon of another version (#2335)', () => {
         }
         expect(session.errors).toEqual([]);
         if (session.kind === 'launcher') expect(session.capture.stdout.tail, 'complete terminal MCP framing').toBe('');
+        if (session.kind === 'component') {
+          expect(session.child.exitCode, 'managed component native exit').toBe(0);
+          expect(session.child.signalCode).toBeNull();
+          expect(session.capture.stdout.tail, 'complete terminal component framing').toBe('');
+          expect(isUtf8(session.capture.stdout.raw.subarray(0, session.capture.stdout.retainedBytes)), 'component UTF-8').toBe(true);
+          for (const line of session.stdout) {
+            const value = JSON.parse(line);
+            expect(value && typeof value === 'object' && !Array.isArray(value), 'component JSON frame').toBe(true);
+            expect(value.pid).toBe(session.child.pid);
+            expect(typeof value.event).toBe('string');
+          }
+        }
         for (const issued of session.refused) {
           const replies = session.stdout.map(line => JSON.parse(line)).filter(value => value?.id === issued.id
             && (value.result !== undefined || value.error !== undefined));
@@ -537,11 +552,23 @@ describe('a launcher meeting a daemon of another version (#2335)', () => {
           expectRefusal(replies[0], issued.root, issued.label);
         }
       }
+      for (const file of observationFiles) {
+        expect(fs.statSync(file).size, 'bounded upgrade native observations').toBeLessThan(1024 * 1024);
+        const raw = fs.readFileSync(file);
+        expect(isUtf8(raw), 'final native observations UTF-8').toBe(true);
+        expect(raw.length > 0 && raw[raw.length - 1] === 10, 'complete final observation newline').toBe(true);
+        for (const line of raw.toString('utf8').slice(0, -1).split('\n')) {
+          const value = JSON.parse(line);
+          expect(value && typeof value === 'object' && !Array.isArray(value), 'native observation JSON frame').toBe(true);
+          expect(typeof value.event).toBe('string');
+        }
+      }
       terminalAuditComplete = true;
     });
     const evidence = () => ({ fixture: tempDir, cleanup, terminalAuditComplete, fixtureRemoved, spawnLogRemoved,
       outcome: cleanup.some(row => row.error) ? 'fail' : 'pass', daemonPids: [...daemonPids],
-      remainingDaemonPids: [...daemonPids].filter(isAlive), sessions: sessions.map(session => ({
+      remainingDaemonPids: [...daemonPids].filter(isAlive), observations: Object.fromEntries([...observationFiles].map(file =>
+        [file, fs.existsSync(file) ? fs.readFileSync(file).subarray(0, 1024 * 1024).toString('base64') : null])), sessions: sessions.map(session => ({
         pid: session.child.pid, root: session.root, kind: session.kind, exitCode: session.child.exitCode,
         signalCode: session.child.signalCode, closed: session.closed, errors: session.errors, refused: session.refused,
         stdout: session.stdout, stderr: session.stderr, capture: Object.fromEntries(Object.entries(session.capture).map(([name, value]) =>
@@ -567,6 +594,7 @@ describe('a launcher meeting a daemon of another version (#2335)', () => {
     }
     sessions.length = 0;
     daemonPids.clear();
+    observationFiles.clear();
   }, 45_000);
 
   /** An agent session: `install`'s launcher, `serve --mcp` in the project. */
@@ -697,65 +725,129 @@ describe('a launcher meeting a daemon of another version (#2335)', () => {
     return { child, log: session.stderr };
   }
 
-  /** The slot as a launcher that just stopped an older daemon holds it: this test process stands in. */
-  function holdWriterSlotForSuccessor(): string {
-    const claim = JSON.stringify({ pid: process.pid, mode: 'handover', startedAt: Date.now(), ready: false }) + '\n';
-    fs.writeFileSync(path.join(realRoot, '.codegraph', 'writer.pid'), claim);
-    return claim;
+  function nativeSnapshot(file: string): { locator: string; raw: string; birthtimeMs: number; ino: number } {
+    const stat = fs.statSync(file);
+    return { locator: path.join(fs.realpathSync(path.dirname(file)), path.basename(file)),
+      raw: fs.readFileSync(file).toString('base64'), birthtimeMs: stat.birthtimeMs, ino: stat.ino };
+  }
+
+  /** Explicit fixture management owns this native reservation continuously;
+   * a raw environment PID is deliberately not ordinary query permission. */
+  function holdWriterSlotForSuccessor(): any {
+    const acquired = tryAcquireWriterLock(realRoot, 'handover');
+    expect(acquired.kind).toBe('acquired');
+    const reservation = nativeSnapshot(getWriterPidPath(realRoot));
+    const owner = JSON.parse(Buffer.from(reservation.raw, 'base64').toString('utf8'));
+    expect(owner).toMatchObject({ pid: process.pid, mode: 'handover' });
+    return { reservation, owner: owner.pid, startedAt: owner.startedAt };
+  }
+
+  function componentEvent(session: Session, event: string): any | undefined {
+    return session.stdout.map(line => JSON.parse(line)).find(value => value.event === event);
+  }
+
+  function startManaged(mode: string, reservation: any = {}, candidate?: any): Session {
+    const config = path.join(realRoot, `.managed-${sessions.length}.json`);
+    fs.writeFileSync(config, JSON.stringify({ root: realRoot, mode, ...reservation, candidate }) + '\n');
+    const child = spawn(process.execPath, [...WASM_RUNTIME_FLAGS, MANAGED_COMPONENT, config], {
+      cwd: tempDir, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '30000' },
+    }) as ChildProcessWithoutNullStreams;
+    const session = observeSession(child, tempDir, 'component');
+    sessions.push(session); daemonPids.add(child.pid!);
+    return session;
+  }
+
+  async function completedComponent(session: Session): Promise<void> {
+    if (session.child.exitCode === null && session.child.signalCode === null && !session.child.stdin.destroyed) session.child.stdin.end();
+    await waitFor(() => session.closed && session.capture.stdout.eof && session.capture.stderr.eof, 10000, 'managed component native close and EOF');
+    expect(session.child.exitCode, session.stderr.join('\n')).toBe(0);
+    expect(session.child.signalCode).toBeNull();
+    expect(componentEvent(session, 'failed')).toBeUndefined();
+  }
+
+  async function ordinaryReservationRefusal(env: NodeJS.ProcessEnv, expected: string): Promise<void> {
+    const artifacts = protectOwner();
+    const child = startDaemon(env);
+    const session = sessions[sessions.length - 1];
+    await waitFor(() => session.closed && session.capture.stdout.eof && session.capture.stderr.eof, 10000, 'ordinary raw reservation refusal close');
+    expect(child.child.exitCode).toBe(1);
+    expect(child.child.signalCode).toBeNull();
+    expect(child.log.join('\n')).toContain('CodeGraph query policy refused');
+    expect(child.log.join('\n')).toContain(expected);
+    expect(child.log.join('\n')).not.toMatch(/Listening on|Took over|serving this session in-process|Serving reads in-process|File watcher active/);
+    expect(session.stdout).toEqual([]);
+    expect(preservedArtifacts()).toEqual(artifacts);
+    expect(isAlive(process.pid)).toBe(true);
+  }
+
+  async function usefulManagedDaemon(component: Session): Promise<void> {
+    const listening = await waitFor(() => componentEvent(component, 'listening'), 20000, 'explicit managed daemon to listen');
+    expect(listening.listening.lock.pid).toBe(component.child.pid);
+    expect(writerLock()).toMatchObject({ pid: component.child.pid, mode: 'daemon', startedAt: listening.writer.startedAt });
+    const client = startSession(null);
+    await status(client, 2, 'actual query through the managed listening daemon');
+    send(client, { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'codegraph_search', arguments: { query: 'appMain' } } });
+    const reply = await waitFor(() => findResponse(client.stdout, 3), 20000, 'managed daemon real SQLite search');
+    expect(reply.error).toBeUndefined(); expect(reply.result.isError).not.toBe(true);
+    expect(JSON.stringify(reply.result)).toContain('appMain');
+    await closeSession(client);
+    for (const id of [1, 2, 3]) expect(client.stdout.map(line => JSON.parse(line)).filter(value => value.id === id
+      && (value.result !== undefined || value.error !== undefined)), `managed client terminal response ${id}`).toHaveLength(1);
+    await completedComponent(component);
+    expect(componentEvent(component, 'draining')).toBeDefined();
+    expect(await waitProcessExit(component.child.pid!, 5000)).toBe(true);
+    expect(daemonLock()).toBeNull(); expect(writerLock()).toBeNull();
   }
 
   it('a daemon takes over the writer slot held for it, and only that one', async () => {
-    const claim = holdWriterSlotForSuccessor();
-
-    // A daemon the slot is not held for finds it held, as by any live writer.
-    const stranger = startDaemon({});
-    const [strangerCode] = await once(stranger.child, 'exit');
-    expect(strangerCode).toBe(1);
-    expect(stranger.log.join('\n')).toContain(`writer lock held by PID ${process.pid} (handover mode)`);
-    expect(fs.readFileSync(path.join(realRoot, '.codegraph', 'writer.pid'), 'utf8')).toBe(claim);
-
-    const successor = startDaemon({ CODEGRAPH_DAEMON_HANDOVER: String(process.pid) });
-    await waitFor(
-      () => daemonLock()?.pid === successor.child.pid && successor.log.some((l) => l.includes('Listening on')),
-      20000, 'the successor to listen',
-    );
-    expect(writerLock()).toMatchObject({ pid: successor.child.pid, mode: 'daemon' });
-    expect(successor.log.join('\n')).toContain(`Took over the writer lock from launcher pid ${process.pid}`);
+    const held = holdWriterSlotForSuccessor();
+    await ordinaryReservationRefusal({}, `live handover writer PID ${process.pid}`);
+    await ordinaryReservationRefusal({ CODEGRAPH_DAEMON_HANDOVER: String(process.pid) }, `live handover writer PID ${process.pid}`);
+    expect(nativeSnapshot(getWriterPidPath(realRoot))).toEqual(held.reservation);
+    const stranger = startManaged('stranger', held);
+    await waitFor(() => componentEvent(stranger, 'stranger-refused'), 20000, 'unintended management component refusal');
+    await completedComponent(stranger);
+    expect(nativeSnapshot(getWriterPidPath(realRoot))).toEqual(held.reservation);
+    expect(daemonLock()).toBeNull();
+    const successor = startManaged('handover', held);
+    await usefulManagedDaemon(successor);
+    expect(successor.stderr.join('\n')).toContain(`Took over the writer lock from launcher pid ${process.pid}`);
   }, 60000);
 
   it('a daemon the slot is held for outwaits a candidate still starting in its way', async () => {
-    holdWriterSlotForSuccessor();
-    // A racing launcher's candidate holds the daemon lock, still starting; it
-    // cannot get the writer slot, so it will give up.
-    const candidate = startDetachedProcess();
-    daemonPids.add(candidate);
-    const pidPath = path.join(realRoot, '.codegraph', 'daemon.pid');
-    const candidateLock = encodeLockInfo({
-      pid: candidate, version: CodeGraphPackageVersion, socketPath: getDaemonSocketPath(realRoot), startedAt: Date.now(),
-    });
-    fs.writeFileSync(pidPath, candidateLock);
-
-    // Any other daemon yields to it at once.
-    const yielding = startDaemon({});
-    const [yieldingCode] = await once(yielding.child, 'exit');
-    expect(yieldingCode).toBe(0);
-    expect(yielding.log.join('\n')).toContain(`Another daemon (pid ${candidate}) already holds the lock`);
-
-    const successor = startDaemon({ CODEGRAPH_DAEMON_HANDOVER: String(process.pid) });
-    await waitFor(
-      () => successor.log.some((l) => l.includes(`Waiting for daemon candidate pid ${candidate}`)),
-      20000, 'the successor to wait for the candidate',
-    );
-    expect(successor.child.exitCode).toBeNull();
-    expect(fs.readFileSync(pidPath, 'utf8')).toBe(candidateLock);
-    // The candidate gives up: its lock goes, then so does it.
-    fs.rmSync(pidPath);
-    process.kill(candidate, 'SIGKILL');
-    await waitFor(
-      () => daemonLock()?.pid === successor.child.pid && successor.log.some((l) => l.includes('Listening on')),
-      20000, 'the successor to listen',
-    );
-    expect(writerLock()).toMatchObject({ pid: successor.child.pid, mode: 'daemon' });
+    for (const replaced of [true, false]) {
+      const held = holdWriterSlotForSuccessor();
+      const candidate = startManaged('candidate');
+      const created = await waitFor(() => componentEvent(candidate, 'candidate-ready'), 10000, 'actual candidate creation');
+      expect(created.identity.pid).toBe(candidate.child.pid);
+      expect(created.record).toEqual(nativeSnapshot(getDaemonPidPath(realRoot)));
+      await ordinaryReservationRefusal({ CODEGRAPH_DAEMON_HANDOVER: String(process.pid) }, `live daemon PID ${candidate.child.pid}`);
+      expect(isAlive(candidate.child.pid!)).toBe(true);
+      const successor = startManaged('outwait', held, created);
+      await waitFor(() => successor.stderr.some(line => line.includes(`Waiting for daemon candidate pid ${candidate.child.pid}`)), 20000, 'actual exported outwait helper');
+      expect(nativeSnapshot(getWriterPidPath(realRoot))).toEqual(held.reservation);
+      expect(nativeSnapshot(getDaemonPidPath(realRoot))).toEqual(created.record);
+      let replacement: ReturnType<typeof nativeSnapshot> | undefined;
+      if (replaced) {
+        const next = { ...writerLock(), startedAt: held.startedAt + 1 };
+        fs.writeFileSync(getWriterPidPath(realRoot), JSON.stringify(next) + '\n');
+        replacement = nativeSnapshot(getWriterPidPath(realRoot));
+      }
+      await completedComponent(candidate); // the exact created candidate releases its own record
+      expect(await waitProcessExit(candidate.child.pid!, 5000)).toBe(true);
+      const waited = await waitFor(() => componentEvent(successor, 'outwait-result'), 10000, 'actual helper result');
+      expect(waited.waited).toBe(true);
+      expect(waited.candidate).toEqual(created.identity);
+      if (replaced) {
+        await waitFor(() => componentEvent(successor, 'reservation-refused'), 10000, 'changed exact reservation prevents transfer');
+        await completedComponent(successor);
+        expect(componentEvent(successor, 'listening')).toBeUndefined();
+        expect(nativeSnapshot(getWriterPidPath(realRoot))).toEqual(replacement);
+        expect(daemonLock()).toBeNull();
+        releaseWriterLock(realRoot); // exact fixture-owned replacement, after preservation assertions
+      } else await usefulManagedDaemon(successor);
+      fs.unlinkSync(created.identityFile);
+    }
   }, 60000);
 
   it('preserves an older daemon and its recurring healthy session calls when another install is refused', async () => {
@@ -848,37 +940,106 @@ describe('a launcher meeting a daemon of another version (#2335)', () => {
   }, 90000);
 
   it('a session whose own install was upgraded serves reads only once its daemon exits', async () => {
-    // An upgrade in place: the daemon notices its package.json changed and
-    // exits (its install check), and its session falls back in-process. As
-    // the project's writer that session — running code the upgrade replaced —
-    // would only keep a daemon from the new install from starting.
+    // Two actually useful old sessions distinguish terminal unknown at loss
+    // from a first post-loss acquisition after proved genuine unavailability.
+    // Neither branch revokes an existing refusal or fakes getDaemonSocket.
     const install = makeInstall('0.0.2');
     extraInstalls.push(install);
-    const before = await sessionWithDaemon(install, '0.0.2', {
-      CODEGRAPH_DAEMON_INSTALL_CHECK_MS: '200',
-      CODEGRAPH_DAEMON_RETRY_MS: '0',
-    });
-    fs.writeFileSync(path.join(install, 'package.json'), JSON.stringify({ name: '@colbymchenry/codegraph', version: '0.0.3' }) + '\n');
-    expect(await waitProcessExit(before.pid, 10000)).toBe(true);
-    expect(daemonLog()).toContain('Install replaced by v0.0.3');
-    await waitFor(
-      () => before.session.stderr.some((l) => l.includes('Shared daemon connection lost')),
-      10000, 'the session to lose its daemon',
-    );
+    const gates = path.join(realRoot, '.upgrade-gates'); fs.mkdirSync(gates);
+    const observations = path.join(gates, 'native.jsonl'); fs.writeFileSync(observations, ''); observationFiles.add(observations);
+    const drainRelease = path.join(gates, 'drain-release.json');
+    const acquisitionRelease = path.join(gates, 'acquisition-release.json');
+    const arm = path.join(gates, 'arm.json');
+    const publishGate = (file: string, value: unknown): void => {
+      const temporary = `${file}.${process.pid}.tmp`;
+      fs.writeFileSync(temporary, JSON.stringify(value) + '\n', { flag: 'wx' });
+      fs.renameSync(temporary, file); // readers never observe a partly written JSON frame
+    };
+    const events = (): any[] => {
+      const raw = fs.readFileSync(observations, 'utf8');
+      const end = raw.lastIndexOf('\n') + 1;
+      if (end !== raw.length && !sessions.some(session => session.child.exitCode === null && session.child.signalCode === null)
+        && ![...daemonPids].some(isAlive)) throw new Error('unterminated native observation after actual process closure');
+      // A writer can still be appending its last frame. Every completed frame
+      // parses now; after all native closes the shared audit checks the tail too.
+      return raw.slice(0, end).split('\n').filter(Boolean).map(line => JSON.parse(line));
+    };
+    const event = (name: string): any => events().find(row => row.event === name);
+    const common = { NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require "${UPGRADE_PRELOAD}"`,
+      QUERY_UPGRADE_ROOT: realRoot, QUERY_UPGRADE_OBSERVATIONS: observations, QUERY_UPGRADE_DRAIN_RELEASE: drainRelease,
+      QUERY_UPGRADE_ACQUISITION_RELEASE: acquisitionRelease, QUERY_UPGRADE_ARM: arm,
+      CODEGRAPH_DAEMON_INSTALL_CHECK_MS: '200', CODEGRAPH_DAEMON_RETRY_MS: '0' };
+    let controlled: Session | undefined;
+    const search = async (session: Session, id: number, label: string) => {
+      send(session, { jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'codegraph_search', arguments: { query: 'appMain' } } });
+      const reply = await waitFor(() => findResponse(session.stdout, id), 20000, label);
+      expect(reply.error, label).toBeUndefined(); expect(reply.result.isError, label).not.toBe(true);
+      expect(JSON.stringify(reply.result), label).toContain('appMain');
+    };
+    try {
+      const before = await sessionWithDaemon(install, '0.0.2', { ...common, QUERY_UPGRADE_ROLE: 'owner' });
+      await search(before.session, 3, 'old owner actual worker/SQLite query');
+      controlled = startSession(install, { ...common, QUERY_UPGRADE_ROLE: 'controlled' });
+      await waitFor(() => attachedLine(controlled!), 20000, 'controlled old session actual attachment');
+      await status(controlled, 2, 'controlled old session actual status');
+      await search(controlled, 3, 'controlled old session actual worker/SQLite query');
+      const initial = events().filter(row => row.event === 'actual-acquisition-returned' && row.pid === controlled!.child.pid);
+      expect(initial).toHaveLength(1); expect(initial[0].socket).toBe(true);
+      const held = { 'writer.pid': nativeSnapshot(getWriterPidPath(realRoot)), 'daemon.pid': nativeSnapshot(getDaemonPidPath(realRoot)) };
+      publishGate(arm, { clientPid: controlled.child.pid, ownerPid: before.pid, root: realRoot, owners: held });
+      fs.writeFileSync(path.join(install, 'package.json'), JSON.stringify({ name: '@colbymchenry/codegraph', version: '0.0.3' }) + '\n');
 
-    await status(before.session, 3, 'a tool call after the daemon exited');
-    const stderr = before.session.stderr.join('\n');
-    expect(stderr).toContain("this session's CodeGraph install was upgraded or removed");
-    expect(stderr).not.toContain('File watcher active');
-    expect(writerLock()).toBeNull();
+      const drained = await waitFor(() => event('native-drain-complete-caller-notification-held'), 20000, 'actual native drain complete, caller notification held');
+      expect(drained.pid).toBe(before.pid); expect(drained.owners).toEqual(held);
+      expect(events().some(row => row.event === 'worker-exit' && row.pid === before.pid)).toBe(true);
+      expect(isAlive(before.pid), 'caller still owns native writer and daemon records after real engine drain').toBe(true);
+      await refusedTool(before.session, 4, 'ungated post-loss acquisition observes unknown live old owner');
+      expect(isAlive(before.pid)).toBe(true);
+      expect(nativeSnapshot(getWriterPidPath(realRoot))).toEqual(held['writer.pid']);
+      expect(nativeSnapshot(getDaemonPidPath(realRoot))).toEqual(held['daemon.pid']);
+      expect(before.session.stderr.join('\n')).not.toMatch(/serving this session in-process|Serving reads in-process|File watcher active/);
+      const postloss = await waitFor(() => event('first-postloss-acquisition-held'), 20000, 'first controlled post-loss acquisition');
+      expect(postloss.pid).toBe(controlled.child.pid); expect(postloss.ordinal).toBe(2); expect(postloss.owners).toEqual(held);
+      expect(events().filter(row => row.event === 'candidate-created')).toEqual([]);
 
-    // So a session from the current install gets a daemon straight away.
-    const after = startSession(null);
-    await waitFor(() => attachedLine(after), 20000, 'the new session to attach');
-    const lock = daemonLock();
-    daemonPids.add(lock.pid);
-    expect(writerLock()).toMatchObject({ pid: lock.pid, mode: 'daemon' });
-    // The common afterEach owns close/EOF and daemon exit; afterAll removes
-    // this install only if every fixture completed that terminal audit.
+      publishGate(drainRelease, { ownerPid: before.pid });
+      expect(await waitProcessExit(before.pid, 10000)).toBe(true);
+      expect(daemonLog()).toContain('Install replaced by v0.0.3');
+      expect(daemonLock()).toBeNull(); expect(writerLock()).toBeNull();
+      const logBeforeCandidate = daemonLog();
+      publishGate(acquisitionRelease, { ownerPid: before.pid, clientPid: controlled.child.pid, ownerAbsent: true });
+      const readonlyStatus = await status(controlled, 4, 'genuine-unavailable upgraded session actual read-only status');
+      await search(controlled, 5, 'genuine-unavailable upgraded session actual read-only SQLite query');
+      const text = readonlyStatus.result.content.map((item: any) => item.text ?? '').join('\n');
+      const execution = JSON.parse(text.split('```json\n')[1].split('\n```')[0]);
+      expect(execution.effective.executionMode).toBe('read-only-fallback');
+      expect(execution.ownership).toMatchObject({ capability: 'read-only', writerAuthority: false, synchronizationAuthority: false });
+      expect(controlled.stderr.join('\n')).toContain("this session's CodeGraph install was upgraded or removed");
+      expect(controlled.stderr.join('\n')).not.toContain('File watcher active');
+      expect(writerLock()).toBeNull(); expect(daemonLock()).toBeNull();
+      const closedCandidate = await waitFor(() => event('candidate-close'), 10000, 'actual unavailable candidate native close');
+      expect(closedCandidate).toMatchObject({ code: 78, signal: null, channelReleased: true, owners: { 'writer.pid': null, 'daemon.pid': null } });
+      const candidate = event('candidate-created');
+      expect(candidate.candidatePid).toBe(closedCandidate.candidatePid);
+      expect(event('candidate-before-cli-exit')).toMatchObject({ pid: candidate.candidatePid, code: 78, owners: { 'writer.pid': null, 'daemon.pid': null } });
+      expect(await waitProcessExit(candidate.candidatePid, 5000)).toBe(true);
+      expect(events().filter(row => row.event === 'candidate-error')).toEqual([]);
+      expect(daemonLog(), 'native pre-CLI candidate emitted no service/log bytes').toBe(logBeforeCandidate);
+      expect(events().filter(row => row.event === 'actual-acquisition-returned' && row.ordinal === 2)).toHaveLength(1);
+      expect(events().find(row => row.event === 'actual-acquisition-returned' && row.ordinal === 2).socket).toBe(false);
+      await refusedTool(before.session, 5, 'actual old-owner absence never revokes the ungated terminal refusal');
+
+      const after = startSession(null);
+      await status(after, 2, 'current install useful daemon uptake after old native owner exit');
+      await search(after, 3, 'current install actual worker/SQLite query');
+      const lock = daemonLock(); daemonPids.add(lock.pid);
+      expect(lock.pid).not.toBe(before.pid);
+      expect(writerLock()).toMatchObject({ pid: lock.pid, mode: 'daemon' });
+    } finally {
+      // Failed fixture cleanup releases timing only; it cannot fabricate success
+      // or turn the original terminal refusal into a permitted acquisition.
+      if (!fs.existsSync(drainRelease)) publishGate(drainRelease, { abort: true });
+      if (!fs.existsSync(acquisitionRelease)) publishGate(acquisitionRelease, { abort: true, clientPid: controlled?.child.pid });
+    }
   }, 90000);
 });

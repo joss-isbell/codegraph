@@ -25,7 +25,7 @@ import { endFreshnessMeasurements } from './index-freshness';
 import { acquireProject, admitQueryProject, assertProjectWriterReservation, retainStartupProjectWriter, rollbackStartupProjectWriter, type IndexProgressLease, type ProjectAcquisition, type ProjectLease, type ProjectResourceObserver, type ProjectWriterReservation } from './project-lifecycle';
 import { CodeGraphPackageVersion } from './version';
 import type { QueryDiagnostics } from './query-diagnostics';
-import { isServicePolicyRefusal, type ServicePolicyRefusal } from './query-service-compatibility';
+import { isServicePolicyRefusal, servicePolicyRefusal, type ServicePolicyRefusal } from './query-service-compatibility';
 
 /** How often the per-tool-call retry may re-run the sub-project down-scan. */
 const RETRY_SUBSCAN_TTL_MS = 5_000;
@@ -41,6 +41,8 @@ export interface MCPEngineOptions {
   resourceObserver?: ProjectResourceObserver;
   /** Explicit caller-owned startup authority, released by that caller. */
   projectWriter?: ProjectWriterReservation;
+  /** Primary direct MCP must own its default writer, including late resolution. */
+  requireDefaultWriter?: boolean;
   onInitialDefaultOutcome?: (outcome: InitialDefaultOutcome) => void;
   executionMode?: QueryExecutionMode;
   /** Serve existing index contents without syncing, watching, or claiming a writer slot. */
@@ -102,6 +104,7 @@ export class MCPEngine {
   private initialDefaultPending = true;
   private readonly resourceObserver?: ProjectResourceObserver;
   private readonly onInitialDefaultOutcome?: MCPEngineOptions['onInitialDefaultOutcome'];
+  private readonly requireDefaultWriter: boolean;
   private projectWriter: ProjectWriterReservation | null = null;
   private ownedStartupReservation: ProjectWriterReservation | null = null;
   // Sole cleanup accounting: exact holders enter before acquisition can await.
@@ -124,6 +127,10 @@ export class MCPEngine {
     this.onInitialDefaultOutcome = opts.onInitialDefaultOutcome;
     const mode = opts.executionMode ?? opts.queryPolicy?.executionMode ?? (opts.readOnly ? 'read-only-fallback' : 'shared-daemon');
     this.opts = { readOnly: opts.readOnly ?? mode === 'read-only-fallback', watch: opts.watch ?? true, queryPool: opts.queryPool ?? false };
+    this.requireDefaultWriter = opts.requireDefaultWriter ?? false;
+    if (this.requireDefaultWriter && (mode !== 'direct' || this.opts.readOnly)) {
+      throw new Error('Primary default writer ownership requires a read-write direct engine.');
+    }
     if ((opts.queryPolicy && opts.queryPolicy.executionMode !== mode) || (mode === 'read-only-fallback') !== this.opts.readOnly) {
       throw new Error('Query policy execution mode and engine capability must agree.');
     }
@@ -202,25 +209,28 @@ export class MCPEngine {
       if (this.projectWriter) throw new Error('Startup writer must have one explicit owner.');
       const route = this.defaultRoute ?? captureMcpIndexRoute(opts.writerLockRoot);
       if (!route || route.root !== realpathSync(opts.writerLockRoot)) throw new Error('Startup writer requires its exact own index route.');
-      assertNoRebuild(opts.writerLockRoot);
-      const pidPath = getWriterPidPath(opts.writerLockRoot);
-      const locator = path.join(realpathSync(path.dirname(pidPath)), path.basename(pidPath));
-      let previous: WriterLockInfo | null = null;
-      try {
-        previous = decodeWriterLockInfo(readFileSync(locator, 'utf8'));
-        if (!previous) throw new Error('The previous native writer record is malformed.');
-      } catch (error) { if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error; }
-      const writer = tryAcquireWriterLock(opts.writerLockRoot, 'fallback');
-      if (writer.kind === 'taken') {
-        throw new Error(writerLockHeldMessage(writer.existing, writer.pidPath));
-      }
-      try { this.ownedStartupReservation = retainStartupProjectWriter(route, writer.info); }
-      catch (primary) {
-        try { rollbackStartupProjectWriter(route, writer, { pidPath, locator, previous }); }
-        catch (secondary) { this.reportProjectCleanup(primary, secondary); }
-        throw primary;
-      }
+      this.ownedStartupReservation = this.acquireOwnedStartupWriter(route, 'fallback');
       this.setProjectWriter(this.ownedStartupReservation);
+    }
+  }
+
+  /** Exact synchronous acquisition shared by legacy fallback and late direct startup. */
+  private acquireOwnedStartupWriter(route: McpIndexRoute, mode: 'direct' | 'fallback'): ProjectWriterReservation {
+    assertNoRebuild(route.root);
+    const pidPath = getWriterPidPath(route.root);
+    const locator = path.join(realpathSync(path.dirname(pidPath)), path.basename(pidPath));
+    let previous: WriterLockInfo | null = null;
+    try {
+      previous = decodeWriterLockInfo(readFileSync(locator, 'utf8'));
+      if (!previous) throw new Error('The previous native writer record is malformed.');
+    } catch (error) { if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error; }
+    const writer = tryAcquireWriterLock(route.root, mode);
+    if (writer.kind === 'taken') throw new Error(writerLockHeldMessage(writer.existing, writer.pidPath));
+    try { return retainStartupProjectWriter(route, writer.info); }
+    catch (primary) {
+      try { rollbackStartupProjectWriter(route, writer, { pidPath, locator, previous }); }
+      catch (secondary) { this.reportProjectCleanup(primary, secondary); }
+      throw primary;
     }
   }
 
@@ -446,7 +456,7 @@ export class MCPEngine {
         try { await this.releaseProjectAcquisition(holder); }
         catch (error) { failures.push(error); projectCleanupIncomplete = true; }
       }
-      // Only the legacy adapter owns this reservation. Explicit startup callers
+      // Legacy fallback and late direct startup own this reservation. Explicit startup callers
       // release their own reservation after the engine's real native drain.
       if (!projectCleanupIncomplete) {
         try { await this.ownedStartupReservation?.release(); this.ownedStartupReservation = null; }
@@ -579,6 +589,19 @@ export class MCPEngine {
       if (signal.aborted || this.closed) return;
       assertMcpIndexRoute(this.defaultRoute!);
       assertNoRebuild(resolvedRoot);
+      if (this.requireDefaultWriter && !this.projectWriter) {
+        try {
+          const reservation = this.acquireOwnedStartupWriter(this.defaultRoute!, 'direct');
+          // Initialization owns this exact route already; the public pre-start
+          // setter fence stays strict. Retain authority across every later wait.
+          this.ownedStartupReservation = reservation;
+          this.projectWriter = reservation;
+        } catch (error) {
+          if (isServicePolicyRefusal(error)) throw error;
+          throw servicePolicyRefusal('unknown', resolvedRoot,
+            error instanceof Error ? error.message : String(error));
+        }
+      }
       acquired = await acquireProject({ route: this.defaultRoute!, signal, lifetime: this.resourceLifetime.signal,
         intent: this.opts.readOnly ? 'read' : this.opts.watch ? 'watch' : 'catch-up',
         watchOptions: this.watchOptions(), resourceObserver: this.resourceObserver,

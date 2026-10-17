@@ -489,7 +489,7 @@ async function spawnDetachedDaemon(route: McpIndexRoute, startup: QueryStartupRe
  * `pid` no longer holds the lock; false at once when no slot is held for this
  * daemon, and false when that stops being so or the wait runs out.
  */
-async function outwaitCandidate(root: string, handoverFrom: number | null, pid: number): Promise<boolean> {
+export async function outwaitCandidate(root: string, handoverFrom: number | null, pid: number): Promise<boolean> {
   const heldForUs = (): boolean => {
     const writer = readWriterLock(root);
     return handoverFrom !== null && writer?.pid === handoverFrom && writer.mode === 'handover';
@@ -729,7 +729,7 @@ export class MCPServer {
     cancelled(signal);
     if (this.stopped) throw new Error('MCP startup is closed.');
     this.engine = new MCPEngine({ queryPool: true, queryPolicy: this.directQueryPolicy,
-      queryAdmissionPolicy: this.queryAdmissionPolicy, ...(route ? { projectRoute: route, projectWriter } : {}),
+      queryAdmissionPolicy: this.queryAdmissionPolicy, requireDefaultWriter: true, ...(route ? { projectRoute: route, projectWriter } : {}),
       resourceObserver: controls.resourceObserver, onInitialDefaultOutcome: controls.onInitialDefaultOutcome, executionMode: 'direct' });
     this.session = new MCPSession(transport, this.engine, { explicitProjectPath: this.projectPath });
     return this.session;
