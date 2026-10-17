@@ -21,10 +21,44 @@ import time
 import traceback
 import uuid
 
-HERE = Path(__file__).resolve().parent
+HERE = (Path(__file__).absolute() if os.name == "nt" else Path(__file__).resolve()).parent
 sys.path.insert(0, str(HERE))
-from report import consume, digest
-from integrity import Witness, relevant
+from report import consume, digest, WINDOWS_INTEGRITY_BYTES
+from integrity import Witness, WindowsInputs, relevant, windows_input_closure
+
+SOURCE_BOUND_BOOTSTRAP = None  # Set only by normal.py's raw-source loader.
+
+
+def source_bound_cache(plan_path, plan):
+    declaration = plan.get("sourceBoundCache")
+    if declaration is None and SOURCE_BOUND_BOOTSTRAP is None:
+        return None
+    if (os.name != "nt" or not isinstance(declaration, dict) or set(declaration) != {"prefix"}
+            or not isinstance(SOURCE_BOUND_BOOTSTRAP, dict)):
+        raise ValueError("source-bound plan requires the Windows normal.py bootstrap")
+    prefix = declaration["prefix"]
+    bootstrap = SOURCE_BOUND_BOOTSTRAP
+    expected_helpers = {str(HERE / name) for name in
+                        ("normal.py", "runner.py", "report.py", "integrity.py", "windows_witness.py")}
+    if (not isinstance(prefix, str) or bootstrap.get("prefix") != prefix
+            or Path(bootstrap["planPath"]) != plan_path
+            or set(bootstrap.get("helpers", {})) != expected_helpers
+            or not sys.dont_write_bytecode or sys.pycache_prefix != prefix
+            or os.environ.get("PYTHONPYCACHEPREFIX") != prefix
+            or os.environ.get("PYTHONDONTWRITEBYTECODE") != "1" or os.path.lexists(prefix)):
+        raise ValueError("source-bound interpreter/plan/raw-helper declaration mismatch")
+    from windows_witness import absolute, ordinary
+    ordinary(absolute(prefix).parent, True)
+    for name, value in (("PYTHONPYCACHEPREFIX", prefix), ("PYTHONDONTWRITEBYTECODE", "1")):
+        environment = plan.get("environment", {})
+        if environment.get(name) != value or any(key.upper() == name and key != name for key in environment):
+            raise ValueError("source-bound child environment must preserve exact " + name)
+    for name in ("runner", "report", "integrity", "windows_witness"):
+        if (getattr(sys.modules[name], "__validation_source_sha256__", None)
+                != bootstrap["helpers"][str(HERE / (name + ".py"))]):
+            raise ValueError("normal helper did not execute the declared raw source: " + name)
+    return {"prefix": prefix, "helpers": dict(bootstrap["helpers"]),
+            "interpreterPrefix": sys.pycache_prefix, "dontWriteBytecode": True}
 
 
 def write(path, value):
@@ -36,7 +70,8 @@ def git(root, *args):
 
 
 def binding(root, artifacts):
-    root = Path(root).resolve()
+    root = Path(root).absolute() if os.name == "nt" else Path(root).resolve()
+    closure = windows_input_closure(root, artifacts) if os.name == "nt" else None
     paths = set()
     try:
         if Path(git(root, "rev-parse", "--show-toplevel").decode().strip()).resolve() != root:
@@ -49,24 +84,33 @@ def binding(root, artifacts):
     except subprocess.CalledProcessError:
         commit = (root / "baseline-source-commit.txt").read_text().strip()
         delta = b""
-        paths.update(p for p in root.rglob("*") if p.is_file() and relevant(p.relative_to(root)))
-    for directory in ["src", "ui/src", "scripts/validation"]:
-        base = root / directory
-        if base.exists():
-            paths.update(p for p in base.rglob("*") if p.is_file() and "__pycache__" not in p.parts)
-    paths.update(root / p for p in ["package.json", "package-lock.json", "ui/package.json"])
+        if os.name != "nt":
+            paths.update(p for p in root.rglob("*") if p.is_file() and relevant(p.relative_to(root)))
+    if closure is not None:
+        paths = closure["files"]["source"]
+    else:
+        for directory in ["src", "ui/src", "scripts/validation"]:
+            base = root / directory
+            if base.exists():
+                paths.update(p for p in base.rglob("*") if p.is_file() and "__pycache__" not in p.parts)
+    paths.update(root / p for p in ["package.json", "package-lock.json", "ui/package.json"]
+                 if closure is None or str(root / p) not in closure["reparse"])
     sources = {str(p.relative_to(root)).replace("\\", "/"): digest(p) if p.is_file() else None
                for p in sorted(paths)}
     artifact_files = {}
-    for item in artifacts:
+    for item in ([] if closure is not None else artifacts):
         p = Path(item).resolve()
         if p.is_dir():
             artifact_files.update({str(f): digest(f) for f in sorted(p.rglob("*"))
-                                   if f.is_file() and "__pycache__" not in f.parts})
+                                   if f.is_file() and (os.name == "nt" or "__pycache__" not in f.parts)})
         else:
             artifact_files[str(p)] = digest(p) if p.is_file() else None
+    if closure is not None:
+        artifact_files = {str(p): digest(p) for p in sorted(closure["files"]["artifact"])}
     return {"commit": commit, "dirtyDeltaSha256": hashlib.sha256(delta).hexdigest(),
-            "sources": sources, "artifacts": artifact_files}
+            "sources": sources, "artifacts": artifact_files,
+            **({"membership": closure["membership"], "reparse": closure["reparse"]}
+               if closure is not None else {})}
 
 
 if os.name == "nt":
@@ -343,12 +387,16 @@ class Log:
         except BaseException as exc:
             self.errors.append(f"log capture failed: {type(exc).__name__}: {exc}")
         finally:
-            pipe.close()
+            try:
+                pipe.close()
+            except BaseException as exc:
+                self.errors.append(f"log pipe close failed: {type(exc).__name__}: {exc}")
 
 
 def run(plan_path):
     plan_path = Path(plan_path).resolve()
     plan = json.loads(plan_path.read_text(encoding="utf-8-sig"))
+    cache = source_bound_cache(plan_path, plan)
     declarations = json.loads((HERE / "declarations-v1.json").read_text())
     bounds = {**declarations, **plan.get("bounds", {})}
     seconds = plan["deadlineSeconds"]
@@ -367,6 +415,7 @@ def run(plan_path):
         raise ValueError("declare nonempty unique scenario array before launch")
     out = Path(plan["output"]).resolve()
     out.mkdir(parents=True, exist_ok=False)
+    plan["integrityProfile"] = "windows-guard-v2" if os.name == "nt" else "linux-inotify-v1"
     write(out / "plan.json", plan)
     write(out / "declarations.json", bounds)
     home = out / "home"
@@ -390,6 +439,9 @@ def run(plan_path):
     if os.name == "nt":
         env.update(HOMEDRIVE=home.drive, HOMEPATH=str(home)[len(home.drive):])
     env.update(plan.get("environment", {}))
+    # Strict helper/artifact inputs include pycache; children must not write it.
+    if os.name == "nt":
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
     source = binding(plan["sourceRoot"], plan.get("artifacts", []) + [sys.executable, str(HERE)])
     write(out / "source-before.json", source)
     try:
@@ -403,26 +455,23 @@ def run(plan_path):
         return {str(p): (p.stat().st_size, p.stat().st_mtime_ns) if p.is_file() else None for p in bound_paths}
     initial_signatures = signatures()
     changed_during_run = False
-    witness = Witness(plan["sourceRoot"], bound_paths)
-    witnesses = [witness]
-    for item in plan.get("artifacts", []) + [sys.executable, str(HERE)]:
-        p = Path(item).resolve()
-        if p.is_dir():
-            witnesses.append(Witness(p, [], artifact=True))
-        elif p.is_file():
-            witnesses.append(Witness(p.parent, [], artifact=True, only=p.name))
-        else:
-            witness.errors.append(f"declared artifact is missing: {p}")
-    receipt = {"schema": "codegraph-validation-v1", "attempt": out.name, "outcome": "incomplete",
+    witnesses = []
+    receipt = {"schema": "codegraph-validation-v2", "attempt": out.name, "outcome": "incomplete",
                "runtime": {"python": sys.version, "executableSha256": digest(sys.executable),
-                           "os": platform.platform(), "machine": platform.machine()},
+                           "os": platform.platform(), "system": platform.system(), "machine": platform.machine()},
                "settings": {k: v for k, v in env.items() if k.startswith("CODEGRAPH_")},
                "executionMode": plan.get("executionMode", "supervised"), "scenarios": scenarios,
+               "integrityProfile": plan["integrityProfile"],
+               "integrityPolicy": ({"childDontWriteBytecode": env["PYTHONDONTWRITEBYTECODE"],
+                                    "artifactPycacheIncluded": True} if os.name == "nt" else
+                                   {"artifactPycacheIncluded": False}),
                "binding": {"commit": source["commit"], "dirtyDeltaSha256": source["dirtyDeltaSha256"]},
                "exitCode": None, "cleanup": {"complete": False}, "failures": [], "events": [], "evidence": [],
                "projects": [], "sessions": []}
+    if cache is not None:
+        receipt["sourceBoundCache"] = cache
     write(out / "receipt.json", receipt)  # Durable interrupted attempt exists before spawn.
-    owner = Ownership()
+    owner = None
     logs = []
     interrupted = threading.Event()
     def interrupt(_sig, _frame):
@@ -431,6 +480,37 @@ def run(plan_path):
     for sig in [signal.SIGINT, signal.SIGTERM] + ([signal.SIGBREAK] if os.name == "nt" else []):
         handlers[sig] = signal.signal(sig, interrupt)
     try:
+        artifacts = plan.get("artifacts", []) + [sys.executable, str(HERE)]
+        if os.name == "nt":
+            witness = WindowsInputs(plan["sourceRoot"], artifacts,
+                                    absent_roots=[cache["prefix"]] if cache is not None else [])
+            witnesses.append(witness)
+            witness.start(time.monotonic() + 30)
+            witness.check()
+            # The earlier selection hash is not protected retrospectively.
+            # Repeat the complete baseline only after actual native arming.
+            armed_source = binding(plan["sourceRoot"], artifacts)
+            if armed_source != source:
+                raise ValueError("source/artifact baseline changed before native arm")
+            if cache is not None:
+                bound_artifacts = {Path(p): value for p, value in armed_source["artifacts"].items()}
+                if any(bound_artifacts.get(Path(p)) != value for p, value in cache["helpers"].items()):
+                    raise ValueError("executed raw helper bytes differ from post-arm immutable binding")
+                if os.path.lexists(cache["prefix"]):
+                    raise ValueError("declared source-bound cache prefix appeared before target release")
+            witness.check()
+        else:
+            witness = Witness(plan["sourceRoot"], bound_paths)
+            witnesses.append(witness)
+            for item in artifacts:
+                p = Path(item).resolve()
+                if p.is_dir():
+                    witnesses.append(Witness(p, [], artifact=True))
+                elif p.is_file():
+                    witnesses.append(Witness(p.parent, [], artifact=True, only=p.name))
+                else:
+                    witness.errors.append(f"declared artifact is missing: {p}")
+        owner = Ownership()
         child = owner.launch(plan["command"], plan["cwd"], env)
         receipt["rootPid"] = child.pid
         logs = [Log(pipe, out / (name + ".log"), bounds["logBytesPerStream"], bounds["excerptBytes"])
@@ -459,7 +539,8 @@ def run(plan_path):
         (out / "supervisor-error.txt").write_text(traceback.format_exc())
     finally:
         try:
-            receipt["cleanup"] = owner.cleanup(bounds)
+            receipt["cleanup"] = owner.cleanup(bounds) if owner is not None else {
+                "complete": True, "observedIdentities": [], "targetStarted": False}
         except BaseException as exc:
             receipt["failures"].append(f"cleanup failure: {exc}")
         for sig, handler in handlers.items():
@@ -471,15 +552,39 @@ def run(plan_path):
             if log.overflow:
                 receipt["failures"].append("output overflow")
             receipt["failures"].extend(log.errors)
-    after = binding(plan["sourceRoot"], plan.get("artifacts", []) + [sys.executable, str(HERE)])
-    write(out / "source-after.json", after)
-    for w in witnesses:
-        w.close()
-    changes = [{"root": str(w.root), "changes": w.changes, "errors": w.errors} for w in witnesses]
-    write(out / "integrity.json", changes)
+    after = None
+    try:
+        after = binding(plan["sourceRoot"], plan.get("artifacts", []) + [sys.executable, str(HERE)])
+        write(out / "source-after.json", after)
+    except BaseException as exc:
+        receipt["failures"].append(f"final source/artifact binding failed: {exc}")
+    finally:
+        # One aggregate Windows close deadline; all final protected reads above
+        # remain inside the active observation interval, even after target fail.
+        close_deadline = time.monotonic() + 8
+        for w in witnesses:
+            try:
+                w.close(close_deadline) if os.name == "nt" else w.close()
+            except BaseException as exc:
+                receipt["failures"].append(f"source witness close failed: {exc}")
+    changes = [w.row() if os.name == "nt" else
+               {"root": str(w.root), "changes": w.changes, "errors": w.errors} for w in witnesses]
+    if os.name == "nt":
+        # Persist the whole terminal domain compactly, never a passing prefix.
+        raw_integrity = json.dumps(changes, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+        if len(raw_integrity) > WINDOWS_INTEGRITY_BYTES:
+            receipt["failures"].append("Windows integrity file exceeds64MiB; whole observation rejected")
+            write(out / "integrity-limit.json", {"bytes": len(raw_integrity),
+                  "maximumBytes": WINDOWS_INTEGRITY_BYTES,
+                  "sha256": hashlib.sha256(raw_integrity).hexdigest(), "wholeObservationRejected": True})
+        else:
+            (out / "integrity.json").write_bytes(raw_integrity)
+    else:
+        write(out / "integrity.json", changes)
     for w in witnesses:
         receipt["failures"].extend(w.errors)
-    receipt["bindingStable"] = source == after and not changed_during_run and not any(w.changes or w.errors for w in witnesses)
+    receipt["bindingStable"] = (source == after and not changed_during_run and bool(witnesses)
+                                and not any(w.changes or w.errors for w in witnesses))
     if not receipt["bindingStable"]:
         receipt["failures"].append("source/artifact binding changed during attempt")
     events = out / "events.jsonl"

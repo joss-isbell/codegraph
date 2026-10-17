@@ -136,6 +136,12 @@ def main():
                     "environment": {"MUTABLE_ARTIFACT": str(mutable), "PROBE_SOURCE": str(fixture)},
                     "bounds": {"logBytesPerStream": 32768, "drainSeconds": 0.1,
                                "startupHandshakeSeconds": 0.1, "cleanupSeconds": 3, "sampleSeconds": 0.05}}
+            # Each runner deliberately scrubs inherited PYTHON* settings.
+            # Explicitly redeclare the actual configured wrapper prefix for
+            # nested gates/targets; standalone absent-prefix behavior is unchanged.
+            cache_prefix = os.environ.get("PYTHONPYCACHEPREFIX")
+            if cache_prefix is not None and cache_prefix == sys.pycache_prefix:
+                plan["environment"]["PYTHONPYCACHEPREFIX"] = cache_prefix
             plan_path = proof / (mode + ".plan.json")
             write(plan_path, plan)
             options = {}

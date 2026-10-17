@@ -7,6 +7,11 @@ import { inspect } from 'node:util';
 // The separate build receipt supplies dist for suites that use real workers.
 const root = process.env.BASELINE_ROOT;
 const out = process.env.VALIDATION_OUT;
+const suites = process.argv.slice(2);
+const testNamePattern = process.env.QUERY_TEST_NAME_PATTERN;
+fs.writeFileSync(path.join(out, 'query-selection.json'), JSON.stringify({
+  schemaVersion: 1, suites, testNamePattern: testNamePattern ?? null,
+}, null, 2));
 fs.writeFileSync(path.join(out, 'query-runtime.json'), JSON.stringify({ executable: process.execPath, versions: process.versions,
   platform: process.platform, arch: process.arch, flags: process.execArgv }, null, 2));
 // Vitest 2's JSON reporter only counts test/suite failures. Unhandled errors can
@@ -33,7 +38,7 @@ const diagnosticReporter = {
   onFinished(_files, errors = []) { recordDiagnostics('onFinished', errors); },
 };
 process.once('exit', code => recordDiagnostics('exit', undefined, code));
-const ctx = await startVitest('test', process.argv.slice(2), {
+const ctx = await startVitest('test', suites, {
   root, config: false, workspace: path.join(root, 'scripts/validation/query-workspace.mjs'), run: true, watch: false,
   globals: true, environment: 'node', include: ['__tests__/**/*.test.ts'],
   exclude: ['__tests__/ui-package.test.ts'],
@@ -41,6 +46,7 @@ const ctx = await startVitest('test', process.argv.slice(2), {
   env: { CODEGRAPH_ALLOW_UNSAFE_NODE: '1', CODEGRAPH_TELEMETRY: '0', CODEGRAPH_NO_UPDATE_CHECK: '1' },
   pool: 'forks', poolOptions: { forks: { execArgv: ['--liftoff-only'] } },
   maxWorkers: 1, minWorkers: 1,
+  ...(testNamePattern === undefined ? {} : { testNamePattern }),
   reporters: ['json', diagnosticReporter], outputFile: path.join(out, 'tests.json'),
 }, { cacheDir: path.join(out, 'vite-cache') });
 recordDiagnostics('afterStart');
