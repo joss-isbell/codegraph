@@ -13,7 +13,7 @@ const detail = (value: unknown) => {
 
 function capture(stream: NodeJS.ReadableStream) {
   const pieces: Buffer[] = [];
-  let seenBytes = 0, retainedBytes = 0, failure: string | null = null, closed = false;
+  let seenBytes = 0, retainedBytes = 0, failure: string | null = null, ended = false, closed = false;
   stream.on('data', (chunk: Buffer | string) => {
     const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     seenBytes += bytes.length;
@@ -22,9 +22,10 @@ function capture(stream: NodeJS.ReadableStream) {
     if (seenBytes > LIMIT_BYTES) failure ??= 'native stream exceeded 65536 bytes';
   });
   stream.on('error', error => { failure ??= detail(error); });
+  stream.on('end', () => { ended = true; });
   stream.on('close', () => { closed = true; });
   return () => ({ text: Buffer.concat(pieces, retainedBytes).toString('utf8'), seenBytes, retainedBytes,
-    limitBytes: LIMIT_BYTES, truncated: seenBytes > retainedBytes, failure, closed });
+    limitBytes: LIMIT_BYTES, truncated: seenBytes > retainedBytes, failure, ended, closed });
 }
 
 function nativeCandidate(fixture = 'query-bootstrap-native.cjs', args: string[] = [], ipc = true, executable = process.execPath) {
@@ -82,6 +83,14 @@ function nativeCandidate(fixture = 'query-bootstrap-native.cjs', args: string[] 
   child.on('exit', (exitCode, signal) => { exit = { exitCode, signal, elapsedMs: performance.now() - started }; });
   child.on('close', (exitCode, signal) => { close = { exitCode, signal, elapsedMs: performance.now() - started }; });
   child.on('disconnect', () => { disconnect = { elapsedMs: performance.now() - started }; });
+  const parentDisconnect = { calls: 0, firstCallElapsedMs: null as number | null, error: null as string | null };
+  const originalDisconnect = child.disconnect;
+  child.disconnect = function (this: typeof child) {
+    parentDisconnect.calls++;
+    parentDisconnect.firstCallElapsedMs ??= performance.now() - started;
+    try { return originalDisconnect.call(this); }
+    catch (error) { parentDisconnect.error ??= detail(error); throw error; }
+  };
   const acquire = async () => {
     try {
       if (child.pid === undefined) { await until(() => spawnError !== null, 'actual native spawn error'); return; }
@@ -125,7 +134,8 @@ function nativeCandidate(fixture = 'query-bootstrap-native.cjs', args: string[] 
   return { child, stdout, stderr, acquire, begin, releaseInput,
     observerStarted: () => { observerStartedElapsedMs = performance.now() - started; },
     observerSettled: () => { observerSettledElapsedMs = performance.now() - started; },
-    facts: () => ({ pid: child.pid, exit, close, disconnect, spawnError, stdinError, stdinClosed,
+    facts: () => ({ pid: child.pid, exit, close, disconnect, parentDisconnect: { ...parentDisconnect },
+    runtime: { version: process.version, platform: process.platform, arch: process.arch }, spawnError, stdinError, stdinClosed,
     begun, beginElapsedMs, observerStartedElapsedMs, observerSettledElapsedMs, nativeIdentity, acquisitionError,
     ipc, connected: child.connected, channelReleased: child.channel == null, pidAbsent: absence(), absenceError,
     statuses, statusFailure }) };
@@ -144,9 +154,34 @@ type NativeCandidate = ReturnType<typeof nativeCandidate>;
 function nativeResourcesReleased(native: NativeCandidate) {
   const facts = native.facts();
   if (facts.absenceError) throw new Error(facts.absenceError);
-  return (facts.exit !== null || (facts.pid === undefined && facts.spawnError !== null))
+  // A failed spawn has no process whose readable EOF can be required or invented.
+  const noChild = facts.pid === undefined && facts.spawnError !== null && facts.nativeIdentity === null;
+  const exitedChild = facts.pid !== undefined && facts.exit !== null && native.stdout().ended && native.stderr().ended;
+  return (exitedChild || noChild)
     && native.stdout().closed && native.stderr().closed && facts.stdinClosed
     && (!facts.ipc || facts.disconnect !== null) && !facts.connected && facts.channelReleased && facts.pidAbsent;
+}
+
+function assertDiagnosticChildClose(native: NativeCandidate) {
+  const facts = native.facts();
+  expect(nativeResourcesReleased(native)).toBe(true);
+  expect(facts.exit).not.toBeNull();
+  if (facts.close !== null) {
+    expect(facts.close).toMatchObject({ exitCode: facts.exit!.exitCode, signal: facts.exit!.signal });
+    return 'observed-congruent-with-exit';
+  }
+  // These exact runtimes are source-qualified for this diagnostic only; the
+  // qualified runner must also bind the corresponding executable SHA.
+  const sourceQualifiedRuntime = facts.runtime.arch === 'x64'
+    && ((facts.runtime.platform === 'win32' && facts.runtime.version === 'v24.19.0')
+      || (facts.runtime.platform === 'linux' && facts.runtime.version === 'v22.23.3'));
+  expect(sourceQualifiedRuntime).toBe(true);
+  expect(facts).toMatchObject({ ipc: true,
+    parentDisconnect: { firstCallElapsedMs: expect.any(Number), error: null },
+    disconnect: { elapsedMs: expect.any(Number) } });
+  expect(facts.parentDisconnect.calls).toBeGreaterThan(0);
+  expect(facts.parentDisconnect.firstCallElapsedMs!).toBeLessThanOrEqual(facts.disconnect!.elapsedMs);
+  return 'not-observed-after-parent-disconnect';
 }
 
 interface PhaseFailure { phase: string; detail: string }
@@ -158,7 +193,7 @@ async function closeOwned(native: NativeCandidate): Promise<PhaseFailure[]> {
   };
   attempt('release-input', () => native.releaseInput());
   attempt('release-ipc', () => { if (native.child.connected) native.child.disconnect(); });
-  try { await until(() => nativeResourcesReleased(native), 'owned native exit, pipe closes, IPC release and PID absence'); }
+  try { await until(() => nativeResourcesReleased(native), 'owned native exit, pipe ends/closes, IPC release and PID absence'); }
   catch (error) {
     failures.push({ phase: 'initial-native-release', detail: detail(error) });
     attempt('owned-cleanup-signal', () => {
@@ -190,8 +225,12 @@ async function finishNativeCase(name: string, native: NativeCandidate, projectRo
   attempt('assert-native-release', () => expect(nativeResourcesReleased(native)).toBe(true));
   if (expectedExit !== null) attempt('assert-native-exit', () => expect(native.facts().exit).toMatchObject(expectedExit));
   attempt('assert-stdin', () => expect(native.facts().stdinError).toBeNull());
-  if (process.env.VALIDATION_OUT && native.child.pid !== undefined)
-    attempt('assert-native-identity', () => expect(native.facts().nativeIdentity?.pid).toBe(native.child.pid));
+  attempt('assert-parent-disconnect', () => expect(native.facts().parentDisconnect.error).toBeNull());
+  if (process.env.VALIDATION_OUT && native.child.pid !== undefined) attempt('assert-native-identity', () => {
+    const facts = native.facts();
+    expect(facts.nativeIdentity?.pid).toBe(native.child.pid);
+    if (facts.begun) expect(facts.nativeIdentity!.acquiredElapsedMs).toBeLessThan(facts.beginElapsedMs!);
+  });
   attempt('assert-acquisition', () => expect(native.facts().acquisitionError).toBeNull());
   attempt('assert-stdout-capture', () => expect(native.stdout().failure).toBeNull());
   attempt('assert-stderr-capture', () => expect(native.stderr().failure).toBeNull());
@@ -199,10 +238,18 @@ async function finishNativeCase(name: string, native: NativeCandidate, projectRo
   attempt('assert-status-capture', () => expect(native.facts().statusFailure).toBeNull());
   const evidence: Record<string, unknown> = { scenario: name, projectRoot, observations, primaryFailure,
     secondaryFailures: failures, fixtureRemoved: null, native: null, stdout: null, stderr: null };
-  attempt('fixture-presence', () => { evidence.fixtureRemoved = !existsSync(projectRoot); });
+  attempt('fixture-presence', () => { evidence.fixtureRemoved = !existsSync(projectRoot); expect(evidence.fixtureRemoved).toBe(true); });
   attempt('native-facts', () => { evidence.native = native.facts(); });
   attempt('stdout-facts', () => { evidence.stdout = native.stdout(); });
   attempt('stderr-facts', () => { evidence.stderr = native.stderr(); });
+  if (name === 'unexpected-permitted-discovery') attempt('diagnostic-child-close', () => {
+    const facts = native.facts();
+    const observation = { state: 'incomplete-native-resources', rawClose: facts.close,
+      parentDisconnect: facts.parentDisconnect, disconnect: facts.disconnect, runtime: facts.runtime };
+    evidence.rawChildCloseObservation = observation;
+    const state = assertDiagnosticChildClose(native);
+    if (failures.length === 0 && evidence.fixtureRemoved === true) observation.state = state;
+  });
   evidence.cleanupFailure = failures.length ? 'Native cleanup/evidence failed; see secondaryFailures.' : null;
   if (process.env.VALIDATION_OUT) {
     attempt('evidence-persistence', () => writeFileSync(path.join(process.env.VALIDATION_OUT!, 'bootstrap-' + name + '-native.json'),
@@ -398,6 +445,32 @@ describe('compiled child bootstrap producer', () => {
 });
 
 describe('native parent bootstrap protocol outcomes', () => {
+  it('refuses unexpected permission during unsupported discovery without acknowledging or promoting the candidate', async () => {
+    await nativeCase('unexpected-permitted-discovery', async (native, root, observations) => {
+      native.observerStarted();
+      const pending = awaitDaemonBootstrap(native.child, root, { acknowledgePermission: false });
+      native.begin();
+      const result = await pending;
+      native.observerSettled();
+      observations.result = result;
+      expect(result).toMatchObject({ kind: 'refused', refusal: { code: 'CODEGRAPH_QUERY_POLICY_REFUSED',
+        reason: 'unknown', projectRoot: root } });
+      expect(Object.isFrozen(result)).toBe(true);
+      await until(() => nativeResourcesReleased(native), 'unacknowledged permitted candidate native resource release');
+      const facts = native.facts();
+      expect(facts.statuses).toHaveLength(1);
+      expect(JSON.parse(facts.statuses[0].prefix)).toEqual({ protocol: 1, kind: 'permitted' });
+      expect(facts).toMatchObject({ exit: { exitCode: 0, signal: null },
+        connected: false, channelReleased: true, pidAbsent: true, absenceError: null });
+      observations.rawChildClose = assertDiagnosticChildClose(native);
+      // The unchanged native fixture emits "promoted" for any actual ACK. Its
+      // sole denial event therefore observes the parent guard over real IPC.
+      expect(JSON.parse(native.stdout().text)).toEqual({ event: 'promotion-denied', pid: native.child.pid });
+      expect(native.stdout().failure).toBeNull(); expect(native.stderr().failure).toBeNull();
+      expect(facts.statusFailure).toBeNull(); expect(native.stderr().text).toBe('');
+    }, { fixture: 'query-bootstrap-native.cjs', args: () => [] });
+  }, 30_000);
+
   it('refuses a permitted status mixed with the compact-refusal marker without acknowledgment', async () => {
     await nativeCase('malformed-compact', async (native, root, observations) => {
       const result = await observeBootstrap(native, root);

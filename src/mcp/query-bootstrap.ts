@@ -17,8 +17,10 @@ export type DaemonBootstrapResult =
 const BOOTSTRAP_MILLISECONDS = 15_000;
 const STATUS_BYTES = 65_536;
 
-/** Observe an inert candidate without acquiring service authority. */
-export function awaitDaemonBootstrap(child: ChildProcess, projectRoot: string): Promise<DaemonBootstrapResult> {
+/** Observe an inert candidate; validated startup permission is acknowledged by default. */
+export function awaitDaemonBootstrap(child: ChildProcess, projectRoot: string,
+  options: { acknowledgePermission?: boolean } = {}): Promise<DaemonBootstrapResult> {
+  const acknowledgePermission = options.acknowledgePermission !== false;
   return new Promise(resolve => {
     let settled = false, permittedObserved = false;
     const unknown = (detail: string): DaemonBootstrapResult => ({ kind: 'refused', refusal: new QueryPolicyRefusalError(
@@ -77,6 +79,9 @@ export function awaitDaemonBootstrap(child: ChildProcess, projectRoot: string): 
         const candidatePid = child.pid;
         if (candidatePid === undefined || !Number.isInteger(candidatePid) || candidatePid <= 0) {
           settle(unknown('Candidate startup permission has no proved spawned process identity.')); return;
+        }
+        if (!acknowledgePermission) {
+          settle(unknown('Candidate unexpectedly permitted startup during unsupported discovery; acknowledgment is disabled.')); return;
         }
         try {
           child.send({ protocol: 1, kind: 'acknowledged' }, error => settle(error

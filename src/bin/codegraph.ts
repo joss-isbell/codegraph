@@ -2215,13 +2215,18 @@ program
       process.env.CODEGRAPH_NO_WATCH = '1';
     }
 
+    const qualifiedCandidate = options.mcp && process.env.CODEGRAPH_DAEMON_INTERNAL === '1'
+      && typeof process.send === 'function';
     try {
-      // A path probe can open SQLite and create its WAL sidecars. Validate the
-      // immutable MCP request first, then reuse it after normal path resolution.
+      // MCP hints are lexical only. Qualified transport is consumed/scrubbed
+      // before filesystem discovery; permission must precede schema probing.
+      const hint = options.path ? path.resolve(options.path) : undefined;
       const startup = options.mcp
-        ? (await import('../mcp/query-policy')).captureQueryStartup(process.env, require('os').cpus().length)
+        ? (await import('../mcp/query-startup-transport')).captureMcpQueryStartup(process.env,
+          () => require('os').cpus().length, qualifiedCandidate === true && process.connected === true,
+          hint ?? path.resolve(process.cwd()), typeof process.send === 'function')
         : undefined;
-      const projectPath = options.path ? resolveProjectPath(options.path) : undefined;
+      const projectPath = options.mcp ? hint : options.path ? resolveProjectPath(options.path) : undefined;
       if (options.mcp) {
         // `serve --mcp` is the stdio MCP server an AI agent launches for itself,
         // not a command to run by hand. A human in a terminal would otherwise
@@ -2271,6 +2276,16 @@ program
         console.error(chalk.cyan('  codegraph_status') + '    - Get index status');
       }
     } catch (err) {
+      if (qualifiedCandidate && process.connected) {
+        // A malformed qualified candidate cannot look like genuine pre-service
+        // unavailability and select a writer. Await the bounded terminal status.
+        const { isQueryPolicyRefusal, QueryPolicyRefusalError } = await import('../mcp/query-policy-refusal');
+        const refusal = isQueryPolicyRefusal(err) ? err : new QueryPolicyRefusalError('unknown',
+          path.resolve(options.path ?? process.cwd()), 'Inspect the candidate startup before retrying.',
+          err instanceof Error ? err.message : String(err));
+        try { await (await import('../mcp/query-bootstrap')).reportDaemonBootstrapRefusal(refusal); }
+        catch (failure) { error(`Candidate refusal transport failed: ${failure instanceof Error ? failure.message : String(failure)}`); }
+      }
       error(`Failed to start server: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
     }
