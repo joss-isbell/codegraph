@@ -43,6 +43,29 @@ def load_supervisor():
     return module
 
 
+class ObservedPipe:
+    """Retain the real Log reader's close result; never retry/race-close it."""
+    def __init__(self, pipe):
+        self.pipe = pipe
+        self.closeAttempted, self.closeCompleted, self.closeError = False, False, None
+
+    @property
+    def closed(self):
+        return self.pipe.closed
+
+    def read(self, size):
+        return self.pipe.read(size)
+
+    def close(self):
+        self.closeAttempted = True
+        try:
+            self.pipe.close()
+            self.closeCompleted = True
+        except BaseException as error:
+            # Frozen Log's finally does not catch close errors; caller observes this.
+            self.closeError = (type(error).__name__ + ": " + str(error))[:4096]
+
+
 def run_stage(core, name, command, seconds, output, whole_end, interrupted):
     output.mkdir()
     started = time.monotonic()
@@ -82,7 +105,13 @@ def run_stage(core, name, command, seconds, output, whole_end, interrupted):
             raise ctypes.WinError(assignment_error)
         result["launchState"] = "job-owned"
         for stream, pipe in (("stdout", child.stdout), ("stderr", child.stderr)):
-            logs.append(core.Log(pipe, output / (stream + ".log"), LOG_BYTES, EXCERPT_BYTES))
+            observed = ObservedPipe(pipe)
+            log = core.Log.__new__(core.Log)
+            entry = {"pipe": observed, "log": log, "path": output / (stream + ".log"),
+                     "constructorReturned": False}
+            logs.append(entry)  # retain a partial constructor/possibly starting reader.
+            core.Log.__init__(log, observed, entry["path"], LOG_BYTES, EXCERPT_BYTES)
+            entry["constructorReturned"] = True
         if interrupted.is_set() or time.monotonic() >= end:
             raise RuntimeError("interrupted or command deadline expired before payload release")
         # Both bounded drains exist before the only payload release.
@@ -98,7 +127,7 @@ def run_stage(core, name, command, seconds, output, whole_end, interrupted):
                 raise RuntimeError("interrupted")
             if time.monotonic() >= end:
                 raise RuntimeError("command deadline expired")
-            if any(log.overflow or log.errors for log in logs):
+            if any(entry["log"].overflow or entry["log"].errors for entry in logs):
                 raise RuntimeError("output overflow or log capture failure")
             time.sleep(0.1)
         result["exitCode"] = child.returncode
@@ -141,25 +170,49 @@ def run_stage(core, name, command, seconds, output, whole_end, interrupted):
                 result["exitCode"] = child.returncode
             except BaseException as exc:
                 result["failures"].append(f"gate exit wait failed: {exc}")
-        drain_end = time.monotonic() + 5
-        for log in logs:
-            log.thread.join(timeout=max(0, drain_end - time.monotonic()))
-            if log.thread.is_alive():
-                result["failures"].append("log reader did not finish")
-            if log.overflow:
-                result["failures"].append("output overflow")
-            result["failures"].extend(log.errors)
-            result["logs"][Path(log.path).name] = {
-                "seenBytes": log.total,
-                "retainedBytes": Path(log.path).stat().st_size if Path(log.path).is_file() else None}
-        if child is not None:
-            try:
-                child._handle.Close()
-                result["gateHandleCloseChecked"] = True
-            except BaseException as exc:
-                result["failures"].append(f"gate handle close failed: {exc}")
+        try:
+            drain_end = time.monotonic() + 5
+            for entry in logs:
+                log, observed, path = entry["log"], entry["pipe"], entry["path"]
+                row = result["logs"][path.name] = {"constructorReturned": entry["constructorReturned"],
+                    "joined": False, "pipeClosed": False, "retainedBytes": None}
+                try:
+                    thread = getattr(log, "thread", None)
+                    if thread is None:
+                        observed.close()  # fixed Log has not constructed/started a reader.
+                        raise RuntimeError("partial Log constructor without reader thread")
+                    thread.join(timeout=max(0, drain_end - time.monotonic()))
+                    row["joined"] = not thread.is_alive()
+                except BaseException as exc:
+                    # Unknown/alive reader is never race-closed or retried here.
+                    result["failures"].append(f"reader join failed ({path.name}): {type(exc).__name__}: {exc}")
+                try:
+                    row.update(pipeCloseAttempted=observed.closeAttempted,
+                        pipeCloseCompleted=observed.closeCompleted, pipeCloseError=observed.closeError,
+                        seenBytes=getattr(log, "total", None), overflow=getattr(log, "overflow", None),
+                        errors=list(getattr(log, "errors", [])))
+                    row["pipeClosed"] = observed.closed
+                    if (not row["constructorReturned"] or not row["joined"] or not row["pipeClosed"]
+                            or not row["pipeCloseAttempted"] or not row["pipeCloseCompleted"]
+                            or row["pipeCloseError"] or row["overflow"] or row["errors"]):
+                        result["failures"].append(f"log EOF/drain/checked pipe close incomplete ({path.name})")
+                    result["failures"].extend(row["errors"])
+                except BaseException as exc:
+                    result["failures"].append(f"reader observation failed ({path.name}): {type(exc).__name__}: {exc}")
+                try:
+                    row["retainedBytes"] = path.stat().st_size if path.is_file() else None
+                except BaseException as exc:
+                    result["failures"].append(f"log stat failed ({path.name}): {type(exc).__name__}: {exc}")
+        finally:
+            # Reader join/state/stat failures cannot suppress this exact retained close.
+            if child is not None:
+                try:
+                    child._handle.Close()
+                    result["gateHandleCloseChecked"] = True
+                except BaseException as exc:
+                    result["failures"].append(f"gate handle close failed: {exc}")
     result["elapsedSeconds"] = time.monotonic() - started
-    result["failureExcerpt"] = b"\n".join(log.tail for log in logs)[-EXCERPT_BYTES:].decode("utf-8", errors="replace")
+    result["failureExcerpt"] = b"\n".join(getattr(entry["log"], "tail", b"") for entry in logs)[-EXCERPT_BYTES:].decode("utf-8", errors="replace")
     if time.monotonic() >= whole_end:
         result["failures"].append("whole CI deadline expired")
     passed = (result["exitCode"] == 0 and result["cleanup"].get("complete") is True
