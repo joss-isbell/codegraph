@@ -400,6 +400,8 @@ export interface LocalHandshakeDeps {
    *  unreachable, preserving the "a broken daemon never wedges a session"
    *  guarantee. Called again whenever the previous engine was retired (#2277). */
   makeEngine(): MCPEngine;
+  /** Release only this engine's caller-owned authority after its successful native drain. */
+  releaseEngine?: (engine: MCPEngine) => Promise<void>;
   /** Project root for the fallback engine's lazy init. */
   root: string;
   /** Release caller-owned fallback reservations after engines/borrowers drain.
@@ -816,6 +818,7 @@ export async function runLocalHandshakeProxy(input: LocalHandshakeInput): Promis
       await Promise.allSettled([...localCalls]);
       if (retired.drain) await retired.drain();
       else await retired.stop();
+      await proxyDeps().releaseEngine?.(retired);
     })();
     retirementDrains.set(retired, draining);
     try {

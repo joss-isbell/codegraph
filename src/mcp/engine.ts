@@ -464,10 +464,14 @@ export class MCPEngine {
   private async releaseExplicitProject(cg: CodeGraph): Promise<void> {
     const leases = this.explicitProjects.get(cg);
     if (!leases) return;
-    const results = await Promise.allSettled([...leases].map(lease => this.releaseProjectAcquisition(lease.acquisition)));
+    const snapshot = [...leases];
+    const results = await Promise.allSettled(snapshot.map(lease => this.releaseProjectAcquisition(lease.acquisition)));
+    // A new cache owner can join this same reader while old cleanup awaits.
+    // Return only successfully released snapshot holders, never its new lease.
+    results.forEach((result, index) => { if (result.status === 'fulfilled') leases.delete(snapshot[index]); });
+    if (this.explicitProjects.get(cg) === leases && leases.size === 0) this.explicitProjects.delete(cg);
     const failures = results.flatMap(result => result.status === 'rejected' ? [result.reason] : []);
     if (failures.length) throw new AggregateError(failures, 'Explicit project cleanup failed');
-    this.explicitProjects.delete(cg);
   }
 
   private async releaseProjectAcquisition(holder: ProjectAcquisition): Promise<void> {
