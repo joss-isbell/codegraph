@@ -22,6 +22,31 @@ const one = (values: any[], name: string): any => {
 };
 const positive = (mode: Mode): boolean => mode === 'utf8-boundary' || mode === 'crlf-boundary' || mode === 'utf8-tail-split';
 const expectedOpaque = (mode: Mode): Buffer => mode === 'utf8-tail-split' ? utf8Tail : opaqueTail;
+const attachment = (input: any[]): any => one(input.filter(value => value.purpose === 'attachment'), 'actual-native-socket-observer-installed');
+/** Roles come from the executed preparation/acquisition seams, never ordinals.
+ * Every observed inspection remains accountable, not discarded as extra noise. */
+function requireSocketLifecycle(input: any[], requesterPid: number, endpoint: string, final = false): any {
+  const installed = events(input, 'actual-native-socket-observer-installed'), selected = attachment(input);
+  expect(installed.map(value => value.purpose).sort()).toEqual(['prepare-admission', 'attempt-admission', 'attachment'].sort());
+  expect(new Set(installed.map(value => value.socketId)).size).toBe(installed.length);
+  for (const value of installed) {
+    expect(value).toMatchObject({ pid: requesterPid, endpoint });
+    expect(value.stack).toContain('connectObservedService');
+    expect(value.stack).toContain(value.purpose === 'attachment' ? 'connectHeldService' : 'admitQueryProject');
+    const own = input.filter(event => event.socketId === value.socketId);
+    expect(one(own, 'actual-requester-socket-native-connect')).toMatchObject({ pid: requesterPid, endpoint });
+    expect(one(own, 'actual-hello-timer-installed')).toMatchObject({ delay: 3000, purpose: value.purpose, endpoint });
+    expect(events(own, 'actual-hello-timer-fired')).toEqual([]);
+    if (final || value.purpose !== 'attachment') expect(one(own, 'actual-requester-socket-native-close')).toMatchObject({ hadError: false, destroyed: true });
+  }
+  expect(events(input, 'actual-requester-socket-native-connect').map(value => value.socketId).sort())
+    .toEqual(installed.map(value => value.socketId).sort());
+  expect(events(input, 'actual-hello-timer-installed').map(value => value.socketId).sort())
+    .toEqual(installed.map(value => value.socketId).sort());
+  if (final) expect(events(input, 'actual-requester-socket-native-close').map(value => value.socketId).sort())
+    .toEqual(installed.map(value => value.socketId).sort());
+  return selected;
+}
 
 async function indexed(root: string): Promise<void> {
   fs.mkdirSync(root);
@@ -44,9 +69,10 @@ function refusal(reply: any, root: string): void {
  * the old parser incorrectly permits its controlled continuation. */
 function requireNativeFrame(mode: Mode, daemon: any[], input: any[], before: ReturnType<typeof parseQueryDiagnostics>, requesterPid: number, root: string): Record<string, unknown> {
   const decorated = one(daemon, 'actual-decorated-hello'), frame = Buffer.from(decorated.frameBase64, 'base64');
+  const selected = attachment(input), socketId = selected.socketId, target = input.filter(value => value.socketId === socketId);
   const nl = frame.indexOf(10), original = Buffer.from(decorated.originalBase64, 'base64');
   const actual = JSON.parse(original.toString('utf8')), modified = JSON.parse(frame.subarray(0, nl).toString('utf8'));
-  expect(decorated).toMatchObject({ mode, requesterPid, authorityUnchanged: true });
+  expect(decorated).toMatchObject({ mode, requesterPid, socketId, purpose: 'attachment', authorityUnchanged: true });
   expect(sha256(frame)).toBe(decorated.frameSha256); expect(sha256(original)).toBe(decorated.originalSha256);
   delete modified.fixturePadding; expect(modified).toEqual(actual);
   expect(actual.pid).toBe(before.ownership.pid); expect(actual.protocol).toBe(1);
@@ -58,20 +84,35 @@ function requireNativeFrame(mode: Mode, daemon: any[], input: any[], before: Ret
   expect(actual.queryExecution.implementation).toEqual(before.implementation);
   expect(decorated.owners.daemon).toMatchObject({ kind: 'live', value: { pid: before.ownership.pid, socketPath: actual.socketPath } });
   expect(decorated.owners.writer).toMatchObject({ kind: 'live', value: { pid: before.ownership.pid } });
-  expect(one(input, 'actual-requester-socket-native-connect')).toMatchObject({ pid: requesterPid, socketId: 1, endpoint: actual.socketPath });
-  expect(one(input, 'actual-native-socket-observer-installed')).toMatchObject({ pid: requesterPid, socketId: 1, endpoint: actual.socketPath });
+  requireSocketLifecycle(input, requesterPid, actual.socketPath);
+  const armed = one(input, 'actual-attachment-decoration-armed');
+  expect(armed).toMatchObject({ pid: requesterPid, socketId, purpose: 'attachment', endpoint: actual.socketPath });
+  expect(BigInt(armed.monotonicNs)).toBeGreaterThan(BigInt(one(input, 'actual-acquisition-released-after-buffered-input').monotonicNs));
+  for (const inspection of events(input, 'actual-native-socket-observer-installed').filter(value => value.socketId !== socketId)) {
+    const chunks = events(input.filter(value => value.socketId === inspection.socketId), 'actual-predecoder-chunk');
+    expect(chunks.length).toBeGreaterThan(0);
+    expect(chunks.every(value => Buffer.from(value.base64, 'base64').length === value.bytes)).toBe(true);
+    const received = Buffer.concat(chunks.map(value => Buffer.from(value.base64, 'base64')));
+    expect(received.at(-1)).toBe(10); expect(received.indexOf(10)).toBe(received.length - 1);
+    const hello = JSON.parse(received.toString('utf8')); expect(hello.fixturePadding).toBeUndefined();
+    expect(hello).toMatchObject({ codegraph: actual.codegraph, pid: actual.pid, protocol: actual.protocol, socketPath: actual.socketPath,
+      queryExecution: { implementation: actual.queryExecution.implementation, requested: actual.queryExecution.requested,
+        effective: actual.queryExecution.effective, ownership: actual.queryExecution.ownership, project: actual.queryExecution.project } });
+    expect(events(daemon, 'actual-unmodified-hello').some(value => value.sha256 === sha256(received)
+      && value.originalBase64 === received.toString('base64') && value.reason === 'not-armed')).toBe(true);
+  }
   expect(one(input, 'actual-acquisition-released-after-buffered-input').consumed).toEqual([100, 101]);
   expect(events(input, 'actual-actionable-input-consumed').map(value => value.id)).toEqual([100, 101, 102]);
-  expect(one(input, 'actual-hello-timer-installed').delay).toBe(3000);
+  expect(one(target, 'actual-hello-timer-installed').delay).toBe(3000);
   expect(events(input, 'actual-hello-timer-fired')).toEqual([]);
-  const chunks = events(input, 'actual-predecoder-chunk'); expect(chunks.length).toBeGreaterThan(0);
+  const chunks = events(target, 'actual-predecoder-chunk'); expect(chunks.length).toBeGreaterThan(0);
   let received = Buffer.concat(chunks.map(value => Buffer.from(value.base64, 'base64')));
   // Each observed native chunk is retained completely in this tiny fixture.
   expect(chunks.every(value => Buffer.from(value.base64, 'base64').length === value.bytes)).toBe(true);
-  expect(chunks.every(value => value.pid === requesterPid && value.socketId === 1)).toBe(true);
+  expect(chunks.every(value => value.pid === requesterPid && value.socketId === socketId)).toBe(true);
   if (mode === 'utf8-tail-split') {
-    const native = events(input, 'actual-tail-native-chunk');
-    expect(native.every(value => value.pid === requesterPid && value.socketId === 1
+    const native = events(target, 'actual-tail-native-chunk');
+    expect(native.every(value => value.pid === requesterPid && value.socketId === socketId
       && Buffer.from(value.base64, 'base64').length === value.bytes)).toBe(true);
     const all = Buffer.concat(native.map(value => Buffer.from(value.base64, 'base64')));
     received = all.subarray(0, frame.length);
@@ -91,14 +132,14 @@ function requireNativeFrame(mode: Mode, daemon: any[], input: any[], before: Ret
       .toEqual(Buffer.from(terminal.base64, 'base64'));
     const continuationNative = native[prefixNativeIndex + 1]; expect(continuationNative).toBeDefined();
     expect(Buffer.from(continuationNative.base64, 'base64')[0]).toBe(169);
-    const calls = events(input, 'actual-tail-set-encoding-return');
+    const calls = events(target, 'actual-tail-set-encoding-return');
     expect(calls.length).toBeGreaterThan(0); expect(calls.length).toBeLessThanOrEqual(2);
     expect(calls[0]).toMatchObject({ encoding: 'utf8', call: 1, sawLf: true });
     expect(calls[0].stack).toContain('connectObservedService');
     expect(BigInt(prefixNative.monotonicNs)).toBeLessThan(BigInt(calls[0].monotonicNs));
     for (const value of calls.slice(1)) { expect(value.encoding).toBe('utf8'); expect(value.stack).toContain('attachDaemon'); }
     const registered = one(input, 'actual-tail-consumer-registered'), released = one(input, 'actual-tail-consumer-barrier-released');
-    expect(registered).toMatchObject({ root, requesterPid, socketId: 1, rawBytes: decorated.split, sawLf: true, encodingCalls: calls.length });
+    expect(registered).toMatchObject({ root, requesterPid, socketId, rawBytes: decorated.split, sawLf: true, encodingCalls: calls.length });
     expect(registered.stack).toContain('attachDaemon');
     expect(BigInt(registered.monotonicNs)).toBeGreaterThan(BigInt(calls.at(-1).monotonicNs));
     expect(BigInt(released.monotonicNs)).toBeGreaterThan(BigInt(registered.monotonicNs));
@@ -110,15 +151,15 @@ function requireNativeFrame(mode: Mode, daemon: any[], input: any[], before: Ret
       expect(BigInt(value.monotonicNs)).toBeGreaterThan(BigInt(released.monotonicNs));
     }
     const consumerAck = one(daemon, 'actual-tail-consumer-acknowledgement').ack;
-    expect(consumerAck).toMatchObject({ root, requesterPid, socketId: 1, rawBytes: decorated.split, sawLf: true });
-    expect(one(daemon, 'actual-prefix-acknowledgement').ack).toMatchObject({ requesterPid, rawBytes: decorated.split, sawLf: true });
+    expect(consumerAck).toMatchObject({ root, requesterPid, socketId, rawBytes: decorated.split, sawLf: true });
+    expect(one(daemon, 'actual-prefix-acknowledgement').ack).toMatchObject({ requesterPid, socketId, rawBytes: decorated.split, sawLf: true });
     const continuation = one(daemon, 'held-continuation-released'); expect(continuation.firstByte).toBe(169);
     const completed = events(daemon, 'native-frame-write-complete');
     expect(completed.map(value => value.phase)).toEqual(['prefix', 'continuation']);
     expect(completed.every(value => value.error === null)).toBe(true);
     expect(completed.reduce((sum, value) => sum + value.bytes, 0)).toBe(frame.length);
     expect(one(daemon, 'actual-tail-consumer-release-written').continuationSha256).toBe(sha256(frame.subarray(decorated.split)));
-    expect(released.release).toMatchObject({ phase: 'actual-native-continuation-write-completed', continuationSha256: sha256(frame.subarray(decorated.split)) });
+    expect(released.release).toMatchObject({ socketId, phase: 'actual-native-continuation-write-completed', continuationSha256: sha256(frame.subarray(decorated.split)) });
     expect(BigInt(registered.monotonicNs)).toBeLessThan(BigInt(consumerAck.monotonicNs));
   } else if (mode === 'utf8-prefix-dangling') {
     const prefix = one(daemon, 'native-prefix-submitted');
@@ -179,21 +220,22 @@ function requireNativeFrame(mode: Mode, daemon: any[], input: any[], before: Ret
     const hello = JSON.parse(bytes.toString('utf8')); expect(hello.fixturePadding).toBeUndefined();
     expect(hello).toEqual(value.hello); expect(hello.pid).toBe(actual.pid); expect(hello.socketPath).toBe(actual.socketPath);
   }
-  return { requesterPid, socketId: 1, daemonPid: actual.pid, root, socketPath: actual.socketPath,
+  return { requesterPid, socketId, daemonPid: actual.pid, root, socketPath: actual.socketPath,
     transmittedSha256: sha256(frame), receivedSha256: sha256(received), receivedBytes: received.length,
     expectedReceivedPrefixSha256: sha256(frame.subarray(0, received.length)), completeFrameReceived: received.equals(frame) };
 }
 
 function requireByteRefusalCausality(daemon: any[], input: any[]): void {
-  const close = one(input, 'actual-requester-socket-native-close'), timer = one(input, 'actual-hello-timer-installed');
+  const socketId = attachment(input).socketId, target = input.filter(value => value.socketId === socketId);
+  const close = one(target, 'actual-requester-socket-native-close'), timer = one(target, 'actual-hello-timer-installed');
   const withheld = one(daemon, 'continuation-withheld-after-native-byte-refusal');
   expect(close).toMatchObject({ hadError: false, rawBytes: 4097, sawLf: false, destroyed: true });
   expect(BigInt(close.monotonicNs)).toBeLessThan(BigInt(timer.installedNs) + 3000000000n);
   expect(events(input, 'actual-hello-timer-fired')).toEqual([]);
-  expect(events(input, 'actual-native-read-EOF').filter(value => !value.destroyed)).toEqual([]);
+  expect(events(target, 'actual-native-read-EOF').filter(value => !value.destroyed)).toEqual([]);
   expect(events(daemon, 'held-continuation-released')).toEqual([]);
   expect(events(daemon, 'native-prefix-still-open-before-continuation')).toEqual([]);
-  expect(withheld.close).toMatchObject({ requesterPid: close.pid, rawBytes: 4097, sawLf: false, hadError: false });
+  expect(withheld.close).toMatchObject({ requesterPid: close.pid, socketId, rawBytes: 4097, sawLf: false, hadError: false });
   expect(BigInt(withheld.monotonicNs)).toBeGreaterThanOrEqual(BigInt(close.monotonicNs));
   const frame = Buffer.from(one(daemon, 'actual-decorated-hello').frameBase64, 'base64');
   expect(Buffer.from(withheld.continuationBase64, 'base64')).toEqual(frame.subarray(4097));
@@ -232,12 +274,13 @@ describe('actual shared-service hello has a raw 4096-byte pre-LF budget', () => 
     const final = (): void => {
       const observed = input.read(true), framed = daemon.read(true);
       requireFramingTrace(input, observed); requireFramingTrace(daemon, framed);
-      expect(one(observed, 'requester-observer-final')).toMatchObject({ sockets: 1, firstError: null });
+      const selected = attachment(observed), installed = events(observed, 'actual-native-socket-observer-installed');
+      expect(one(observed, 'requester-observer-final')).toMatchObject({ sockets: installed.length, targetSocketId: selected.socketId, firstError: null });
       expect(one(framed, 'daemon-observer-final')).toMatchObject({ decorated: 1, firstError: null });
       expect(one(observed, 'actual-input-EOF')).toMatchObject({ partialBytes: 0, firstError: null });
-      expect(one(observed, 'actual-requester-socket-native-close').hadError).toBe(false);
+      requireSocketLifecycle(observed, peer!.child.pid!, selected.endpoint, true);
       expect(one(framed, 'decorated-socket-native-close').hadError).toBe(false);
-      expect(events(observed, 'requester-factory-observer-installed')).toHaveLength(1);
+      expect(one(observed, 'requester-factory-observer-installed')).toMatchObject({ branch: 'prepared-deps', root });
       expect(events(observed, 'requester-factory-invoked')).toEqual([]);
       if (!before || !peer) throw new Error('Framing prefix did not establish owned actual service/requester');
       requireNativeFrame(mode, framed, observed, before, peer.child.pid!, root);
@@ -273,7 +316,7 @@ describe('actual shared-service hello has a raw 4096-byte pre-LF budget', () => 
       await peer.initialize();
       const armed = { root, mode, requesterPid: peer.child.pid };
       evidence.armed = armed;
-      fs.writeFileSync(control, JSON.stringify(armed) + '\n');
+      fs.writeFileSync(control + '.request', JSON.stringify(armed) + '\n');
       const waiting = Promise.all([peer.tool('frameFirst', 100), peer.tool('frameBuffered', 101, root)]); void waiting.catch(() => {});
       await until(() => {
         const values = input.read(); requireFramingTrace(input, values);
@@ -295,6 +338,7 @@ describe('actual shared-service hello has a raw 4096-byte pre-LF budget', () => 
       result(ownerSurvives, 'ownerSurvives'); expect(after.ownership).toEqual(before.ownership); expect(after.effective).toEqual(before.effective);
       expect(framingOwners(root)).toEqual(locks); expect(framingSpawns(root)).toEqual(candidates);
       const framed = daemon.read(), observed = input.read(); requireFramingTrace(daemon, framed); requireFramingTrace(input, observed);
+      const socketsAtResponse = events(observed, 'actual-native-socket-observer-installed');
       evidence.frameCorrelation = requireNativeFrame(mode, framed, observed, before, peer.child.pid!, root); evidence.nativeFramePreconditionsPassed = true;
       if (positive(mode)) {
         [replies[0], replies[1], next].forEach((reply, index) => result(reply, ['frameFirst', 'frameBuffered', 'frameNew'][index]));
@@ -305,14 +349,14 @@ describe('actual shared-service hello has a raw 4096-byte pre-LF budget', () => 
         expect(peer.text('stdout').split(expectedOpaque(mode).toString('utf8')).length - 1).toBe(1);
         if (mode === 'utf8-tail-split') {
           expect(peer.text('stdout')).not.toContain('\uFFFD');
-          expect(events(observed, 'actual-tail-set-encoding-return')).toHaveLength(1);
+          expect(events(observed.filter(value => value.socketId === attachment(observed).socketId), 'actual-tail-set-encoding-return')).toHaveLength(1);
         }
       } else {
         for (const reply of [...replies, next]) refusal(reply, root);
         if (mode === 'utf8-prefix-dangling') requireByteRefusalCausality(framed, observed);
       }
       await wait(350); // greater than three configured100ms retry intervals
-      expect(events(input.read(), 'actual-native-socket-observer-installed')).toHaveLength(1);
+      expect(events(input.read(), 'actual-native-socket-observer-installed')).toEqual(socketsAtResponse);
       expect(events(input.read(), 'requester-factory-invoked')).toEqual([]);
       expect(framingOwners(root)).toEqual(locks); expect(framingSpawns(root)).toEqual(candidates);
       requireHistory(workers.read(), mode, before.ownership.pid, before.ownership.generation);
