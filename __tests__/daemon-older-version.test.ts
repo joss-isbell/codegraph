@@ -1,20 +1,15 @@
 /**
- * A launcher replaces a daemon from an older install (#2335).
+ * Explicit daemon management and ordinary acquisition of another version.
  *
  * A daemon keeps running the code it started with. The 1.6.1 daemon in #2335
  * outlived an upgrade to 1.6.2, went on loading grammars from the install the
  * upgrade removed, and wrote every file its watcher re-indexed as empty. A
- * launcher that found it could only serve its own session in-process, read-only:
- * the old daemon held the project's writer lock and file watcher, so no daemon
- * from the new install could start. Daemons from before the fix cannot notice
- * the upgrade themselves, so the launcher acts: a daemon of an OLDER release is
- * stopped the way `codegraph daemon` stops one (identity-checked SIGTERM, a
- * graceful shutdown on POSIX) and one from the launcher's own install takes its
- * place. The launcher hears an older daemon's hello on its own socket, or —
- * when it listens elsewhere (on Windows, daemons before #2278 named their pipe
- * after the root as typed) — finds it by the project lock. A daemon of the
- * same, a newer or an unknown version is never touched, so two installed
- * versions cannot fight over the daemon.
+ * launcher must not solve this by signaling that daemon or serving around its
+ * unproved policy. Ordinary acquisition now refuses an older, newer or unknown
+ * service without changing the owner, its index or locks. A failed usual socket
+ * probe is not permission to replace a live owner recorded in the project lock.
+ * The explicit stopOlderDaemon utility and writer handover are still tested
+ * independently; only a separately authorized management action may use them.
  *
  * The end-to-end cases run real daemons of other versions: this build's dist/
  * linked into a temp "install" whose package.json carries another version. A
@@ -28,14 +23,17 @@ import * as fs from 'fs';
 import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
-import { CodeGraph } from '../src';
-import { encodeLockInfo, getDaemonPidPath, getDaemonSocketPath } from '../src/mcp/daemon-paths';
+import { createHash } from 'crypto';
+import { isUtf8 } from 'buffer';
+import { StringDecoder } from 'string_decoder';
+import { CodeGraph, getDatabasePath } from '../src';
+import { encodeLockInfo, getDaemonPidPath, getDaemonSocketCandidates, getDaemonSocketPath } from '../src/mcp/daemon-paths';
 import { isProcessAlive, stopOlderDaemon } from '../src/mcp/daemon-registry';
 import { connectWithHello } from '../src/mcp/proxy';
 import { CodeGraphPackageVersion, isOlderRelease } from '../src/mcp/version';
 import { getWriterPidPath, readWriterLock, swapWriterLock } from '../src/mcp/writer-lock';
 import { WASM_RUNTIME_FLAGS } from '../src/extraction/wasm-runtime-flags';
-import { recordSpawns, removeSpawnLog, settleLosingCandidates } from './daemon-candidates';
+import { recordSpawns, removeSpawnLog, settleLosingCandidates, spawnLogFor } from './daemon-candidates';
 
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
 const DIST = path.resolve(__dirname, '../dist');
@@ -99,11 +97,7 @@ describe('connectWithHello', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it.each([
-    [OLDER, 'older-version', false],
-    [NEWER, 'version-mismatch', true],
-    ['0.0.0-unknown', 'version-mismatch', true],
-  ])('reports a %s daemon as %s', async (version, expected, logged) => {
+  it.each([OLDER, NEWER, '0.0.0-unknown'])('refuses a %s daemon with explicit unknown-policy guidance', async (version) => {
     const socketPath = listenPath(dir, 'daemon');
     server = net.createServer((socket) => {
       socket.write(JSON.stringify({ codegraph: version, pid: process.pid, socketPath, protocol: 1 }) + '\n');
@@ -111,9 +105,11 @@ describe('connectWithHello', () => {
     await listen(server, socketPath);
     const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     try {
-      expect(await connectWithHello(socketPath, '1.6.2')).toBe(expected);
-      // An older daemon is the launcher's to report; it is not a mismatch to serve around.
-      expect(stderr.mock.calls.some(([line]) => String(line).includes('differs from ours'))).toBe(logged);
+      await expect(connectWithHello(socketPath, '1.6.2')).rejects.toMatchObject({
+        code: 'CODEGRAPH_QUERY_POLICY_REFUSED', reason: 'unknown', projectRoot: socketPath,
+        guidance: expect.stringContaining(socketPath),
+      });
+      expect(stderr.mock.calls.some(([line]) => String(line).includes('Attached to shared daemon'))).toBe(false);
     } finally {
       stderr.mockRestore();
     }
@@ -303,7 +299,9 @@ describe('stopOlderDaemon', () => {
     });
     await listen(server, socketPath);
     expect(await stopOlderDaemon(root, '1.6.2')).toBeNull();
-    expect(await connectWithHello(socketPath, '1.6.2')).toBe('older-version');
+    await expect(connectWithHello(socketPath, '1.6.2')).rejects.toMatchObject({
+      code: 'CODEGRAPH_QUERY_POLICY_REFUSED', reason: 'unknown', projectRoot: socketPath,
+    });
   });
 
   it('does not act on an unreadable lock', async () => {
@@ -339,18 +337,96 @@ interface Session {
   child: ChildProcessWithoutNullStreams;
   stdout: string[];
   stderr: string[];
+  root: string;
+  kind: 'launcher' | 'daemon';
+  closed: boolean;
+  errors: string[];
+  capture: { stdout: LineCapture; stderr: LineCapture };
+  refused: Array<{ id: number; root: string; label: string }>;
 }
 
-function lines(stream: NodeJS.ReadableStream, into: string[]): void {
+interface LineCapture {
+  seenBytes: number;
+  retainedBytes: number;
+  eof: boolean;
+  tail: string;
+  raw: Buffer;
+  errors: string[];
+}
+
+function lines(stream: NodeJS.ReadableStream, into: string[], protocol: boolean, maximum: number): LineCapture {
+  const capture: LineCapture = { seenBytes: 0, retainedBytes: 0, eof: false, tail: '', raw: Buffer.alloc(maximum), errors: [] };
+  const fail = (detail: string) => { if (capture.errors.length < 16) capture.errors.push(detail.slice(0, 2048)); };
+  const decoder = new StringDecoder('utf8');
   let buffer = '';
-  stream.on('data', (chunk: Buffer) => {
-    buffer += chunk.toString('utf8');
+  const consume = (text: string) => {
+    buffer += text;
     let idx: number;
     while ((idx = buffer.indexOf('\n')) !== -1) {
-      into.push(buffer.slice(0, idx));
+      const line = buffer.slice(0, idx);
       buffer = buffer.slice(idx + 1);
+      if (into.length >= 4096) { fail('bounded line capture overflow'); continue; }
+      into.push(line);
+      if (protocol) {
+        try {
+          const value = JSON.parse(line);
+          if (!value || typeof value !== 'object' || Array.isArray(value) || value.jsonrpc !== '2.0') fail('invalid MCP stdout frame');
+          else if (value.method !== undefined ? typeof value.method !== 'string' || value.result !== undefined || value.error !== undefined
+            : value.id === undefined || (value.result !== undefined) === (value.error !== undefined)) fail('invalid MCP stdout envelope');
+        } catch { fail('malformed MCP stdout JSON frame'); }
+      }
     }
+  };
+  stream.on('data', (chunk: Buffer) => {
+    capture.seenBytes += chunk.length;
+    const kept = chunk.subarray(0, Math.max(0, maximum - capture.retainedBytes));
+    kept.copy(capture.raw, capture.retainedBytes); capture.retainedBytes += kept.length;
+    if (kept.length !== chunk.length) fail('bounded raw capture overflow');
+    consume(decoder.write(kept)); capture.tail = buffer;
   });
+  stream.on('end', () => {
+    consume(decoder.end()); capture.eof = true; capture.tail = buffer;
+    if (protocol && !isUtf8(capture.raw.subarray(0, capture.retainedBytes))) fail('invalid UTF-8 MCP stdout');
+    if (protocol && buffer.length) fail('unterminated MCP stdout frame at EOF');
+  });
+  stream.on('error', error => fail('stream error: ' + String(error)));
+  stream.on('close', () => {
+    if (!capture.eof) fail('stream closed without EOF');
+  });
+  return capture;
+}
+
+function observeSession(child: ChildProcessWithoutNullStreams, root: string, kind: Session['kind']): Session {
+  const stdout: string[] = [], stderr: string[] = [];
+  const session: Session = { child, root, kind, stdout, stderr, closed: false, errors: [], refused: [],
+    capture: { stdout: lines(child.stdout, stdout, kind === 'launcher', 8 * 1024 * 1024),
+      stderr: lines(child.stderr, stderr, false, 1024 * 1024) } };
+  const fail = (detail: string) => { if (session.errors.length < 16) session.errors.push(detail.slice(0, 2048)); };
+  child.on('error', error => fail('child error: ' + String(error)));
+  child.stdin.on('error', error => fail('stdin error: ' + String(error)));
+  child.on('close', () => { session.closed = true; });
+  return session;
+}
+
+/** Close/EOF, not merely exit: all terminal protocol bytes must be observable. */
+async function closeSession(session: Session): Promise<void> {
+  const { child } = session;
+  if (child.exitCode === null && child.signalCode === null) {
+    if (session.kind === 'daemon') child.kill('SIGKILL'); // owned fixture stop, after assertions
+    else child.stdin.end();
+  }
+  try {
+    await waitFor(() => session.closed && session.capture.stdout.eof && session.capture.stderr.eof, 5000, 'owned child close and both stream EOFs');
+  } catch (primary) {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    // Bound the repair too; an incomplete tail still fails even if SIGKILL works.
+    await waitFor(() => session.closed && session.capture.stdout.eof && session.capture.stderr.eof, 5000, 'forced owned child close and EOFs')
+      .catch(error => { session.errors.push(String(error).slice(0, 2048)); });
+    throw primary;
+  }
+  if (session.kind === 'launcher' && (child.exitCode !== 0 || child.signalCode !== null)) {
+    throw new Error(`Owned launcher cleanup exit ${child.exitCode}/${child.signalCode}`);
+  }
 }
 
 function findResponse(stdout: string[], id: number): any | null {
@@ -378,7 +454,8 @@ function waitFor<T>(predicate: () => T | undefined | null | false, timeoutMs: nu
 }
 
 function isAlive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; } catch { return false; }
+  try { process.kill(pid, 0); return true; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false; return true; }
 }
 
 async function waitProcessExit(pid: number, timeoutMs: number): Promise<boolean> {
@@ -396,6 +473,8 @@ describe('a launcher meeting a daemon of another version (#2335)', () => {
   let realRoot: string;
   const sessions: Session[] = [];
   const daemonPids = new Set<number>();
+  const extraInstalls: string[] = [];
+  let preserveInstalls = false;
 
   beforeAll(() => {
     olderInstall = makeInstall(OLDER);
@@ -403,7 +482,9 @@ describe('a launcher meeting a daemon of another version (#2335)', () => {
   });
 
   afterAll(async () => {
-    for (const dir of [olderInstall, newerInstall]) {
+    // An incomplete fixture tail keeps its installs/links and ownership evidence.
+    if (preserveInstalls) return;
+    for (const dir of [olderInstall, newerInstall, ...extraInstalls]) {
       if (!dir) continue;
       // The link first: removing an install must never reach this checkout's modules.
       try { fs.unlinkSync(path.join(dir, 'node_modules')); } catch { /* not created */ }
@@ -423,25 +504,69 @@ describe('a launcher meeting a daemon of another version (#2335)', () => {
     // Every launcher first (with the runtime flags there is no relaunch child),
     // then the losing daemon candidates, then the daemons themselves — and only
     // then the fixture: on Windows a live process inside it blocks the removal.
-    await Promise.all(sessions.map(async ({ child }) => {
-      if (child.exitCode !== null || child.signalCode !== null) return;
-      const exited = once(child, 'exit');
-      child.kill('SIGKILL');
-      await exited;
-    }));
-    sessions.length = 0;
+    const cleanup: Array<{ phase: string; error: string | null }> = [];
+    let terminalAuditComplete = false, fixtureRemoved = false, spawnLogRemoved = false;
+    const attempt = async (phase: string, action: () => unknown | Promise<unknown>) => {
+      try { await action(); cleanup.push({ phase, error: null }); }
+      catch (error) { cleanup.push({ phase, error: error instanceof Error ? error.stack ?? error.message : String(error) }); }
+    };
+    await Promise.all(sessions.map((session, index) => attempt(`session ${index} close and EOF`, () => closeSession(session))));
     const lockPid = (): number | null => readJson(path.join(realRoot, '.codegraph', 'daemon.pid'))?.pid ?? null;
-    await settleLosingCandidates(tempDir, lockPid);
+    await attempt('losing daemon candidates exit', () => settleLosingCandidates(tempDir, lockPid, 10000));
     const holder = lockPid();
     if (holder) daemonPids.add(holder);
-    for (const pid of daemonPids) {
-      if (pid === process.pid || !isAlive(pid)) continue;
-      try { process.kill(pid, 'SIGKILL'); } catch { /* raced to exit */ }
-      await waitProcessExit(pid, 5000);
+    await Promise.all([...daemonPids].map(pid => attempt(`owned daemon ${pid} exit`, async () => {
+      if (pid === process.pid) throw new Error('fixture owner must never be the test process');
+      if (isAlive(pid)) { try { process.kill(pid, 'SIGKILL'); } catch { /* checked below, never assumed gone */ } }
+      expect(await waitProcessExit(pid, 5000), `owned daemon ${pid} actually exited`).toBe(true);
+    })));
+    await attempt('terminal protocol and refused-response audit', () => {
+      for (const session of sessions) {
+        expect(session.closed, 'actual child close').toBe(true);
+        for (const capture of Object.values(session.capture)) {
+          expect(capture.eof, 'actual stream EOF').toBe(true);
+          expect(capture.errors).toEqual([]);
+          expect(capture.retainedBytes).toBe(capture.seenBytes);
+        }
+        expect(session.errors).toEqual([]);
+        if (session.kind === 'launcher') expect(session.capture.stdout.tail, 'complete terminal MCP framing').toBe('');
+        for (const issued of session.refused) {
+          const replies = session.stdout.map(line => JSON.parse(line)).filter(value => value?.id === issued.id
+            && (value.result !== undefined || value.error !== undefined));
+          expect(replies, `${issued.label}: terminal exactly-once response`).toHaveLength(1);
+          expectRefusal(replies[0], issued.root, issued.label);
+        }
+      }
+      terminalAuditComplete = true;
+    });
+    const evidence = () => ({ fixture: tempDir, cleanup, terminalAuditComplete, fixtureRemoved, spawnLogRemoved,
+      outcome: cleanup.some(row => row.error) ? 'fail' : 'pass', daemonPids: [...daemonPids],
+      remainingDaemonPids: [...daemonPids].filter(isAlive), sessions: sessions.map(session => ({
+        pid: session.child.pid, root: session.root, kind: session.kind, exitCode: session.child.exitCode,
+        signalCode: session.child.signalCode, closed: session.closed, errors: session.errors, refused: session.refused,
+        stdout: session.stdout, stderr: session.stderr, capture: Object.fromEntries(Object.entries(session.capture).map(([name, value]) =>
+          [name, { ...value, raw: undefined, rawBase64: value.raw.subarray(0, value.retainedBytes).toString('base64') }])),
+      })) });
+    const evidencePath = process.env.VALIDATION_OUT
+      ? path.join(process.env.VALIDATION_OUT, `${path.basename(tempDir)}-cleanup.json`)
+      : `${tempDir}.cleanup.json`;
+    await attempt('persist complete cleanup facts', () => fs.writeFileSync(evidencePath, JSON.stringify(evidence(), null, 2) + '\n'));
+    if (cleanup.every(row => row.error === null)) {
+      await attempt('remove verified fixture', async () => {
+        await fs.promises.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+        fixtureRemoved = true;
+        removeSpawnLog(tempDir);
+        spawnLogRemoved = true;
+      });
     }
+    await attempt('persist final cleanup disposition', () => fs.writeFileSync(evidencePath, JSON.stringify(evidence(), null, 2) + '\n'));
+    const failures = cleanup.filter(row => row.error !== null);
+    if (failures.length) {
+      preserveInstalls = true;
+      throw new Error(`Owned daemon fixture cleanup incomplete; retained ${tempDir}, ${spawnLogFor(tempDir)}, ${evidencePath}: ${JSON.stringify(failures)}`);
+    }
+    sessions.length = 0;
     daemonPids.clear();
-    removeSpawnLog(tempDir);
-    await fs.promises.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }, 45_000);
 
   /** An agent session: `install`'s launcher, `serve --mcp` in the project. */
@@ -459,11 +584,7 @@ describe('a launcher meeting a daemon of another version (#2335)', () => {
         ...env,
       },
     }) as ChildProcessWithoutNullStreams;
-    child.on('error', () => { /* ignore */ });
-    child.stdin.on('error', () => { /* ignore */ });
-    const session: Session = { child, stdout: [], stderr: [] };
-    lines(child.stdout, session.stdout);
-    lines(child.stderr, session.stderr);
+    const session = observeSession(child, tempDir, 'launcher');
     sessions.push(session);
     send(session, {
       jsonrpc: '2.0', id: 1, method: 'initialize',
@@ -487,6 +608,30 @@ describe('a launcher meeting a daemon of another version (#2335)', () => {
     return reply;
   }
 
+  async function refusedTool(session: Session, id: number, label: string, name = 'codegraph_status'): Promise<any> {
+    if (session.refused.some(issued => issued.id === id)) throw new Error('refused fixture request ID reused');
+    session.refused.push({ id, root: realRoot, label });
+    send(session, { jsonrpc: '2.0', id, method: 'tools/call', params: { name,
+      arguments: name === 'codegraph_search' ? { query: 'appMain' } : {} } });
+    const reply = await waitFor(() => findResponse(session.stdout, id), 20000, label).catch((err: Error) => {
+      throw new Error(`${err.message}\n--- stderr ---\n${session.stderr.join('\n')}\n--- daemon.log ---\n${daemonLog()}`);
+    });
+    expectRefusal(reply, realRoot, label);
+    expect(session.stdout.map(line => { try { return JSON.parse(line); } catch { return null; } })
+      .filter(value => value?.id === id && (value.result !== undefined || value.error !== undefined)), label).toHaveLength(1);
+    return reply;
+  }
+
+  function expectRefusal(reply: any, root: string, label: string): void {
+    expect(reply.jsonrpc, label).toBe('2.0');
+    expect(reply.method, label).toBeUndefined();
+    expect(reply.error, label).toMatchObject({ code: -32603, data: {
+      code: 'CODEGRAPH_QUERY_POLICY_REFUSED', reason: 'unknown', projectRoot: root,
+    } });
+    expect(reply.error.data.guidance, label).toContain(root);
+    expect(reply.result, label).toBeUndefined();
+  }
+
   const attachedLine = (session: Session): string | undefined =>
     session.stderr.find((l) => l.includes('Attached to shared daemon'));
   const daemonLock = (): any => readJson(path.join(realRoot, '.codegraph', 'daemon.pid'));
@@ -494,6 +639,36 @@ describe('a launcher meeting a daemon of another version (#2335)', () => {
   const daemonLog = (): string => {
     try { return fs.readFileSync(path.join(realRoot, '.codegraph', 'daemon.log'), 'utf8'); } catch { return ''; }
   };
+
+  /** Durable index/source/ownership bytes and write times must survive a refused
+   * acquisition. SQLite SHM and daemon logs are coordination/observation files,
+   * not the durable index; the original daemon remains legitimately usable. */
+  function preservedArtifacts(): Record<string, unknown> {
+    return Object.fromEntries([
+      path.join(realRoot, 'app.ts'), getDatabasePath(realRoot), `${getDatabasePath(realRoot)}-wal`,
+      path.join(realRoot, '.codegraph', '.gitignore'), getDaemonPidPath(realRoot), getWriterPidPath(realRoot),
+      path.join(realRoot, '.codegraph', 'launcher-preservation-sentinel'), spawnLogFor(tempDir),
+    ].map(file => {
+      if (!fs.existsSync(file)) return [file, null];
+      const stat = fs.statSync(file);
+      return [file, { sha256: createHash('sha256').update(fs.readFileSync(file)).digest('hex'), size: stat.size,
+        mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, birthtimeMs: stat.birthtimeMs, ino: stat.ino }];
+    }));
+  }
+
+  function protectOwner(): Record<string, unknown> {
+    fs.writeFileSync(path.join(realRoot, '.codegraph', 'launcher-preservation-sentinel'), 'existing owner must remain untouched\n');
+    return preservedArtifacts();
+  }
+
+  function expectPreservedOwner(session: Session, pid: number, lock: unknown, artifacts: Record<string, unknown>): void {
+    expect(isAlive(pid), 'existing owner remains alive').toBe(true);
+    expect(daemonLock()).toEqual(lock);
+    expect(writerLock()).toMatchObject({ pid, mode: 'daemon' });
+    expect(preservedArtifacts()).toEqual(artifacts);
+    expect(attachedLine(session), 'refused session never attaches to a replacement').toBeUndefined();
+    expect(session.stderr.join('\n')).not.toMatch(/\[CodeGraph MCP\] Stopped|serving this session in-process|Serving reads in-process|local read-only fallback|File watcher active/);
+  }
 
   /** A session of `install` attached to a daemon of its own, which owns the project. */
   async function sessionWithDaemon(install: string, version: string, env: NodeJS.ProcessEnv = {}): Promise<{ session: Session; pid: number }> {
@@ -516,12 +691,10 @@ describe('a launcher meeting a daemon of another version (#2335)', () => {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env, CODEGRAPH_DAEMON_INTERNAL: '1', CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '30000', ...env },
     }) as ChildProcessWithoutNullStreams;
-    child.on('error', () => { /* ignore */ });
-    child.stdout.resume();
-    const log: string[] = [];
-    lines(child.stderr, log);
+    const session = observeSession(child, tempDir, 'daemon');
+    sessions.push(session);
     daemonPids.add(child.pid!);
-    return { child, log };
+    return { child, log: session.stderr };
   }
 
   /** The slot as a launcher that just stopped an older daemon holds it: this test process stands in. */
@@ -585,11 +758,12 @@ describe('a launcher meeting a daemon of another version (#2335)', () => {
     expect(writerLock()).toMatchObject({ pid: successor.child.pid, mode: 'daemon' });
   }, 60000);
 
-  it('keeps the older daemon\'s sessions read-only through the replacement, even mid-call', async () => {
+  it('preserves an older daemon and its recurring healthy session calls when another install is refused', async () => {
     const before = await sessionWithDaemon(olderInstall, OLDER);
-    // The older session calls every 20ms throughout, so it serves itself
-    // in-process the instant its daemon goes. Finding the writer slot free
-    // then, it would claim it — with the code of the install being replaced.
+    const lock = daemonLock();
+    const artifacts = protectOwner();
+    // The older session keeps using its actual daemon while the new install
+    // attempts acquisition. Refusal must not abandon any healthy owner call.
     let next = 100;
     const calling = setInterval(() => {
       send(before.session, { jsonrpc: '2.0', id: next++, method: 'tools/call', params: { name: 'codegraph_status', arguments: {} } });
@@ -597,120 +771,80 @@ describe('a launcher meeting a daemon of another version (#2335)', () => {
     let after: Session;
     try {
       after = startSession(null);
-      await waitFor(() => attachedLine(after), 30000, 'the new session to attach');
-      await new Promise((r) => setTimeout(r, 500));
+      await refusedTool(after, 2, 'the new install to refuse the older service');
+      await refusedTool(after, 3, 'the refused session to refuse a real query', 'codegraph_search');
     } finally {
       clearInterval(calling);
     }
-    const lock = daemonLock();
-    daemonPids.add(lock.pid);
-    expect(lock.version).toBe(CodeGraphPackageVersion);
-    expect(writerLock()).toMatchObject({ pid: lock.pid, mode: 'daemon' });
-    await status(after, 2, 'a tool call through the new daemon');
-
     const last = next - 1;
-    await waitFor(() => findResponse(before.session.stdout, last), 20000, 'the older session to answer every call');
-    for (let id = 100; id <= last; id++) expect(findResponse(before.session.stdout, id), `call ${id}`).toBeTruthy();
+    expect(last).toBeGreaterThanOrEqual(100);
+    await waitFor(() => findResponse(before.session.stdout, last), 20000, 'the older session to answer every recurring call during refused acquisition');
+    for (let id = 100; id <= last; id++) {
+      const reply = findResponse(before.session.stdout, id);
+      expect(reply, `healthy owner call ${id}`).toBeTruthy();
+      expect(reply.error, `healthy owner call ${id}`).toBeUndefined();
+      expect(reply.result?.isError, `healthy owner call ${id}`).not.toBe(true);
+      expect(JSON.stringify(reply.result), `healthy owner call ${id}`).toContain('CodeGraph Status');
+    }
     const stderr = before.session.stderr.join('\n');
-    expect(stderr).toContain('Serving reads in-process without auto-sync');
-    expect(stderr).not.toContain('File watcher active');
-    expect(writerLock()).toMatchObject({ pid: lock.pid, mode: 'daemon' });
+    expect(stderr).not.toMatch(/Shared daemon connection lost|Serving reads in-process without auto-sync/);
+    expectPreservedOwner(after!, before.pid, lock, artifacts);
+    await status(before.session, 3, 'the original service remains usable after all recurring calls');
   }, 120000);
 
-  it('stops a daemon from an older install and starts one from its own', async () => {
+  it('refuses an older install without replacing its daemon or changing its index and locks', async () => {
     const before = await sessionWithDaemon(olderInstall, OLDER);
-
-    const after = startSession(null);
-    const stopped = await waitFor(
-      () => after.stderr.find((l) => l.includes('[CodeGraph MCP] Stopped')),
-      30000, 'the older daemon to be stopped',
-    );
-    expect(stopped).toContain(`the CodeGraph ${OLDER} daemon (pid ${before.pid})`);
-    expect(stopped).toContain(`from this install (${CodeGraphPackageVersion})`);
-    expect(await waitProcessExit(before.pid, 10000)).toBe(true);
-
-    const attached = await waitFor(() => attachedLine(after), 20000, 'the new session to attach');
     const lock = daemonLock();
-    daemonPids.add(lock.pid);
-    expect(lock.version).toBe(CodeGraphPackageVersion);
-    expect(lock.pid).not.toBe(before.pid);
-    expect(attached).toContain(`(pid ${lock.pid}, v${CodeGraphPackageVersion})`);
-    await status(after, 2, 'a tool call through the new daemon');
-    // The replacement owns updates for the project: writer lock and watcher,
-    // handed to it by the launcher that held the slot through the stop.
-    expect(writerLock()).toMatchObject({ pid: lock.pid, mode: 'daemon' });
-    expect(daemonLog()).toContain(`Took over the writer lock from launcher pid ${after.child.pid}`);
-    if (process.platform !== 'win32') {
-      // SIGTERM ran the old daemon's own shutdown. (On Windows it is
-      // TerminateProcess, and the stop clears what is left.)
-      expect(daemonLog()).toContain(`Shutting down (SIGTERM`);
-    }
-
-    // The session from before the upgrade keeps answering, read-only, and
-    // leaves the new daemon its writer lock.
-    await waitFor(
-      () => before.session.stderr.some((l) => l.includes('Shared daemon connection lost')),
-      10000, 'the older session to lose its daemon',
-    );
-    await status(before.session, 3, 'a tool call in the older session');
-    expect(before.session.stderr.some((l) => l.includes('Serving reads in-process without auto-sync'))).toBe(true);
-    expect(writerLock()).toMatchObject({ pid: lock.pid, mode: 'daemon' });
-    expect(daemonLock()).toEqual(lock);
-    expect(isAlive(lock.pid)).toBe(true);
+    const artifacts = protectOwner();
+    const after = startSession(null);
+    await refusedTool(after, 2, 'an older service produces an explicit policy refusal');
+    await refusedTool(after, 3, 'refused query cannot create a bypass engine', 'codegraph_search');
+    expectPreservedOwner(after, before.pid, lock, artifacts);
+    expect(daemonLog()).not.toContain(`Took over the writer lock from launcher pid ${after.child.pid}`);
+    expect(daemonLog()).not.toContain('Shutting down (SIGTERM');
+    await status(before.session, 3, 'the original older service still serves its own session');
+    expect(before.session.stderr.join('\n')).not.toMatch(/Shared daemon connection lost|Serving reads in-process without auto-sync/);
+    expectPreservedOwner(after, before.pid, lock, artifacts);
   }, 120000);
 
-  it('finds an older daemon its probe cannot reach by the project lock, and stops it', async () => {
+  it('refuses an older live lock owner when every usual probe fails, preserving its index and locks', async () => {
     // On Windows a 1.6.1 daemon named its pipe after the root as typed (#2278),
-    // so a newer launcher's probe never hears its hello; only its lock says
-    // where it listens. Stand one up on a socket no launcher probes.
-    const socketDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-sock-'));
-    try {
-      const socketPath = listenPath(socketDir, 'older');
-      const older = spawn(process.execPath, [OLDER_DAEMON, realRoot, OLDER, socketPath], { detached: true, stdio: 'ignore' });
-      older.unref();
-      daemonPids.add(older.pid!);
-      await waitFor(() => daemonLock()?.pid === older.pid, 10000, 'the older daemon to hold the project');
-      expect(writerLock()).toMatchObject({ pid: older.pid, mode: 'daemon' });
-
-      const session = startSession(null);
-      const stopped = await waitFor(
-        () => session.stderr.find((l) => l.includes('[CodeGraph MCP] Stopped')),
-        30000, 'the older daemon to be stopped',
-      );
-      expect(stopped).toContain(`the CodeGraph ${OLDER} daemon (pid ${older.pid})`);
-      expect(await waitProcessExit(older.pid!, 10000)).toBe(true);
-      const attached = await waitFor(() => attachedLine(session), 20000, 'the session to attach');
-      const lock = daemonLock();
-      daemonPids.add(lock.pid);
-      expect(lock.version).toBe(CodeGraphPackageVersion);
-      expect(attached).toContain(`(pid ${lock.pid}, v${CodeGraphPackageVersion})`);
-      expect(writerLock()).toMatchObject({ pid: lock.pid, mode: 'daemon' });
-      expect(daemonLog()).toContain(`Took over the writer lock from launcher pid ${session.child.pid}`);
-      await status(session, 2, 'a tool call through the new daemon');
-    } finally {
-      fs.rmSync(socketDir, { recursive: true, force: true });
+    // so the usual probes find no service. A live project lock still forbids
+    // treating that absence as permission to signal, spawn or serve around it.
+    const socketPath = listenPath(tempDir, 'older');
+    const older = spawn(process.execPath, [OLDER_DAEMON, realRoot, OLDER, socketPath], { detached: true, stdio: 'ignore', windowsHide: true });
+    older.unref();
+    daemonPids.add(older.pid!);
+    await waitFor(() => daemonLock()?.pid === older.pid, 10000, 'the older daemon to hold the project');
+    expect(writerLock()).toMatchObject({ pid: older.pid, mode: 'daemon' });
+    expect(getDaemonSocketCandidates(realRoot)).not.toContain(socketPath);
+    for (const candidate of getDaemonSocketCandidates(realRoot)) {
+      expect(await connectWithHello(candidate), `usual probe ${candidate} is genuinely unavailable`).toBeNull();
     }
+    const lock = daemonLock();
+    const artifacts = protectOwner();
+    const session = startSession(null);
+    await refusedTool(session, 2, 'failed usual probes and a live older owner produce an explicit refusal');
+    await refusedTool(session, 3, 'a repeated query cannot replace or bypass the hidden owner', 'codegraph_search');
+    expectPreservedOwner(session, older.pid!, lock, artifacts);
+    expect(older.exitCode).toBeNull();
+    expect(older.signalCode).toBeNull();
+    expect(daemonLog()).not.toContain(`Took over the writer lock from launcher pid ${session.child.pid}`);
   }, 90000);
 
   it('never stops a daemon from a newer install', async () => {
     const retry = { CODEGRAPH_DAEMON_RETRY_MS: '300', CODEGRAPH_DAEMON_RETRY_MAX_MS: '600' };
     const newer = await sessionWithDaemon(newerInstall, NEWER);
     const lock = daemonLock();
-
+    const artifacts = protectOwner();
     const current = startSession(null, retry);
-    // The first probe and the retries that follow all find the newer daemon.
-    await waitFor(
-      () => current.stderr.filter((l) => l.includes(`version (${NEWER}) differs from ours`)).length >= 3,
-      20000, 'repeated probes of the newer daemon',
-    );
-    await status(current, 2, 'a tool call served in-process');
-    expect(current.stderr.some((l) => l.includes('Serving reads in-process without auto-sync'))).toBe(true);
-    expect(current.stderr.some((l) => l.includes('[CodeGraph MCP] Stopped'))).toBe(false);
-
-    expect(isAlive(newer.pid)).toBe(true);
-    expect(daemonLock()).toEqual(lock);
-    expect(writerLock()).toMatchObject({ pid: newer.pid, mode: 'daemon' });
+    // A version mismatch is terminal policy refusal, not unavailable service
+    // eligible for retrying with an in-process fallback or replacement daemon.
+    await refusedTool(current, 2, 'a newer service produces an explicit policy refusal');
+    await refusedTool(current, 3, 'the same refused client cannot bypass the newer service', 'codegraph_search');
+    expectPreservedOwner(current, newer.pid, lock, artifacts);
     await status(newer.session, 3, 'a tool call through the newer daemon');
+    expectPreservedOwner(current, newer.pid, lock, artifacts);
   }, 90000);
 
   it('a session whose own install was upgraded serves reads only once its daemon exits', async () => {
@@ -719,42 +853,32 @@ describe('a launcher meeting a daemon of another version (#2335)', () => {
     // the project's writer that session — running code the upgrade replaced —
     // would only keep a daemon from the new install from starting.
     const install = makeInstall('0.0.2');
-    try {
-      const before = await sessionWithDaemon(install, '0.0.2', {
-        CODEGRAPH_DAEMON_INSTALL_CHECK_MS: '200',
-        CODEGRAPH_DAEMON_RETRY_MS: '0',
-      });
-      fs.writeFileSync(path.join(install, 'package.json'), JSON.stringify({ name: '@colbymchenry/codegraph', version: '0.0.3' }) + '\n');
-      expect(await waitProcessExit(before.pid, 10000)).toBe(true);
-      expect(daemonLog()).toContain('Install replaced by v0.0.3');
-      await waitFor(
-        () => before.session.stderr.some((l) => l.includes('Shared daemon connection lost')),
-        10000, 'the session to lose its daemon',
-      );
+    extraInstalls.push(install);
+    const before = await sessionWithDaemon(install, '0.0.2', {
+      CODEGRAPH_DAEMON_INSTALL_CHECK_MS: '200',
+      CODEGRAPH_DAEMON_RETRY_MS: '0',
+    });
+    fs.writeFileSync(path.join(install, 'package.json'), JSON.stringify({ name: '@colbymchenry/codegraph', version: '0.0.3' }) + '\n');
+    expect(await waitProcessExit(before.pid, 10000)).toBe(true);
+    expect(daemonLog()).toContain('Install replaced by v0.0.3');
+    await waitFor(
+      () => before.session.stderr.some((l) => l.includes('Shared daemon connection lost')),
+      10000, 'the session to lose its daemon',
+    );
 
-      await status(before.session, 3, 'a tool call after the daemon exited');
-      const stderr = before.session.stderr.join('\n');
-      expect(stderr).toContain("this session's CodeGraph install was upgraded or removed");
-      expect(stderr).not.toContain('File watcher active');
-      expect(writerLock()).toBeNull();
+    await status(before.session, 3, 'a tool call after the daemon exited');
+    const stderr = before.session.stderr.join('\n');
+    expect(stderr).toContain("this session's CodeGraph install was upgraded or removed");
+    expect(stderr).not.toContain('File watcher active');
+    expect(writerLock()).toBeNull();
 
-      // So a session from the current install gets a daemon straight away.
-      const after = startSession(null);
-      await waitFor(() => attachedLine(after), 20000, 'the new session to attach');
-      const lock = daemonLock();
-      daemonPids.add(lock.pid);
-      expect(writerLock()).toMatchObject({ pid: lock.pid, mode: 'daemon' });
-    } finally {
-      // On Windows a process still running from the install blocks its removal.
-      for (const { child } of sessions) {
-        if (child.exitCode === null && child.signalCode === null) {
-          const exited = once(child, 'exit');
-          child.kill('SIGKILL');
-          await exited;
-        }
-      }
-      try { fs.unlinkSync(path.join(install, 'node_modules')); } catch { /* not created */ }
-      await fs.promises.rm(install, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-    }
+    // So a session from the current install gets a daemon straight away.
+    const after = startSession(null);
+    await waitFor(() => attachedLine(after), 20000, 'the new session to attach');
+    const lock = daemonLock();
+    daemonPids.add(lock.pid);
+    expect(writerLock()).toMatchObject({ pid: lock.pid, mode: 'daemon' });
+    // The common afterEach owns close/EOF and daemon exit; afterAll removes
+    // this install only if every fixture completed that terminal audit.
   }, 90000);
 });
