@@ -1,7 +1,7 @@
 param(
   [Parameter(Mandatory=$true)][string]$Plan,
   [Parameter(Mandatory=$true)][string]$LaunchOutput,
-  [ValidateRange(1,3600)][int]$DeadlineSeconds = 900,
+  [ValidateRange(1,7200)][int]$DeadlineSeconds = 900,
   [string]$Python = 'C:/Users/atramenta/AppData/Local/Programs/Python/Python312/python.exe'
 )
 $ErrorActionPreference = 'Stop'

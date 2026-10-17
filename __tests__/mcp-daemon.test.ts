@@ -218,7 +218,7 @@ function registerRoot(root: string): void { if (!current.roots.includes(root)) c
 function arm(fault: 'stop-before-status' | 'exit78-before-status' | 'hold-before-status' | 'observe', attempt = 'initial'): void {
   fs.writeFileSync(current.control, JSON.stringify({ fault, attempt }));
 }
-function proveUnavailable(server: SpawnedServer, attempt = 'initial'): void {
+function proveUnavailable(server: SpawnedServer, attempt = 'initial', expectedDeadDaemon?: { pid: number; contents: string }): void {
   const records = trace().filter(record => record.pid === server.child.pid);
   const candidates = records.filter(record => record.event === 'candidate-spawn' && record.attempt === attempt);
   expect(candidates).toHaveLength(1);
@@ -231,16 +231,26 @@ function proveUnavailable(server: SpawnedServer, attempt = 'initial'): void {
   const close = records.find(record => record.event === 'candidate-close' && record.candidatePid === candidatePid);
   if (firstFactory) expect(close.sequence).toBeLessThan(firstFactory.sequence);
   expect(isAlive(candidatePid)).toBe(false);
-  expect(fs.existsSync(path.join(current.root, '.codegraph/daemon.pid'))).toBe(false);
+  const daemonPath = path.join(current.root, '.codegraph/daemon.pid');
+  if (expectedDeadDaemon) {
+    // A Windows SIGTERM can end the previous service without unlinking its
+    // record. Exact known-dead evidence is not a live or unknown owner, and
+    // the newly stopped pre-service candidate must not mutate that record.
+    expect(JSON.parse(expectedDeadDaemon.contents).pid).toBe(expectedDeadDaemon.pid);
+    expect(isAlive(expectedDeadDaemon.pid)).toBe(false);
+    expect(bounded(daemonPath).toString('utf8')).toBe(expectedDeadDaemon.contents);
+  } else expect(fs.existsSync(daemonPath)).toBe(false);
   const entry = JSON.parse(bounded(path.join(current.trace, `candidate-${candidatePid}-entered.json`)).toString('utf8'));
   expect(entry.argv[1]).toBe(BIN); expect(entry.argv.slice(2)).toEqual(candidates[0].args.slice(candidates[0].args.indexOf(BIN) + 1));
   expect(entry.controls).toEqual(candidates[0].controls); expect(entry.startupCpu).toBe(candidates[0].startupCpu);
   expect(trace().filter(record => record.pid === candidatePid && ['engine-before-constructor','engine-constructor','sqlite-constructor','graph-open','graph-openSync','graph-sync','graph-watch','tool-start','history'].includes(record.event))).toEqual([]);
   const factory = records.find(record => record.event === 'engine-before-constructor' && record.sequence > candidates[0].sequence);
-  if (firstFactory) expect(factory?.held.find((route: any) => route.root === current.root)?.owners['daemon.pid']).toEqual({ present: false });
+  if (firstFactory) expect(factory?.held.find((route: any) => route.root === current.root)?.owners['daemon.pid']).toEqual(expectedDeadDaemon
+    ? { present: true, base64: Buffer.from(expectedDeadDaemon.contents).toString('base64') } : { present: false });
   const held = current.roots.map(root => ({ root, index: fs.realpathSync(path.join(root, '.codegraph/codegraph.db')) }));
   current.observations.push({ event: 'controlled-pre-service-unavailable', candidatePid, attempt, held,
-    daemonAbsent: true, writer: readWriterInfo(current.root), evidence: 'native fault before status/ACK; exit+close; fresh owner/held-route records' });
+    daemonAbsent: !expectedDeadDaemon, deadDaemonPid: expectedDeadDaemon?.pid ?? null, writer: readWriterInfo(current.root),
+    evidence: 'native fault before status/ACK; exit+close; fresh absent or exact known-dead owner/held-route records' });
 }
 function proveQualified78(server: SpawnedServer): void {
   const records = trace().filter(record => record.pid === server.child.pid);
@@ -1357,6 +1367,7 @@ describe('Shared MCP daemon (issue #411)', () => {
     sendMessage(a.child, { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'codegraph_status', arguments: {} } });
     await waitFor(() => findResponse(a.stdout, 2), 30000, 25, 'warm tools/call via daemon');
     const firstDaemon = readLockPid(realRoot)!;
+    const firstDaemonLock = { pid: firstDaemon, contents: bounded(path.join(realRoot, '.codegraph/daemon.pid')).toString('utf8') };
     await realExplore(a, 1000);
 
     arm('stop-before-status', 'post-loss');
@@ -1366,7 +1377,7 @@ describe('Shared MCP daemon (issue #411)', () => {
     sendMessage(a.child, { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'codegraph_status', arguments: {} } });
     await waitFor(() => findResponse(a.stdout, 3), 15000, 25, 'in-process tools/call');
 
-    proveUnavailable(a, 'post-loss');
+    proveUnavailable(a, 'post-loss', firstDaemonLock);
     // Arm the NEXT actual candidate before the first local query: this is a
     // second one-use native pre-status failure, not synthetic null acquisition.
     arm('stop-before-status', 'local-recreation'); await realExplore(a, 1001);
@@ -1375,6 +1386,8 @@ describe('Shared MCP daemon (issue #411)', () => {
     expect(firstLocal[0].diagnostics.effective.executionMode).toBe('writable-fallback');
     const firstGeneration = firstLocal[0].generation;
     expect(firstGeneration).toBe(firstLocal[0].diagnostics.ownership.generation);
+    const firstLocalWriter = JSON.parse(fs.readFileSync(path.join(realRoot, '.codegraph/writer.pid'), 'utf8'));
+    expect(firstLocalWriter).toMatchObject({ pid: proxyPid, mode: 'fallback' });
     let nextId = 4;
     const send = (): void => {
       sendMessage(a.child, { jsonrpc: '2.0', id: nextId++, method: 'tools/call', params: { name: 'codegraph_status', arguments: {} } });
@@ -1384,7 +1397,7 @@ describe('Shared MCP daemon (issue #411)', () => {
       trace().some(spawn => spawn.pid === proxyPid && spawn.event === 'candidate-spawn' && spawn.attempt === 'local-recreation' && spawn.candidatePid === record.candidatePid)), 15000, 25, 'second genuine unavailable native close');
     await waitFor(() => trace().find(record => record.pid === proxyPid && record.event === 'engine-constructor' &&
       record.diagnostics.effective.executionMode === 'writable-fallback' && record.diagnostics.ownership.generation !== firstGeneration), 15000, 25, 'actual replacement local engine');
-    proveUnavailable(a, 'local-recreation'); arm('observe', 'handover');
+    proveUnavailable(a, 'local-recreation', firstDaemonLock); arm('observe', 'handover');
     await realExplore(a, 1003);
     const localCalls = trace().filter(record => record.pid === proxyPid && record.event === 'tool-start' && [1001,1003].includes(record.requestId));
     expect(localCalls).toHaveLength(2);
@@ -1395,6 +1408,12 @@ describe('Shared MCP daemon (issue #411)', () => {
     expect(retirement).toBeDefined();
     const replacement = trace().find(record => record.pid === proxyPid && record.event === 'engine-constructor' && record.diagnostics.ownership.generation === localCalls[1].generation);
     expect(retirement.sequence).toBeLessThan(replacement.sequence);
+    const secondLocalWriter = JSON.parse(fs.readFileSync(path.join(realRoot, '.codegraph/writer.pid'), 'utf8'));
+    expect(secondLocalWriter).toMatchObject({ pid: proxyPid, mode: 'fallback' });
+    // The same proxy must relinquish the first native reservation after drain,
+    // then acquire a NEW writer for the actual replacement engine. Keeping the
+    // old live-PID record would silently downgrade this session to read-only.
+    expect(secondLocalWriter.startedAt).toBeGreaterThan(firstLocalWriter.startedAt);
     const localHistory = actualHistory().filter(record => record.pid === proxyPid && record.root === realRoot);
     expect(localHistory.map(record => record.index)).toEqual([1,2]);
     expect(new Set(localHistory.map(record => record.historyId)).size).toBe(1);
@@ -1403,12 +1422,6 @@ describe('Shared MCP daemon (issue #411)', () => {
       retiredGeneration: retirement.generation, localHistoryId: localHistory[0].historyId, indexes: localHistory.map(record => record.index) });
     // The lockout: the in-process engine owns the project's writer slot.
     expect(readWriterInfo(realRoot)).toMatchObject({ pid: proxyPid, mode: 'fallback' });
-
-    // Another session starting now cannot get a daemon while that lock is held.
-    const b = spawnServer(tempDir, env);
-    servers.push(b);
-    sendInitialize(b.child, `file://${tempDir}`, 1);
-    await waitFor(() => findResponse(b.stdout, 1), 20000, 25, 'second session initialize');
 
     // Keep calling through the handover: every request gets exactly one reply.
     // The same owned ticker spans local recreation and the original handover.
@@ -1428,19 +1441,36 @@ describe('Shared MCP daemon (issue #411)', () => {
     send();
     const lastId = nextId - 1;
     await waitFor(() => findResponse(a.stdout, lastId), 15000, 25, 'a tools/call through the new daemon');
-    for (let id = 2; id <= lastId; id++) {
-      const replies = a.stdout.filter((line) => {
-        try { const m = JSON.parse(line); return m.id === id && ('result' in m || 'error' in m); } catch { return false; }
-      });
-      expect(replies, `replies to request ${id}`).toHaveLength(1);
-      expect(JSON.parse(replies[0]).error, `request ${id}`).toBeUndefined();
-    }
     expect(readLockPid(realRoot)).toBe(daemonWriter!.pid);
     expect(daemonWriter!.pid).not.toBe(firstDaemon);
     const branch = trace().filter(record => record.event === 'engine-diagnostics').map(record => record.diagnostics);
     expect(branch.some(value => value.ownership.pid === daemonWriter!.pid && value.effective.executionMode === 'shared-daemon')).toBe(true);
+    const localEngines = trace().filter(record => record.pid === proxyPid && record.event === 'engine-constructor');
+    expect(localEngines.map(record => record.diagnostics.effective.executionMode)).toEqual(['writable-fallback', 'writable-fallback']);
+    const finalDrain = trace().find(record => record.pid === proxyPid && record.event === 'engine-drain-complete' && record.generation === localCalls[1].generation);
+    const finalCandidate = trace().find(record => record.pid === proxyPid && record.event === 'candidate-spawn' && record.attempt === 'handover');
+    expect(finalDrain).toBeDefined();
+    expect(finalCandidate).toBeDefined();
+    const localGenerations = new Set(localCalls.map(record => record.generation));
+    const localWorkers = trace().filter(record => record.pid === proxyPid && record.event === 'worker-spawn' && localGenerations.has(record.execution.generation));
+    expect(new Set(localWorkers.map(record => record.execution.generation))).toEqual(localGenerations);
+    const workerKey = (record: any) => record.pid + ':' + record.workerThreadId;
+    const localWorkerKeys = localWorkers.map(workerKey).sort();
+    expect(new Set(localWorkerKeys).size).toBe(localWorkerKeys.length);
+    const localExits = trace().filter(record => record.pid === proxyPid && record.event === 'worker-exit' && localWorkerKeys.includes(workerKey(record)));
+    expect(localExits.map(workerKey).sort()).toEqual(localWorkerKeys);
+    expect(localExits.every(record => record.code === 0 || record.code === 1)).toBe(true);
+    // No competing launch can publish an unproved foreign daemon owner during
+    // A's healthy local epoch: that correctly causes a terminal unknown refusal.
+    // A must complete its OWN scheduled handback before B tests daemon reuse.
+    expect(finalDrain.sequence).toBeLessThan(finalCandidate.sequence);
+    expect(finalCandidate.candidatePid).toBe(daemonWriter!.pid);
 
-    // The session that started during the lockout ends up on the shared daemon too.
+    const b = spawnServer(tempDir, env);
+    servers.push(b);
+    sendInitialize(b.child, `file://${tempDir}`, 1);
+    await waitFor(() => findResponse(b.stdout, 1), 20000, 25, 'second session initialize');
+    // A later independent session reuses the same proved live shared owner.
     await waitFor(
       () => b.stderr.some((l) => l.includes('Attached to shared daemon') && l.includes(`(pid ${daemonWriter!.pid},`)),
       30000, 25, 'the second session to attach',
@@ -1449,6 +1479,30 @@ describe('Shared MCP daemon (issue #411)', () => {
     const bReply = await waitFor(() => findResponse(b.stdout, 2), 15000, 25, 'second session tools/call');
     expect(bReply.error).toBeUndefined();
     await realExplore(a, 1002); await realExplore(b, 1000);
+    const recoveredEngine = trace().find(record => record.pid === daemonWriter!.pid && record.event === 'engine-constructor');
+    expect(recoveredEngine).toBeDefined();
+    expect(recoveredEngine.diagnostics.effective.executionMode).toBe('shared-daemon');
+    const sharedCalls = trace().filter(record => record.pid === daemonWriter!.pid && record.event === 'tool-start' &&
+      record.name === 'codegraph_explore' && [1002,1000].includes(record.requestId));
+    expect(sharedCalls).toHaveLength(2);
+    expect(new Set(sharedCalls.map(record => record.sessionId)).size).toBe(2);
+    for (const call of sharedCalls) {
+      expect(call.generation).toBe(recoveredEngine.diagnostics.ownership.generation);
+      expect(call.diagnostics.effective).toEqual(recoveredEngine.diagnostics.effective);
+      expect(call.diagnostics.implementation).toEqual(recoveredEngine.diagnostics.implementation);
+      expect(call.diagnostics.ownership).toEqual(recoveredEngine.diagnostics.ownership);
+    }
+    expect(trace().filter(record => record.pid === b.child.pid &&
+      ['candidate-spawn', 'engine-constructor', 'worker-spawn'].includes(record.event))).toEqual([]);
+    for (const id of [1, ...Array.from({ length: lastId - 1 }, (_, index) => index + 2), 1000, 1001, 1002, 1003]) {
+      const replies = a.stdout.filter((line) => {
+        try { const m = JSON.parse(line); return m.id === id && ('result' in m || 'error' in m); } catch { return false; }
+      });
+      expect(replies, `replies to request ${id}`).toHaveLength(1);
+      const reply = JSON.parse(replies[0]);
+      expect(reply.error, `request ${id}`).toBeUndefined();
+      expect(reply.result.isError, `request ${id}`).toBeFalsy();
+    }
     const history = actualHistory().filter(record => record.root === realRoot); expect(history).toHaveLength(5);
     expect(new Set(history.map(record => record.historyId)).size).toBe(4); // Old daemon, SAME local state across two engines, then two new daemon sessions.
   }, 90000);

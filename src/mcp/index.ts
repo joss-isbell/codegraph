@@ -534,8 +534,8 @@ export class MCPServer {
   private livenessWatchdog: WatchdogHandle | null = null;
   // Idempotency guard for stop().
   private stopped = false;
-  /** Project root whose writer.pid we hold in direct mode (#1740); released on stop. */
-  private startupWriters = new Set<ProjectWriterReservation>();
+  /** Caller-owned startup authority; fallback entries bind their exact engine. */
+  private startupWriters = new Map<ProjectWriterReservation, MCPEngine | null>();
 
   constructor(projectPath?: string, startup = captureMcpQueryStartup(process.env, () => os.cpus().length,
     process.connected === true && typeof process.send === 'function', path.resolve(projectPath ?? process.cwd()),
@@ -621,7 +621,7 @@ export class MCPServer {
       recordFailure('engine drain', error);
     }
     if (engineStopped) this.engine = null;
-    if (engineStopped) for (const reservation of this.startupWriters) {
+    if (engineStopped) for (const reservation of this.startupWriters.keys()) {
       try { await reservation.release(); this.startupWriters.delete(reservation); }
       catch (error) { recordFailure('startup writer reservation release', error); }
     }
@@ -723,7 +723,7 @@ export class MCPServer {
       const writer = tryAcquireWriterLock(route.root, 'direct');
       if (writer.kind === 'taken') throw unknownStartup(route.root, writerLockHeldMessage(writer.existing, writer.pidPath));
       projectWriter = retainObservedStartupWriter(route, observed, writer);
-      this.startupWriters.add(projectWriter);
+      this.startupWriters.set(projectWriter, null);
     }
     // No await separates the final closing/ownership fence and publication.
     cancelled(signal);
@@ -900,7 +900,19 @@ export class MCPServer {
       cancelled(signal);
       if (this.stopped) throw new Error('MCP startup is closed.');
       assertStartupRoute(route);
-      return makeFallbackEngine(route, startup, prospective, controls, reservation => this.startupWriters.add(reservation));
+      let owner: ProjectWriterReservation | undefined;
+      const engine = makeFallbackEngine(route, startup, prospective, controls, reservation => {
+        this.startupWriters.set(reservation, null);
+        owner = reservation;
+      });
+      if (owner) this.startupWriters.set(owner, engine);
+      return engine;
+    }, releaseEngine: async retired => {
+      for (const [reservation, owner] of this.startupWriters) {
+        if (owner !== retired) continue;
+        await reservation.release();
+        this.startupWriters.delete(reservation);
+      }
     }, root, stop: () => this.stop() };
   }
 
