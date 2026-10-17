@@ -28,7 +28,13 @@ jobs:
       - name: Install, build, and run the complete test workspace
         shell: pwsh
         timeout-minutes: 57
-        run: python scripts/ci/windows.py
+        run: |
+          python scripts/ci/windows.py
+          $commandExit = $LASTEXITCODE
+          python scripts/ci/verify-windows.py "$env:RUNNER_TEMP/codegraph-windows-ci"
+          $receiptExit = $LASTEXITCODE
+          if ($commandExit -ne 0) { exit $commandExit }
+          exit $receiptExit
       - name: Retain bounded command logs and receipts
         if: always()
         timeout-minutes: 5

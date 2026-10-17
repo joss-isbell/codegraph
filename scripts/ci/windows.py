@@ -40,6 +40,19 @@ def load_supervisor():
     spec = importlib.util.spec_from_file_location("codegraph_ci_supervisor", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    # The shared primitive historically discards CloseHandle's BOOL. Keep its
+    # behavior unchanged elsewhere; this caller may only accept checked closure.
+    class CheckedKernel:
+        def __getattr__(self, name):
+            return getattr(native_kernel, name)
+
+        def CloseHandle(self, handle):
+            if not native_kernel.CloseHandle(handle):
+                raise ctypes.WinError(ctypes.get_last_error())
+            return True
+
+    native_kernel = module.kernel
+    module.kernel = CheckedKernel()
     return module
 
 
@@ -200,7 +213,9 @@ def run_stage(core, name, command, seconds, output, whole_end, interrupted):
                 except BaseException as exc:
                     result["failures"].append(f"reader observation failed ({path.name}): {type(exc).__name__}: {exc}")
                 try:
-                    row["retainedBytes"] = path.stat().st_size if path.is_file() else None
+                    row["retainedBytes"] = path.stat().st_size
+                    if row["retainedBytes"] != row.get("seenBytes"):
+                        result["failures"].append(f"log retained size mismatch ({path.name})")
                 except BaseException as exc:
                     result["failures"].append(f"log stat failed ({path.name}): {type(exc).__name__}: {exc}")
         finally:

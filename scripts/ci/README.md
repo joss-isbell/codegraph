@@ -12,6 +12,20 @@ Run the same sequence locally on Windows with supported Node/npm and Python
 python scripts/ci/windows.py
 ```
 
+After the command exits, consume the complete receipt (the hosted workflow does
+this automatically):
+
+```powershell
+python scripts/ci/verify-windows.py "$env:RUNNER_TEMP/codegraph-windows-ci"
+```
+
+For local runs without `RUNNER_TEMP`, use `.validation/windows-ci`. Use a fresh
+output base for each check: the consumer requires exactly one attempt, rejects
+incomplete install/build/test sequences, and treats unreadable paths or invalid
+receipt files as failures, never as absent attempts. Keep the command's original
+nonzero exit even if receipt verification also fails. Local receipt verification
+does not certify source integrity or replace the actual command exit status.
+
 All three commands use `CODEGRAPH_DIR=.codegraph` so an inherited local agent
 index-directory override cannot change the repository's canonical CI layout.
 
