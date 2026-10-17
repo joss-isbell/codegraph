@@ -105,17 +105,33 @@ function caseInsensitiveTmp(): boolean {
 }
 
 describe('in-process project sharing (#2278)', () => {
-  it.runIf(caseInsensitiveTmp())('opens one graph for two casings of one root', async () => {
+  it.runIf(caseInsensitiveTmp())('opens one graph for two casings of one root', async ({ task }) => {
+    let nonce = '', sequence = 0;
+    const phase = (name: string): void => {
+      try {
+        if (sequence >= 20) return;
+        nonce ||= Math.random().toString(36).slice(2, 14);
+        const marker = { id: task.id, pid: process.pid, nonce, sequence: ++sequence, phase: name };
+        Object.assign(task.meta, { rendezvousDiagnostic: marker });
+        process.stderr.write(('[rendezvous-phase] ' + JSON.stringify(marker)).slice(0, 511) + '\n');
+      } catch { /* Observation must not replace the original test/error disposition. */ }
+    };
+    phase('body.enter');
     const root = path.join(makeDir(), 'Repo');
     fs.mkdirSync(root);
     fs.writeFileSync(path.join(root, 'app.ts'), 'export function rendezvous() {}\n');
-    const graph = await CodeGraph.init(root);
+    let graph: Awaited<ReturnType<typeof CodeGraph.init>>;
+    phase('fixture.init.begin');
+    try { graph = await CodeGraph.init(root); } finally { phase('fixture.init.settled'); }
     let primary: { error: unknown } | undefined;
+    phase('fixture.index.begin');
     try { await graph.indexAll(); } catch (error) { primary = { error }; }
+    finally { phase('fixture.index.settled'); }
+    phase('fixture.close.begin');
     try { graph.close(); } catch (error) {
       if (primary) process.stderr.write(`Rendezvous fixture close after ${String(primary.error).slice(0, 2048)}: ${String(error).slice(0, 2048)}\n`);
       else primary = { error };
-    }
+    } finally { phase('fixture.close.settled'); }
     if (primary) throw primary.error;
     let opened = 0;
     const nativeOpen = CodeGraph.openSync;
@@ -123,23 +139,31 @@ describe('in-process project sharing (#2278)', () => {
     const policy = resolveQueryPolicy({ poolSize: '0' }, 'shared-daemon', 3), lifetime = new AbortController();
     let a: Awaited<ReturnType<typeof acquireProject>> | undefined, b: Awaited<ReturnType<typeof acquireProject>> | undefined;
     try {
+      phase('routes.begin');
       const own = captureMcpIndexRoute(root), alias = captureMcpIndexRoute(path.join(path.dirname(root), 'REPO'));
+      phase('routes.return');
       if (!own || !alias) throw new Error('Rendezvous fixture missing own route');
       const request: ProjectRequest = { route: own, intent: 'read', lifetime: lifetime.signal, watchOptions: {},
         admit: (selected, signal) => admitQueryProject(selected.root, policy, signal) };
-      a = await acquireProject({ ...request, route: own });
-      b = await acquireProject({ ...request, route: alias });
+      phase('acquire.a.begin');
+      try { a = await acquireProject({ ...request, route: own }); } finally { phase('acquire.a.settled'); }
+      phase('acquire.b.begin');
+      try { b = await acquireProject({ ...request, route: alias }); } finally { phase('acquire.b.settled'); }
       expect(opened).toBe(1);
       expect(b.cg).toBe(a.cg);
     } catch (error) { primary = { error }; }
     finally {
-      const releases = await Promise.allSettled([a?.release(), b?.release()]);
+      let releases: PromiseSettledResult<void | undefined>[];
+      phase('release.begin');
+      try { releases = await Promise.allSettled([a?.release(), b?.release()]); }
+      finally { phase('release.settled'); }
       observation.mockRestore();
       for (const result of releases) if (result.status === 'rejected') {
         if (primary) process.stderr.write(`Rendezvous lease cleanup after ${String(primary.error).slice(0, 2048)}: ${String(result.reason).slice(0, 2048)}\n`);
         else primary = { error: result.reason };
       }
     }
+    phase(primary ? 'body.throw' : 'body.return');
     if (primary) throw primary.error;
   });
 });

@@ -708,10 +708,14 @@ describe('MCP explicit projectPath lifecycle (#1835)', { timeout: 30_000 }, () =
   it('shares the catch-up gate across concurrent calls and engines', async () => {
     let release!: () => void;
     const held = new Promise<void>((resolve) => { release = resolve; });
+    let enterSync!: () => void, publishReader!: () => void;
+    const syncEntered = new Promise<void>(resolve => { enterSync = resolve; });
+    const readerPublished = new Promise<void>(resolve => { publishReader = resolve; });
     onOpen = (cg, readOnly) => {
-      if (readOnly) return;
+      if (cg.getProjectRoot() !== serviceA) return;
+      if (readOnly) { publishReader(); return; }
       const sync = cg.sync.bind(cg);
-      vi.spyOn(cg, 'sync').mockImplementation(async (...args) => { await held; return sync(...args); });
+      vi.spyOn(cg, 'sync').mockImplementation(async (...args) => { enterSync(); await held; return sync(...args); });
     };
     fs.writeFileSync(path.join(serviceA, 'src/sample.ts'), 'export function concurrentNew() {}\n');
     const second = makeCaller();
@@ -722,7 +726,9 @@ describe('MCP explicit projectPath lifecycle (#1835)', { timeout: 30_000 }, () =
       second.getToolHandler().execute('codegraph_search', { projectPath: serviceA, query: 'concurrentNew' }),
     ].map((p) => p.then((r) => { completed++; return r; }));
     try {
-      await new Promise((r) => setTimeout(r, 100));
+      // Publication follows actual asynchronous admission; elapsed time is
+      // not evidence that both shared native handles reached their barriers.
+      await bounded(Promise.all([syncEntered, readerPublished]), 'Shared writer sync and reader publication');
       expect(completed).toBe(0);
       expect(opened).toHaveLength(2); expectHandles(serviceA, 1, 1);
     } finally { release(); }

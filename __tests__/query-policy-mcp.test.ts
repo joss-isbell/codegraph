@@ -199,6 +199,9 @@ describe('strict preset and overrides through real direct and writable MCP hosts
           expect(result.isError).toBeFalsy(); expect(result.content[0].text).toContain(symbol); expect(result.content[0].text).toContain('app.ts');
         }
       }
+      // The tool reply precedes its delivered-history commit. A later request
+      // processed by this same session is the barrier, not parent stdout data.
+      expect(await client.request('ping')).toEqual({});
       const facts = events();
       const history = facts.filter(event => event.event === 'session-history');
       expect(history.map(event => [event.projectRoot, event.query, event.index])).toEqual([

@@ -208,7 +208,11 @@ describe('MCP engine holds an acknowledged default route before first initializa
     expect(result.isError).not.toBe(true);
     expect(result.content[0]?.text).toContain('verified own codegraph index (invalid)');
     expect(value.hasDefaultCodeGraph()).toBe(false);
-    expect(observer.facts()).toMatchObject({ total: 0, overflow: false });
+    // A >=100-byte unknown database needs an admitted native RO schema
+    // validation attempt. Only this exact held child may be probed: no
+    // ancestor fallback, writable constructor, or second graph is permitted.
+    expect(observer.facts()).toEqual({ total: 1, overflow: false,
+      records: [{ file: held.index, readOnly: true }] });
     expect(membership(ancestor)).toEqual(before);
   }), 30_000);
 

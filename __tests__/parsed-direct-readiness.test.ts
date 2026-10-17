@@ -812,11 +812,38 @@ describe('late prepared direct routes retain one real MCP session', () => {
         const advancing = file === 'db-only' ? 'db' : 'wal', unchanged = file === 'db-only' ? 'wal' : 'db';
         expect(new Set(during.map(value => value[advancing])).size).toBeGreaterThanOrEqual(3);
         expect(during.every(value => value[unchanged] === baseline[unchanged])).toBe(true);
-        host.send('after-work', 'ping'); await host.reply('after-work');
-        host.command('progress-release', { name: 'sqlite' }); await host.event('progress-released');
-        await host.acquireWatchdogIdentity(host.events.filter(value => value.event === 'watchdog-spawned').at(-1)!.pid);
-        host.child.stdin!.end(); await host.event('stdin-ended'); host.command('release-preparation'); await host.close();
+        // The raw resume event proves the synchronous work finished while
+        // preparation is still held; a routed ping cannot answer at this gate.
         expect(host.events.filter(value => value.event === 'factory-entered')).toEqual([]);
+        host.command('progress-release', { name: 'sqlite' });
+        const released = await host.event('progress-released');
+        expect(released.watchdogs).toHaveLength(acquired.watchdogs.length + 1);
+        expect(released.watchdogs.slice(0, -1).map((value: Message) => value.pid))
+          .toEqual(acquired.watchdogs.map((value: Message) => value.pid));
+        const previous = acquired.watchdogs.at(-1), replacement = released.watchdogs.at(-1);
+        // Cumulative snapshots must not let the old selected-path watchdog,
+        // including a reused PID/census identity, stand in for a replacement.
+        expect(new Set(released.watchdogs.map((value: Message) => value.pid)).size).toBe(released.watchdogs.length);
+        expect(replacement).toMatchObject({ paths: [], closed: false });
+        expect(released.watchdogs.find((value: Message) => value.pid === previous.pid)?.closed).toBe(true);
+        const previousClose = host.events.findIndex(value => value.event === 'watchdog-closed' && value.pid === previous.pid);
+        const replacementSpawn = host.events.findIndex(value => value.event === 'watchdog-spawned' && value.pid === replacement.pid);
+        expect(previousClose).toBeGreaterThanOrEqual(0);
+        expect(replacementSpawn).toBeGreaterThan(previousClose);
+        expect(host.watchdogIdentities.some(value => value.pid === replacement.pid)).toBe(false);
+        await host.acquireWatchdogIdentity(replacement.pid);
+        if (process.env.VALIDATION_OUT) {
+          const replacementIdentity = host.watchdogIdentities.find(value => value.pid === replacement.pid);
+          expect(replacementIdentity).toMatchObject({ pid: replacement.pid, creationIdentity: expect.any(String) });
+          expect(host.watchdogIdentities.filter(value => value.pid !== replacement.pid)
+            .some(value => value.creationIdentity === replacementIdentity!.creationIdentity)).toBe(false);
+        }
+        expect(host.events.filter(value => value.event === 'factory-entered')).toEqual([]);
+        // Retain the real public ping as the final route-health check, only
+        // after the preparing-phase progress/watchdog boundary is established.
+        host.command('release-preparation');
+        host.send('after-work', 'ping'); await host.reply('after-work');
+        host.child.stdin!.end(); await host.event('stdin-ended'); await host.close();
       } catch (error) { primaryFailed = true; throw error; }
       finally {
         if (writer) clearInterval(writer);

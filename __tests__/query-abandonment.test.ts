@@ -302,7 +302,11 @@ describe('actual MCP cancellation and disconnect', () => {
     await engine.ensureInitialized(root);
     let release!: () => void, entered = false;
     const gate = new Promise<void>(resolve => { release = resolve; });
-    engine.getToolHandler().setProjectLifecycle({ open: (_root, open) => open(),
+    engine.getToolHandler().setProjectLifecycle({ open: async (route, signal) => {
+      signal?.throwIfAborted();
+      expect(route).toEqual({ root: explicit, index: fs.realpathSync(path.join(explicit, '.codegraph/codegraph.db')) });
+      return CodeGraph.openSync(route.root);
+    },
       activate: async cg => { entered = true; await gate; await cg.sync(); }, release: cg => { cg.close(); } });
     const measurement = vi.spyOn(freshness, 'measurePendingChanges');
     const connection = await connectSessions(engine, root);
