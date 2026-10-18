@@ -16,13 +16,33 @@ HERE = Path(__file__).absolute().parent
 HELPERS = ("windows_witness", "report", "integrity", "runner")
 
 
+def binding_plan(plan):
+    """Require the documented runnable-plan fields without creating run state."""
+    if not isinstance(plan, dict):
+        raise ValueError("plan must be an object")
+    for key in ("sourceRoot", "cwd", "output"):
+        if not isinstance(plan.get(key), str) or not Path(plan[key]).is_absolute():
+            raise ValueError("plan requires an absolute " + key)
+    command, scenarios, environment = (plan.get(key) for key in ("command", "scenarios", "environment"))
+    if (not isinstance(command, list) or not command
+            or any(not isinstance(item, str) or not item for item in command)
+            or not isinstance(scenarios, list) or not scenarios
+            or any(not isinstance(item, str) or not item for item in scenarios)
+            or len(set(scenarios)) != len(scenarios)
+            or not isinstance(environment, dict)
+            or any(not isinstance(key, str) or not isinstance(value, str) for key, value in environment.items())):
+        raise ValueError("plan requires command, unique scenarios and a string environment")
+
+
 def main():
-    if len(sys.argv) not in (2, 4) or (len(sys.argv) == 4 and sys.argv[2] != "--report"):
-        raise ValueError("usage: normal.py PLAN.json [--report RECEIPT.json]")
+    if len(sys.argv) not in (2, 4) or (len(sys.argv) == 4 and sys.argv[2] not in {"--report", "--binding"}):
+        raise ValueError("usage: normal.py PLAN.json [--report RECEIPT.json | --binding OUTPUT.json]")
     if os.name != "nt":
         raise ValueError("source-bound normal caller is Windows only")
     plan_path = Path(sys.argv[1]).absolute()
     plan = json.loads(plan_path.read_text(encoding="utf-8-sig"))
+    if len(sys.argv) == 4 and sys.argv[2] == "--binding":
+        binding_plan(plan)
     declaration = plan.get("sourceBoundCache")
     if not isinstance(declaration, dict) or set(declaration) != {"prefix"}:
         raise ValueError("declare exact sourceBoundCache.prefix before interpreter launch")
@@ -53,6 +73,25 @@ def main():
         exec(compile(raw, module.__file__, "exec"), module.__dict__)
     runner = sys.modules["runner"]
     runner.SOURCE_BOUND_BOOTSTRAP = {"planPath": str(plan_path), "prefix": prefix, "helpers": hashes}
+    if len(sys.argv) == 4 and sys.argv[2] == "--binding":
+        from windows_witness import absolute, ordinary
+        runner.source_bound_cache(plan_path, plan)
+        runner.plan_bounds(plan)
+        output = absolute(sys.argv[3])
+        ordinary(output.parent, True)
+        if os.path.lexists(output):
+            raise ValueError("binding output must not already exist")
+        artifacts = runner.plan_artifacts(plan)
+        observed = runner.binding(plan["sourceRoot"], artifacts)
+        roots = [absolute(plan["sourceRoot"]), absolute(plan["output"]), absolute(prefix),
+                 *(absolute(item) for item in artifacts),
+                 *(Path(row["target"]) for row in observed["reparse"].values())]
+        if any(output.is_relative_to(root) for root in roots):
+            raise ValueError("binding output must be outside inputs, target output and declared cache")
+        with output.open("x", encoding="utf-8") as stream:
+            json.dump(observed, stream, indent=2)
+            stream.write("\n")
+        return 0
     if len(sys.argv) == 4:
         receipt = Path(sys.argv[3]).absolute()
         if receipt.parent / "plan.json" != plan_path:

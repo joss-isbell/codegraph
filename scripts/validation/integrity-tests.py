@@ -391,12 +391,173 @@ def log_close_rejections(proof):
     return results
 
 
+def binding_export_checks(proof):
+    """Exercise the read-only normal CLI and compare it with a real run."""
+    source = fixture(proof / "binding-source")
+    helpers = proof / "binding-helpers"
+    helpers.mkdir()
+    for path in HERE.iterdir():
+        if path.is_file():
+            shutil.copyfile(path, helpers / path.name)
+    (helpers / "__pycache__").mkdir()
+    cached = helpers / "__pycache__" / "strict.pyc"
+    cached.write_bytes(b"cached helper is a strict input")
+    artifact = proof / "binding-artifact"
+    (artifact / "child").mkdir(parents=True)
+    prefix = str(proof / "binding-cache-must-stay-absent")
+    target = proof / "binding-target"
+    plan = {"sourceRoot": str(source), "cwd": str(source), "output": str(target),
+            "command": [sys.executable, str(helpers / "selftest.py"), "produce", "success"],
+            "deadlineSeconds": 8, "scenarios": ["probe"], "artifacts": [str(artifact)],
+            "sourceBoundCache": {"prefix": prefix},
+            "environment": {"PYTHONPYCACHEPREFIX": prefix, "PYTHONDONTWRITEBYTECODE": "1"},
+            "bounds": {"logBytesPerStream": 65536, "excerptBytes": 8192,
+                       "drainSeconds": 0.1, "startupHandshakeSeconds": 0.1,
+                       "cleanupSeconds": 3, "sampleSeconds": 0.02}}
+    plan_path = proof / "binding-plan.json"
+    write(plan_path, plan)
+    env = {**os.environ, **plan["environment"]}
+    command = [sys.executable, "-I", "-S", "-B", "-X", "pycache_prefix=" + prefix,
+               str(helpers / "normal.py"), str(plan_path)]
+    exported = proof / "binding-export.json"
+    result = subprocess.run(command + ["--binding", str(exported)], env=env,
+                            capture_output=True, timeout=25)
+    check("normal binding CLI describes inputs without starting a target",
+          result.returncode == 0 and exported.is_file() and not target.exists()
+          and not Path(prefix).exists(), stderr=result.stderr.decode(errors="replace")[-8192:])
+    observed = json.loads(exported.read_text())
+    check("binding includes explicit root and child directories plus implicit strict inputs",
+          observed["membership"]["artifact"][str(artifact)] == "directory"
+          and observed["membership"]["artifact"][str(artifact / "child")] == "directory"
+          and sum(path == str(artifact) or path.startswith(str(artifact) + os.sep)
+                  for path in observed["membership"]["artifact"]) == 2
+          and observed["artifacts"][sys.executable] == digest(sys.executable)
+          and observed["artifacts"][str(helpers / "normal.py")] == digest(helpers / "normal.py")
+          and observed["artifacts"][str(cached)] == digest(cached))
+    execution = subprocess.run(command, env=env, capture_output=True, timeout=35)
+    check("read-only export and actual execution select the identical complete input map",
+          execution.returncode == 0
+          and observed == json.loads((target / "source-before.json").read_text())
+          and observed == json.loads((target / "source-after.json").read_text()),
+          stderr=execution.stderr.decode(errors="replace")[-8192:])
+    replay = subprocess.run(command[:-1] + [str(target / "plan.json"), "--report",
+                            str(target / "receipt.json")], env=env, capture_output=True, timeout=25)
+    check("normal execution and saved report replay stay compatible", replay.returncode == 0
+          and json.loads(replay.stdout)["outcome"] == "pass")
+    malformed = dict(plan)
+    malformed.pop("command")
+    malformed_path = proof / "binding-malformed-plan.json"
+    write(malformed_path, malformed)
+    refused_output = proof / "binding-malformed-output.json"
+    refused = subprocess.run(command[:-1] + [str(malformed_path), "--binding", str(refused_output)],
+                             env=env, capture_output=True, timeout=25)
+    check("binding refuses a malformed runnable plan before producing a description",
+          refused.returncode != 0 and not refused_output.exists())
+    bad_bounds = {**plan, "bounds": {**plan["bounds"], "cleanupSeconds": 0}}
+    bad_bounds_path = proof / "binding-bad-bounds-plan.json"
+    write(bad_bounds_path, bad_bounds)
+    refused = subprocess.run(command[:-1] + [str(bad_bounds_path), "--binding", str(refused_output)],
+                             env=env, capture_output=True, timeout=25)
+    check("binding and execution reject the same malformed supervision bounds",
+          refused.returncode != 0 and not refused_output.exists())
+    for args in ((str(plan_path), "--binding", str(exported)),
+                 (str(plan_path), "--binding", str(artifact / "description.json")),
+                 (str(plan_path), "--binding", prefix)):
+        refused = subprocess.run(command[:-1] + list(args), env=env, capture_output=True, timeout=25)
+        check("binding refuses overwrite and output beneath an observed input",
+              refused.returncode != 0 and json.loads(exported.read_text()) == observed
+              and not (artifact / "description.json").exists() and not Path(prefix).exists())
+    for args in (("init", "--initial-branch=main"), ("add", "."),
+                 ("-c", "user.name=Binding fixture", "-c", "user.email=binding@example.invalid",
+                  "commit", "--no-gpg-sign", "-m", "binding fixture")):
+        subprocess.run(["git", "-C", str(source), *args], check=True,
+                       capture_output=True, timeout=15)
+    prospective = dict(plan)
+    prospective["output"] = str(proof / "reviewed-target")
+    prospective_path = proof / "reviewed-plan.json"
+    prospective["artifacts"] = [*plan["artifacts"], str(prospective_path)]
+    write(prospective_path, prospective)
+    frozen_path = proof / "reviewed-binding.json"
+    subprocess.run(command[:-1] + [str(prospective_path), "--binding", str(frozen_path)],
+                   env=env, check=True, capture_output=True, timeout=25)
+    def git_fact(*args):
+        return subprocess.check_output(["git", "-C", str(source), *args], timeout=15).decode().strip()
+    review = {"plan": {"path": str(prospective_path), "sha256": digest(prospective_path)},
+              "binding": json.loads(frozen_path.read_text()),
+              "controls": [{"path": str(prospective_path), "sha256": digest(prospective_path)}],
+              "git": {"tree": git_fact("rev-parse", "HEAD^{tree}"),
+                      "branch": git_fact("branch", "--show-current"), "status": []},
+              "python": sys.executable, "powershell": os.environ["BINDING_POWERSHELL"],
+              "inheritedTEMP": os.environ.get("TEMP"), "inheritedTMP": os.environ.get("TMP"),
+              "launchOutput": str(proof / "reviewed-launch"), "deadlineSeconds": 30}
+    review_path = proof / "reviewed.json"
+    write(review_path, review)
+    reviewed_command = [sys.executable, "-I", "-S", "-B", str(helpers / "launch-reviewed.py"),
+                        str(review_path), "--sha256", digest(review_path)]
+    checked = subprocess.run(reviewed_command + ["--output", str(proof / "reviewed-check"), "--check-only"],
+                             env=env, capture_output=True, timeout=40)
+    check("reviewed caller consumes the canonical description without dispatch in check-only mode",
+          checked.returncode == 0 and not Path(prospective["output"]).exists()
+          and not Path(review["launchOutput"]).exists(),
+          stderr=checked.stderr.decode(errors="replace")[-8192:])
+    original_cache = cached.read_bytes()
+    extra = helpers / "new-helper.py"
+    for index, mutation in enumerate(("extra-helper", "missing-helper", "changed-helper", "extra-directory",
+                                      "missing-directory", "renamed-directory-same-count")):
+        if mutation == "extra-helper":
+            extra.write_bytes(b"new strict helper\n")
+        elif mutation == "missing-helper":
+            cached.unlink()
+        elif mutation == "changed-helper":
+            cached.write_bytes(b"changed strict helper bytes")
+        elif mutation == "extra-directory":
+            (artifact / "extra").mkdir()
+        elif mutation == "missing-directory":
+            (artifact / "child").rmdir()
+        else:
+            (artifact / "child").rename(artifact / "renamed")
+        try:
+            refused = subprocess.run(reviewed_command + ["--output", str(proof / ("reviewed-drift-" + str(index))),
+                                     "--check-only"], env=env, capture_output=True, timeout=40)
+            check("reviewed caller refuses " + mutation + " by exact map equality before dispatch",
+                  refused.returncode != 0
+                  and b"current canonical input map differs" in refused.stderr
+                  and not Path(prospective["output"]).exists()
+                  and not Path(review["launchOutput"]).exists(),
+                  stderr=refused.stderr.decode(errors="replace")[-8192:])
+        finally:
+            if extra.exists():
+                extra.unlink()
+            cached.write_bytes(original_cache)
+            if (artifact / "extra").exists():
+                (artifact / "extra").rmdir()
+            if (artifact / "renamed").exists():
+                (artifact / "renamed").rename(artifact / "child")
+            (artifact / "child").mkdir(exist_ok=True)
+    dispatched = subprocess.run(reviewed_command + ["--output", str(proof / "reviewed-dispatch")],
+                                env=env, capture_output=True, timeout=70)
+    target_plan = Path(prospective["output"]) / "plan.json"
+    target_receipt = Path(prospective["output"]) / "receipt.json"
+    replay = subprocess.run(command[:-1] + [str(target_plan), "--report", str(target_receipt)],
+                            env=env, capture_output=True, timeout=25)
+    check("matched reviewed inputs dispatch through the existing owned normal launch and consumer",
+          dispatched.returncode == 0 and replay.returncode == 0
+          and json.loads(replay.stdout)["outcome"] == "pass"
+          and json.loads((Path(review["launchOutput"]) / "launch-result.json").read_text())["cleanupComplete"] is True,
+          stderr=dispatched.stderr.decode(errors="replace")[-8192:])
+
+
 def main():
     if os.name != "nt":
         raise RuntimeError("Windows focused caller checks require actual Windows")
     event("start", scenario=SCENARIO)
     proof = Path(os.environ["VALIDATION_OUT"]) / "windows-inputs"
     proof.mkdir()
+    if sys.argv[1:] == ["--binding-only"]:
+        binding_export_checks(proof)
+        event("complete", scenario=SCENARIO)
+        event("final", passed=True, scenarios=[SCENARIO])
+        return
     log_close = log_close_rejections(proof)
     accepted = run_case(proof, "clean", "success", "pass", aliased=True)
     run_case(proof, "ignored-generated", "generated-directory", "pass")

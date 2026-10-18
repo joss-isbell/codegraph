@@ -69,6 +69,14 @@ def git(root, *args):
     return subprocess.check_output(["git", "-C", str(root), *args], stderr=subprocess.DEVNULL)
 
 
+def plan_artifacts(plan):
+    """The explicit strict inputs, followed by this interpreter and helper tree."""
+    artifacts = plan.get("artifacts", [])
+    if not isinstance(artifacts, list) or any(not isinstance(item, str) or not item for item in artifacts):
+        raise ValueError("artifacts must be an array of nonempty literal paths")
+    return artifacts + [sys.executable, str(HERE)]
+
+
 def binding(root, artifacts):
     root = Path(root).absolute() if os.name == "nt" else Path(root).resolve()
     closure = windows_input_closure(root, artifacts) if os.name == "nt" else None
@@ -393,10 +401,8 @@ class Log:
                 self.errors.append(f"log pipe close failed: {type(exc).__name__}: {exc}")
 
 
-def run(plan_path):
-    plan_path = Path(plan_path).resolve()
-    plan = json.loads(plan_path.read_text(encoding="utf-8-sig"))
-    cache = source_bound_cache(plan_path, plan)
+def plan_bounds(plan):
+    """Validate the same saved supervision declaration for export and execution."""
     declarations = json.loads((HERE / "declarations-v1.json").read_text())
     bounds = {**declarations, **plan.get("bounds", {})}
     seconds = plan["deadlineSeconds"]
@@ -413,6 +419,15 @@ def run(plan_path):
     scenarios = plan["scenarios"]
     if not isinstance(scenarios, list) or not scenarios or len(set(scenarios)) != len(scenarios):
         raise ValueError("declare nonempty unique scenario array before launch")
+    return bounds
+
+
+def run(plan_path):
+    plan_path = Path(plan_path).resolve()
+    plan = json.loads(plan_path.read_text(encoding="utf-8-sig"))
+    cache = source_bound_cache(plan_path, plan)
+    bounds = plan_bounds(plan)
+    seconds, scenarios = plan["deadlineSeconds"], plan["scenarios"]
     out = Path(plan["output"]).resolve()
     out.mkdir(parents=True, exist_ok=False)
     plan["integrityProfile"] = "windows-guard-v2" if os.name == "nt" else "linux-inotify-v1"
@@ -442,7 +457,7 @@ def run(plan_path):
     # Strict helper/artifact inputs include pycache; children must not write it.
     if os.name == "nt":
         env["PYTHONDONTWRITEBYTECODE"] = "1"
-    source = binding(plan["sourceRoot"], plan.get("artifacts", []) + [sys.executable, str(HERE)])
+    source = binding(plan["sourceRoot"], plan_artifacts(plan))
     write(out / "source-before.json", source)
     try:
         delta = git(plan["sourceRoot"], "diff", "--binary", "HEAD")
@@ -480,7 +495,7 @@ def run(plan_path):
     for sig in [signal.SIGINT, signal.SIGTERM] + ([signal.SIGBREAK] if os.name == "nt" else []):
         handlers[sig] = signal.signal(sig, interrupt)
     try:
-        artifacts = plan.get("artifacts", []) + [sys.executable, str(HERE)]
+        artifacts = plan_artifacts(plan)
         if os.name == "nt":
             witness = WindowsInputs(plan["sourceRoot"], artifacts,
                                     absent_roots=[cache["prefix"]] if cache is not None else [])
@@ -554,7 +569,7 @@ def run(plan_path):
             receipt["failures"].extend(log.errors)
     after = None
     try:
-        after = binding(plan["sourceRoot"], plan.get("artifacts", []) + [sys.executable, str(HERE)])
+        after = binding(plan["sourceRoot"], plan_artifacts(plan))
         write(out / "source-after.json", after)
     except BaseException as exc:
         receipt["failures"].append(f"final source/artifact binding failed: {exc}")

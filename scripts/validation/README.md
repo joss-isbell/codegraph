@@ -205,6 +205,105 @@ and retain their original policy; they are not upgraded to this source-bound
 assurance by `-B` alone. Neither route constitutes product acceptance until the
 complete selected producer and consumer tail passes.
 
+### Describe and launch reviewed Windows inputs
+
+`normal.py PLAN --binding OUTPUT.json` uses the same raw-source loader and the
+runner's authoritative source/artifact selection, including its interpreter
+and complete helper directory. The JSON shape is the existing `source-before`
+shape: commit, dirty delta, file digests, root-inclusive membership and reparse
+records. It creates only the requested new file, outside source/artifacts,
+target output and the absent cache route. It starts no target or native input
+observation and creates no home/cache/acceptance receipt. Malformed runnable
+plans, invalid supervision bounds and an existing output refuse.
+
+Use the existing bounded launcher for this read-only command as well:
+
+```powershell
+$pythonExe = 'C:\Users\atramenta\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'
+$planFile = 'C:\owned\final-plan.json'
+$bindingFile = 'C:\owned\frozen-binding.json'
+pwsh -NoProfile -File scripts/validation/launch-normal.ps1 `
+  -Plan $planFile -Python $pythonExe -LaunchOutput C:\owned\describe-launch `
+  -BindingOutput $bindingFile -DeadlineSeconds 60
+if ($LASTEXITCODE -ne 0) { throw 'Input description failed.' }
+```
+
+Finalize the selected plan and its applicable controlling inputs **before**
+this description. Declare the plan itself and those control files as strict
+artifacts. Reconcile the candidate source/build/dependency maps and existing
+release/proof references against their reviewed values before freezing the
+expectation; reject conflicting inherited digests instead of choosing the
+latest value. The description is current observation, not proof of that
+provenance. An old saved map is not a new observation, and a changed plan or
+control set needs a newly prepared expectation. No extra review/resource
+documents are required by these commands.
+
+The prospective caller is `launch-reviewed.py`. Its one frozen JSON input has
+the fields below; `binding` is the entire parsed description, not counts or a
+subset. `controls` holds the applicable existing `{path, sha256}` reference
+records with their previously reviewed digests (it may be empty). The selected
+plan is checked separately and is always a strict artifact. For example, after
+the provenance reconciliation above, prepare it in PowerShell:
+
+```powershell
+$selected = Get-Content -LiteralPath $planFile -Raw | ConvertFrom-Json -AsHashtable
+$frozen = Get-Content -LiteralPath $bindingFile -Raw | ConvertFrom-Json -AsHashtable
+$reviewedControls = @() # Populate from the selected run's existing reviewed references.
+function Read-GitFacts([string[]]$Arguments) {
+  $rows = @(& git -C $selected.sourceRoot @Arguments)
+  if ($LASTEXITCODE -ne 0) { throw 'Git identity read failed.' }
+  return $rows
+}
+$review = [ordered]@{
+  plan = @{path=$planFile; sha256=(Get-FileHash -LiteralPath $planFile -Algorithm SHA256).Hash.ToLowerInvariant()}
+  binding = $frozen
+  controls = $reviewedControls
+  git = @{tree=(Read-GitFacts @('rev-parse','HEAD^{tree}')); branch=(Read-GitFacts @('branch','--show-current')); status=@(Read-GitFacts @('status','--porcelain=v1'))}
+  python = $pythonExe
+  powershell = (Get-Command pwsh).Source
+  inheritedTEMP = $env:TEMP
+  inheritedTMP = $env:TMP
+  launchOutput = 'C:\owned\selected-launch'
+  deadlineSeconds = 900
+}
+$reviewFile = 'C:\owned\reviewed-launch.json' # Outside the observed input roots.
+$review | ConvertTo-Json -Depth 32 | Out-File -LiteralPath $reviewFile -Encoding utf8 -NoClobber
+$reviewHash = (Get-FileHash -LiteralPath $reviewFile -Algorithm SHA256).Hash.ToLowerInvariant()
+& $pythonExe -I -S -B scripts/validation/launch-reviewed.py $reviewFile `
+  --sha256 $reviewHash --output C:\owned\immediate-preflight
+if ($LASTEXITCODE -ne 0) { throw 'Reviewed launch did not pass.' }
+```
+
+Retain the frozen review-file digest with the selected launch instruction;
+do not replace it with a new digest after an unexpected change. The caller
+checks exact parsed maps, control/interpreter/caller hashes, Git commit/tree/
+branch/status, inherited TEMP/TMP, absent process/plan name filters and fresh
+endpoints. It invokes `normal.py --binding` through `launch-normal.ps1` before
+comparing, then delegates dispatch and native exit/cleanup checks to that same
+ordinary launcher. Directory/member totals in `preflight.json` are display
+only. Add `--check-only` with its own fresh `--output` for static feedback
+without dispatch; neither that success nor a matching description is target
+acceptance. A normal run and its complete consumer tail still decide that.
+This full-selection caller deliberately rejects `QUERY_TEST_NAME_PATTERN`;
+ordinary explicitly filtered focused plans retain their existing launcher.
+
+Keep inputs quiet between the comparison and native arming. This extension
+does not add an armed expected-binding protocol or close that existing
+interval. Expectation and preflight outputs stay outside observed roots to
+avoid circular control hashes. Historical callers/results stay unchanged.
+
+For focused helper feedback, run `integrity-tests.py --binding-only` in a saved
+normal bounded plan with scenario `windows-inputs` and environment
+`BINDING_POWERSHELL` set to the absolute `pwsh` executable. This selection
+uses disposable source/helper copies and a real normal run/report, and checks
+added/missing/changed strict helpers, root-inclusive directories, same-count
+membership changes, refusal paths and real reviewed dispatch. The existing
+`query-adapter-proof.py` synthetic fixture also preserves exact case-sensitive
+`(file, fullName)` identities; place its fresh output beneath the checkout's
+`.validation` so copied adapters can resolve the checkout's unchanged Vitest
+dependencies. A workspace dependency junction's ordinary `ui` target remains
+an independently declared strict input.
+
 ## Protected baseline and observation protocol
 
 `prepare.py` preserves the exact baseline Git archive and initial dirty-delta

@@ -1,6 +1,7 @@
 param(
   [Parameter(Mandatory=$true)][string]$Plan,
   [Parameter(Mandatory=$true)][string]$LaunchOutput,
+  [string]$BindingOutput,
   [ValidateRange(1,7200)][int]$DeadlineSeconds = 900,
   [string]$Python = 'C:/Users/atramenta/AppData/Local/Programs/Python/Python312/python.exe'
 )
@@ -195,7 +196,9 @@ $start.RedirectStandardError = $true
 # before normal.py's raw-source bootstrap. Only the owned gate starts pre-assign.
 $gate = 'import json, subprocess, sys; sys.exit(subprocess.call(json.loads(sys.stdin.readline())))'
 foreach ($arg in @('-I','-S','-B','-X',"pycache_prefix=$prefix",'-c',$gate)) { $start.ArgumentList.Add($arg) }
-$targetArgv = @($Python,'-I','-S','-B','-X',"pycache_prefix=$prefix",(Join-Path $PSScriptRoot 'normal.py'),(Resolve-Path -LiteralPath $Plan).Path) | ConvertTo-Json -Compress
+$targetArgs = @($Python,'-I','-S','-B','-X',"pycache_prefix=$prefix",(Join-Path $PSScriptRoot 'normal.py'),(Resolve-Path -LiteralPath $Plan).Path)
+if ($BindingOutput) { $targetArgs += @('--binding',$BindingOutput) }
+$targetArgv = $targetArgs | ConvertTo-Json -Compress
 $start.Environment['PYTHONPYCACHEPREFIX'] = $prefix
 $start.Environment['PYTHONDONTWRITEBYTECODE'] = '1'
 $start.Environment['PYTHONUTF8'] = '1'
