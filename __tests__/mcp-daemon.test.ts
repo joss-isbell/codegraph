@@ -289,7 +289,8 @@ function proveQualified78(server: SpawnedServer): void {
   current.observations.push({ event: 'controlled-native-pre-status-78', pid, spawned: candidates[0], entry,
     daemonAbsent: true, writer: readWriterInfo(current.root), held: fs.realpathSync(path.join(current.root, '.codegraph/codegraph.db')) });
 }
-async function proveBlockedOrdinaryWriterRetry(server: SpawnedServer, candidate: any): Promise<void> {
+async function proveBlockedOrdinaryWriterRetry(server: SpawnedServer, candidate: any,
+  expected: { root: string; index: string; writerBase64: string }): Promise<void> {
   const pid = candidate.candidatePid;
   // These are uncontrolled retries, not another synthetic unavailable fault.
   // Join actual exit + IPC + every parent-owned stdio tail. Aggregate close is
@@ -317,18 +318,59 @@ async function proveBlockedOrdinaryWriterRetry(server: SpawnedServer, candidate:
     if (channels.some((channel: any) => !channel) || isAlive(pid)) return null;
     return { exited, disconnected, channels, aggregateClose: native.find(record => record.event === 'candidate-close') ?? null };
   }, 5000, 25, `ordinary-writer retry ${pid} native outcome`);
-  expect(tail.exited).toMatchObject({ code: 1, signal: null, statuses: 0, acknowledgements: 0 });
-  expect(tail.disconnected).toMatchObject({ connected: false, channelPresent: false, statuses: 0, acknowledgements: 0 });
-  if (tail.aggregateClose) expect(tail.aggregateClose).toMatchObject({ code: 1, signal: null, statuses: 0, acknowledgements: 0 });
+  expect(tail.exited).toMatchObject({ code: 1, signal: null, statuses: 1, acknowledgements: 1 });
+  expect(tail.disconnected).toMatchObject({ connected: false, channelPresent: false, statuses: 1, acknowledgements: 1 });
+  if (tail.aggregateClose) expect(tail.aggregateClose).toMatchObject({ code: 1, signal: null, statuses: 1, acknowledgements: 1 });
   for (const channel of tail.channels) if (channel.parentClosed) {
     expect(channel.parentClosed.identityError).toBeUndefined(); expect(channel.parentClosed.identity).toEqual(channel.identity);
   }
   const records = trace();
-  expect(records.filter(record => record.pid === server.child.pid && record.candidatePid === pid &&
-    ['candidate-status','candidate-parent-send','candidate-controlled-stop','candidate-stdio-error','candidate-parent-file-fd-close-error','candidate-error'].includes(record.event))).toEqual([]);
-  expect(records.filter(record => record.pid === pid &&
-    ['candidate-entered-before-status','candidate-controlled-exit','engine-before-constructor','engine-constructor','sqlite-constructor','graph-open','graph-openSync','graph-sync','graph-watch','tool-start','history'].includes(record.event))).toEqual([]);
-  current.observations.push({ event: 'ordinary-writer-retry-native-outcome', candidate, ...tail });
+  const parent = records.filter(record => record.pid === server.child.pid && record.candidatePid === pid);
+  const statuses = parent.filter(record => record.event === 'candidate-status');
+  const acknowledgements = parent.filter(record => record.event === 'candidate-parent-send');
+  expect(statuses).toHaveLength(1); expect(statuses[0].message).toEqual({ protocol: 1, kind: 'permitted' });
+  expect(acknowledgements).toHaveLength(1); expect(acknowledgements[0].message).toEqual({ protocol: 1, kind: 'acknowledged' });
+  expect(statuses[0].sequence).toBeGreaterThan(candidate.sequence);
+  expect(acknowledgements[0].sequence).toBeGreaterThan(statuses[0].sequence);
+  expect(tail.disconnected.sequence).toBeGreaterThan(acknowledgements[0].sequence);
+  expect(tail.exited.sequence).toBeGreaterThan(acknowledgements[0].sequence);
+  expect(parent.filter(record => ['candidate-controlled-stop','candidate-stdio-error','candidate-parent-file-fd-close-error','candidate-error'].includes(record.event))).toEqual([]);
+  const child = records.filter(record => record.pid === pid);
+  const childAcks = child.filter(record => record.event === 'native-ipc-message');
+  expect(childAcks).toHaveLength(1);
+  expect(childAcks[0]).toMatchObject({ parentPid: server.child.pid, threadId: 0, message: { protocol: 1, kind: 'acknowledged' } });
+  // A parent send is not proof of child permission. The actual child ACK must
+  // follow that send, and precede EVERY observed constructor/authority effect.
+  const ordered = [statuses[0], acknowledgements[0], childAcks[0]];
+  const effects = child.filter(record => /^(engine-|sqlite-|graph-|worker-)/.test(record.event) || ['tool-start','history','socket-raw'].includes(record.event));
+  for (const effect of effects) {
+    expect(effect.threadId).toBe(0); expect(effect.sequence).toBeGreaterThan(childAcks[0].sequence);
+    expect(BigInt(effect.monotonicNs) > BigInt(childAcks[0].monotonicNs)).toBe(true);
+  }
+  // Admission probes only this held index after ACK. A daemon constructor is
+  // inert here: its configured RW capability is NOT an acquired writer lease.
+  expect(effects.map(record => record.event)).toEqual(['sqlite-constructor','engine-before-constructor','engine-constructor']);
+  const [probe, factory, constructed] = effects;
+  expect(probe).toMatchObject({ file: expected.index, readOnly: true });
+  expect(factory.held).toEqual([{ root: expected.root, index: expected.index, owners: {
+    'writer.pid': { present: true, base64: expected.writerBase64 },
+    'daemon.pid': { present: true, base64: expect.any(String) },
+  } }]);
+  const claim = JSON.parse(Buffer.from(factory.held[0].owners['daemon.pid'].base64, 'base64').toString('utf8'));
+  expect(claim).toEqual({ pid, version: CodeGraphPackageVersion, socketPath: getDaemonSocketPath(expected.root), startedAt: expect.any(Number) });
+  expect(Number.isFinite(claim.startedAt) && claim.startedAt > 0).toBe(true);
+  expect(constructed.diagnostics.project).toMatchObject({ root: expected.root, index: expected.index });
+  expect(constructed.diagnostics.effective.executionMode).toBe('shared-daemon');
+  expect(constructed.diagnostics.ownership.pid).toBe(pid);
+  expect(constructed.diagnostics.lifecycle).toMatchObject({ state: 'cold', ready: false, workers: 0, queued: 0, executing: 0, starting: 0, retiring: 0 });
+  expect(child.filter(record => ['candidate-entered-before-status','candidate-controlled-exit','socket-connect'].includes(record.event))).toEqual([]);
+  const childExits = child.filter(record => record.event === 'process-exit');
+  expect(childExits).toHaveLength(1); expect(childExits[0]).toMatchObject({ code: 1, firstFailure: null });
+  ordered.push(probe, factory, constructed, childExits[0], tail.exited);
+  for (let index = 1; index < ordered.length; index++) expect(BigInt(ordered[index].monotonicNs) > BigInt(ordered[index - 1].monotonicNs)).toBe(true);
+  expect(probe.sequence).toBeLessThan(factory.sequence); expect(factory.sequence).toBeLessThan(constructed.sequence);
+  expect(constructed.sequence).toBeLessThan(childExits[0].sequence);
+  current.observations.push({ event: 'ordinary-writer-retry-native-outcome', candidate, expected, statuses, acknowledgements, childAck: childAcks[0], probe, factory, constructed, childExit: childExits[0], ...tail });
 }
 async function proveTypedUnsupported(server: SpawnedServer, root: string): Promise<void> {
   const records = trace().filter(record => record.pid === server.child.pid);
@@ -1625,6 +1667,19 @@ describe('Shared MCP daemon (issue #411)', () => {
     expect(local.error).toBeUndefined();
     expect(server.stderr.some(line => line.includes('Serving reads in-process without auto-sync'))).toBe(true);
     const controlledCandidate = proveUnavailable(server, 'initial', undefined, true); arm('observe', 'ordinary-writer-retries');
+    // Bind expectations BEFORE the ordinary owner stops, independently of any
+    // later candidate: the original local factory held these exact owner bytes.
+    const initialFactories = trace().filter(record => record.pid === server.child.pid && record.event === 'engine-before-constructor');
+    expect(initialFactories).toHaveLength(1); expect(initialFactories[0].held).toHaveLength(1);
+    const retryExpected = { root: realRoot, index: fs.realpathSync(path.join(realRoot, '.codegraph/codegraph.db')),
+      writerBase64: initialFactories[0].held[0].owners['writer.pid'].base64 };
+    expect(initialFactories[0].held).toEqual([{ root: retryExpected.root, index: retryExpected.index, owners: {
+      'daemon.pid': { present: false }, 'writer.pid': { present: true, base64: retryExpected.writerBase64 },
+    } }]);
+    const initialWriter = Buffer.from(retryExpected.writerBase64, 'base64');
+    expect(JSON.parse(initialWriter.toString('utf8'))).toMatchObject({ pid: owner.child.pid, mode: 'fallback', ready: true });
+    expect(bounded(path.join(realRoot, '.codegraph/writer.pid'))).toEqual(initialWriter);
+    expect(before.find(entry => entry.name === 'writer.pid')).toMatchObject({ kind: 'file', bytes: initialWriter.length, sha256: sha(initialWriter) });
     expect(readLockPid(realRoot)).toBeNull();
     expect(readWriterInfo(realRoot)).toMatchObject({ pid: owner.child.pid, mode: 'fallback' });
     const localPolicy = trace().find(record => record.pid === server.child.pid && record.event === 'engine-diagnostics')?.diagnostics;
@@ -1679,7 +1734,7 @@ describe('Shared MCP daemon (issue #411)', () => {
       if (candidate.attempt === 'initial') expect(noFault).toHaveLength(1); else expect(noFault).toEqual([]);
       expect(records.filter(record => record.candidatePid === candidate.candidatePid &&
         ['candidate-pre-service-barrier','candidate-controlled-stop','candidate-error'].includes(record.event))).toEqual([]);
-      if (candidate.candidatePid !== daemonPid) await proveBlockedOrdinaryWriterRetry(server, candidate);
+      if (candidate.candidatePid !== daemonPid) await proveBlockedOrdinaryWriterRetry(server, candidate, retryExpected);
       else {
         const statuses = records.filter(record => record.event === 'candidate-status' && record.candidatePid === daemonPid);
         const acknowledgements = records.filter(record => record.event === 'candidate-parent-send' && record.candidatePid === daemonPid);
