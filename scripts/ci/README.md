@@ -1,5 +1,24 @@
 # Ordinary Windows CI
 
+The independent `helper-tests` job runs the existing native-cleanup regression
+and six receipt-consumer regressions without npm, a product build, or the product
+test workspace. Run that same bounded check locally on Windows with Python 3.9
+or newer:
+
+```powershell
+python -B scripts/ci/selftest.py
+```
+
+It runs `windows.test.py` then `verify-windows.test.py` once each. Both must
+complete successfully; a passing prefix, interruption, timeout or incomplete
+cleanup fails the command. It reuses the ordinary CI supervisor, with 120 seconds
+per suite and 360 seconds overall, including the existing 70-second final cleanup
+reserve. These are supervision limits, not duration promises. Fresh helper logs
+and receipts go under `RUNNER_TEMP/codegraph-windows-ci-helpers` (or
+`.validation/windows-ci-helpers` locally), separate from product CI receipts.
+The helper job always attempts to upload its bounded logs and receipts, retained
+for seven days. Neither Windows job depends on the other passing.
+
 `.github/workflows/windows-ci.yml` runs the existing `npm ci`, `npm run build`,
 and `npm test` commands on pull requests and pushes to `main` or `proto/issue-7`.
 The test command covers both Vitest workspace projects; the separate component
@@ -45,6 +64,9 @@ cache is excluded from the artifact.
 
 This is an ordinary product build/test check, not Issue #7's private acceptance
 campaign or a source-integrity qualification. It does not invoke the validation
-runner's scenario consumer or file-change Witness. Adding the workflow does not
+runner's scenario consumer or file-change Witness. Adding either job does not
 make it a required branch-protection check, and local validation is not a hosted
 GitHub Actions run.
+
+A helper-test pass only checks the CI helpers. It does not establish a product
+install/build/test pass; those commands still need their own complete receipt.
