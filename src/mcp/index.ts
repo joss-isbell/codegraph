@@ -387,7 +387,7 @@ async function spawnDetachedDaemon(route: McpIndexRoute, startup: QueryStartupRe
   assertStartupRoute(route);
   const root = route.root;
   const selector = codeGraphDirNameFor(root);
-  if (fs.realpathSync(path.join(root, selector, 'codegraph.db')) !== route.index) {
+  if (fs.realpathSync.native(path.join(root, selector, 'codegraph.db')) !== route.index) {
     throw unknownStartup(root, 'The captured child index-directory binding changed.');
   }
   const scriptPath = process.argv[1];

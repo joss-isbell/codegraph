@@ -532,7 +532,10 @@ export function captureMcpIndexRoute(root: string): McpIndexRoute | null {
   const index = path.join(getCodeGraphDir(root), 'codegraph.db');
   try {
     if (!fs.statSync(index).isFile()) return null;
-    return Object.freeze({ root: fs.realpathSync(root), index: fs.realpathSync(index) });
+    // Native realpaths supply the actual Windows casing for both identities.
+    // Unlike the rendezvous key, neither missing paths nor case-folded guesses
+    // can stand in for a verified root and its exact current own index.
+    return Object.freeze({ root: fs.realpathSync.native(root), index: fs.realpathSync.native(index) });
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === 'ENOENT' || code === 'ENOTDIR') return null;
@@ -543,8 +546,8 @@ export function captureMcpIndexRoute(root: string): McpIndexRoute | null {
 /** Revalidate an already chosen route without permission or schema I/O. */
 export function assertMcpIndexRoute(route: McpIndexRoute): void {
   try {
-    if (fs.realpathSync(route.root) !== route.root
-      || fs.realpathSync(path.join(getCodeGraphDir(route.root), 'codegraph.db')) !== route.index
+    if (fs.realpathSync.native(route.root) !== route.root
+      || fs.realpathSync.native(path.join(getCodeGraphDir(route.root), 'codegraph.db')) !== route.index
       || !fs.statSync(route.index).isFile()) {
       throw new McpIndexRouteUnavailableError(route, 'changed');
     }

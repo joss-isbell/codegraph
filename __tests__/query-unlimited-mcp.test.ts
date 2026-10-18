@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import * as net from 'net';
 import { CodeGraph } from '../src';
 import { getWriterPidPath } from '../src/mcp/writer-lock';
 import { parseQueryDiagnostics as diagnostic } from './query-diagnostics-helper';
@@ -16,6 +17,145 @@ async function until(check: () => boolean, ms: number, detail: () => string = ()
 }
 
 describe('independent unlimited concurrency through actual MCP', () => {
+  it.runIf(process.platform === 'win32')('keeps Windows case-alias queries usable across two live MCP engines and the first engine exit', async () => {
+    const { MCPEngine }: typeof import('../src/mcp/engine') = require('../dist/mcp/engine');
+    const { MCPSession }: typeof import('../src/mcp/session') = require('../dist/mcp/session');
+    const { SocketTransport }: typeof import('../src/mcp/transport') = require('../dist/mcp/transport');
+    const fixture = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-query-case-alias-')));
+    const root = path.join(fixture, 'Repo'), alias = path.join(fixture, 'REPO');
+    const engines: Array<InstanceType<typeof MCPEngine>> = [];
+    const sessions: Array<InstanceType<typeof MCPSession>> = [];
+    const endpoints: Array<{ name: string; server: net.Server; replies: any[]; issued: number[];
+      buffer: string; seenBytes: number; serverClosed: boolean }> = [];
+    const sockets: Array<{ socket: net.Socket; name: string; closed: boolean; ended: boolean; hadError: boolean | null }> = [];
+    const errors: string[] = [];
+    const cleanup: Array<{ phase: string; error: string | null }> = [];
+    const evidence: Record<string, unknown> = { fixture, root, alias,
+      construction: { rootless: true, readOnly: true, watch: false, queryPool: false, hostPid: process.pid } };
+    let primary: unknown, phase = 'fixture setup', fixtureRemoved = false;
+    const bounded = async <T,>(work: Promise<T>, label: string): Promise<T> => {
+      let timer: NodeJS.Timeout | undefined;
+      try { return await Promise.race([work, new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`Owned case-alias ${label} deadline`)), 10000);
+      })]); } finally { if (timer) clearTimeout(timer); }
+    };
+    const ownSocket = (socket: net.Socket, name: string) => {
+      const owned = { socket, name, closed: false, ended: false, hadError: null as boolean | null };
+      sockets.push(owned);
+      socket.on('error', error => errors.push(`${name}: ${String(error)}`));
+      socket.once('end', () => { owned.ended = true; });
+      socket.once('close', hadError => { owned.closed = true; owned.hadError = hadError; });
+    };
+    const endpoint = async (name: string) => {
+      // Both built engines resolve through the same production lifecycle module.
+      // No default project is selected: each real MCP call supplies its own path.
+      const engine = new MCPEngine({ readOnly: true, watch: false, queryPool: false });
+      engines.push(engine);
+      let session: InstanceType<typeof MCPSession> | undefined;
+      const server = net.createServer(socket => {
+        ownSocket(socket, `${name}:server`);
+        session = new MCPSession(new SocketTransport(socket), engine);
+        sessions.push(session); session.start();
+      });
+      const row = { name, server, replies: [] as any[], issued: [] as number[], buffer: '', seenBytes: 0, serverClosed: false };
+      endpoints.push(row);
+      server.on('error', error => errors.push(`${name}:server: ${String(error)}`));
+      server.once('close', () => { row.serverClosed = true; });
+      await bounded(new Promise<void>((resolve, reject) => {
+        server.once('error', reject); server.listen(0, '127.0.0.1', () => { server.removeListener('error', reject); resolve(); });
+      }), `${name} listen`);
+      const client = net.createConnection((server.address() as net.AddressInfo).port, '127.0.0.1');
+      ownSocket(client, `${name}:client`);
+      client.setEncoding('utf8');
+      client.on('data', (chunk: string) => {
+        row.seenBytes += Buffer.byteLength(chunk);
+        if (row.seenBytes > 1024 * 1024) { errors.push(`${name}: reply capture overflow`); client.destroy(); return; }
+        row.buffer += chunk;
+        let end: number;
+        while ((end = row.buffer.indexOf('\n')) >= 0) {
+          const line = row.buffer.slice(0, end); row.buffer = row.buffer.slice(end + 1);
+          try {
+            const reply = JSON.parse(line);
+            if (reply.jsonrpc !== '2.0' || 'method' in reply || !row.issued.includes(reply.id)
+              || ('result' in reply) === ('error' in reply) || row.replies.length >= 16) throw new Error('Invalid owned MCP reply');
+            row.replies.push(reply);
+          } catch (error) { errors.push(`${name}: ${String(error)}`); }
+        }
+      });
+      const request = async (method: string, params: unknown) => {
+        const id = row.issued.length + 1; row.issued.push(id);
+        client.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+        await until(() => errors.length > 0 || row.replies.some(reply => reply.id === id), 10000,
+          () => JSON.stringify({ name, method, errors, replies: row.replies }));
+        expect(errors).toEqual([]);
+        return row.replies.find(reply => reply.id === id)!;
+      };
+      const initialized = await request('initialize', { protocolVersion: '2024-11-05', capabilities: {},
+        clientInfo: { name, version: '1' } });
+      expect(initialized.error).toBeUndefined();
+      expect(initialized.result.serverInfo).toBeDefined();
+      client.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
+      return { engine, request, stopSession: () => session?.stop() };
+    };
+    const expectedSearch = (reply: any, symbol: string, line: number) => {
+      expect(reply.error, JSON.stringify(reply)).toBeUndefined();
+      expect(reply.result.isError).toBeFalsy();
+      expect(reply.result.content[0].text).toContain(symbol);
+      expect(reply.result.content[0].text).toContain(`app.ts:${line}`);
+    };
+    try {
+      fs.mkdirSync(root);
+      fs.writeFileSync(path.join(root, 'app.ts'),
+        'export function aliasFirst() { return 701; }\nexport function aliasSurvivor() { return 907; }\n');
+      const graph = await CodeGraph.init(root);
+      try { await graph.indexAll(); } finally { graph.close(); }
+      const first = await endpoint('case-alias-first'), second = await endpoint('case-alias-second');
+      phase = 'first session holds the indexed project';
+      const original = await first.request('tools/call', { name: 'codegraph_search', arguments: { query: 'aliasFirst', projectPath: root } });
+      evidence.original = original; expectedSearch(original, 'aliasFirst', 1);
+      phase = 'second live session queries the same Windows directory under different case';
+      const joined = await second.request('tools/call', { name: 'codegraph_search', arguments: { query: 'aliasFirst', projectPath: alias } });
+      evidence.joined = joined; expectedSearch(joined, 'aliasFirst', 1);
+      phase = 'second session remains useful after the first engine exits';
+      first.stopSession(); await bounded(first.engine.stop(), 'first engine stop');
+      evidence.firstEngineStopped = true;
+      const surviving = await second.request('tools/call', { name: 'codegraph_search', arguments: { query: 'aliasSurvivor', projectPath: alias } });
+      evidence.surviving = surviving; expectedSearch(surviving, 'aliasSurvivor', 2);
+      phase = 'owned native cleanup';
+    } catch (error) { primary = error; throw error; }
+    finally {
+      const attempt = async (name: string, action: () => unknown | Promise<unknown>) => {
+        try { await action(); cleanup.push({ phase: name, error: null }); }
+        catch (error) { cleanup.push({ phase: name, error: error instanceof Error ? error.stack ?? error.message : String(error) }); }
+      };
+      for (const [index, session] of sessions.entries()) await attempt(`session ${index} stop`, () => session.stop());
+      await Promise.all(engines.map((engine, index) => attempt(`engine ${index} drain`, () => bounded(engine.stop(), `engine ${index} drain`))));
+      await Promise.all(endpoints.map(row => attempt(`${row.name} server close`, async () => {
+        if (row.server.listening) await bounded(new Promise<void>((resolve, reject) => row.server.close(error => error ? reject(error) : resolve())), `${row.name} close`);
+      })));
+      await attempt('all native sockets closed and complete MCP replies retained', async () => {
+        for (const owned of sockets) owned.socket.destroy();
+        await until(() => sockets.every(owned => owned.closed), 10000);
+        expect(errors).toEqual([]);
+        expect(sockets.every(owned => owned.hadError === false)).toBe(true);
+        expect(endpoints.every(row => row.serverClosed && !row.buffer.length)).toBe(true);
+        for (const row of endpoints) for (const id of row.issued) expect(row.replies.filter(reply => reply.id === id)).toHaveLength(1);
+      });
+      if (cleanup.every(row => row.error === null)) await attempt('owned fixture removal after both engine drains', async () => {
+        await fs.promises.rm(fixture, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+        expect(fs.existsSync(fixture)).toBe(false); fixtureRemoved = true;
+      });
+      saveCompatibilityEvidence('case-alias-shared-project', { ...evidence, phase,
+        primary: primary instanceof Error ? primary.stack : String(primary ?? ''),
+        outcome: primary || cleanup.some(row => row.error) ? 'fail' : 'pass', cleanup, fixtureRemoved, errors,
+        sockets: sockets.map(({ socket: _socket, ...owned }) => owned),
+        endpoints: endpoints.map(({ server: _server, ...row }) => row) });
+      const failures = cleanup.filter(row => row.error);
+      if (failures.length && !primary) throw new Error('Owned case-alias cleanup incomplete: ' + JSON.stringify(failures));
+      if (failures.length && primary) process.stderr.write('Owned case-alias cleanup also failed: ' + JSON.stringify(failures) + '\n');
+    }
+  }, 90000);
+
   it.runIf(process.platform === 'win32')('serves three compatible cold callers while their shared service is still starting', async () => {
     const fixture = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-query-concurrent-startup-')));
     const root = path.join(fixture, 'project');

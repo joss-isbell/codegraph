@@ -2334,8 +2334,8 @@ export class ToolHandler {
   private assertAdmittedRoute(project: McpIndexRoute): void {
     let ownIndex = false;
     try {
-      ownIndex = realpathSync(project.root) === project.root
-        && realpathSync(getDatabasePath(project.root)) === project.index
+      ownIndex = realpathSync.native(project.root) === project.root
+        && realpathSync.native(getDatabasePath(project.root)) === project.index
         && isInitialized(project.root);
     } catch { /* Missing or inaccessible own index is recoverable, never an ancestor route. */ }
     if (!ownIndex) {
