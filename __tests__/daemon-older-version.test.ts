@@ -965,7 +965,7 @@ describe('a launcher meeting a daemon of another version (#2335)', () => {
       return raw.slice(0, end).split('\n').filter(Boolean).map(line => JSON.parse(line));
     };
     const event = (name: string): any => events().find(row => row.event === name);
-    const common = { NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require "${UPGRADE_PRELOAD}"`,
+    const common = { NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require "${UPGRADE_PRELOAD.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`,
       QUERY_UPGRADE_ROOT: realRoot, QUERY_UPGRADE_OBSERVATIONS: observations, QUERY_UPGRADE_DRAIN_RELEASE: drainRelease,
       QUERY_UPGRADE_ACQUISITION_RELEASE: acquisitionRelease, QUERY_UPGRADE_ARM: arm,
       CODEGRAPH_DAEMON_INSTALL_CHECK_MS: '200', CODEGRAPH_DAEMON_RETRY_MS: '0' };

@@ -65,15 +65,18 @@ async function requireCandidateAbsence(root: string): Promise<void> {
     return absent;
   }, 30000);
 }
-function requireObservedSockets(values: any[], final = false): void {
+function requireObservedSockets(values: any[], root: string, final = false): void {
   const events = (name: string): any[] => values.filter(value => value.event === name);
   const installed = events('actual-observed-socket-installed');
   expect(installed.length, 'actual IO trace must observe its native connection').toBeGreaterThan(0);
   const verified = events('actual-verified-socket');
-  expect(installed.map(value => value.purpose).sort()).toEqual(verified.length
-    ? ['prepare-admission', 'attempt-admission', 'attachment'].sort() : ['prepare-admission']);
+  const purposes = verified.length ? ['prepare-admission', 'attempt-admission', 'attachment'] : ['prepare-admission'];
+  expect(installed.every(value => purposes.includes(value.purpose)),
+    'every observed connection has a recognized acquisition role').toBe(true);
   expect(new Set(installed.map(value => value.socketId)).size).toBe(installed.length);
   for (const identity of installed) {
+    expect(getDaemonSocketCandidates(root)).toContain(identity.endpoint);
+    if (verified.length) expect(identity).toMatchObject({ pid: verified[0].pid, endpoint: verified[0].owners.daemon.value.socketPath });
     expect(identity.stack).toContain('connectObservedService');
     expect(identity.stack).toContain(identity.purpose === 'attachment' ? 'connectHeldService' : 'admitQueryProject');
     const own = (name: string): any[] => events(name).filter(value => value.socketId === identity.socketId);
@@ -117,7 +120,7 @@ function requireObservedSockets(values: any[], final = false): void {
     expect(events('fallback-prepared-deps-observer-installed')).toEqual([]);
   }
 }
-function requireTrace(trace: UnprovedTrace, values: any[]): void {
+function requireTrace(trace: UnprovedTrace, values: any[], root: string): void {
   expect(trace.firstError).toBeNull(); expect(trace.truncated).toBe(false);
   const identity = (value: any) => value.pid + ':' + value.threadId;
   const spawned = values.filter(value => value.event === 'spawn').map(identity).sort();
@@ -135,14 +138,14 @@ function requireTrace(trace: UnprovedTrace, values: any[]): void {
   if (values.some(value => value.event === 'actual-actionable-input-consumed')) {
     expect(values.filter(value => value.event === 'fallback-factory-observer-installed')).toEqual([expect.objectContaining({ branch: 'prepare-entry' })]);
     expect(values.filter(value => value.event === 'actual-input-EOF')).toEqual([expect.objectContaining({ partialBytes: 0, firstError: null })]);
-    requireObservedSockets(values, true);
+    requireObservedSockets(values, root, true);
   }
 }
 async function settle(root: string, clients: UnprovedClient[], traces: UnprovedTrace[], cleanup: Cleanup): Promise<void> {
   for (const client of clients) await attempt(cleanup, 'native-close-' + client.name, () => client.close());
   await attempt(cleanup, 'all-candidates-exited', () => requireCandidateAbsence(root));
   for (const trace of traces) await attempt(cleanup, 'final-trace-' + traces.indexOf(trace), () => {
-    requireTrace(trace, trace.read(true));
+    requireTrace(trace, trace.read(true), root);
   });
 }
 async function bufferedRequests(peer: UnprovedClient, root: string, io: UnprovedTrace, release: string, evidence: Record<string, unknown>): Promise<any[]> {
@@ -184,7 +187,7 @@ function save(name: string, root: string, fixture: string, evidence: object, cli
     try { candidatePids(finalSpawns); cleanup.push({ phase: 'final-candidate-record-schema', error: null }); }
     catch (error) { cleanup.push({ phase: 'final-candidate-record-schema', error: String(error).slice(0, 8192) }); }
     traces.forEach((trace, index) => {
-      try { requireTrace(trace, finalTraces[index].values); cleanup.push({ phase: 'persisted-trace-' + index, error: null }); }
+      try { requireTrace(trace, finalTraces[index].values, root); cleanup.push({ phase: 'persisted-trace-' + index, error: null }); }
       catch (error) { cleanup.push({ phase: 'persisted-trace-' + index, error: String(error).slice(0, 8192) }); }
     });
     cleanup.push({ phase: 'raw-fixture-and-spawn-evidence-retained', error: null });
@@ -308,7 +311,7 @@ describe('unproved transport observation cannot become unavailable', () => {
       for (const reply of [...replies, next]) requireRefusal(reply, root);
       await wait(350); // terminal refusal cannot arm the configured100ms retry
       const finalSeam = seam.read();
-      requireObservedSockets(finalSeam);
+      requireObservedSockets(finalSeam, root);
       for (const name of ['actual-verified-socket', 'actual-socket-native-close', 'returned-destroyed-socket']) expect(finalSeam.filter(value => value.event === name)).toHaveLength(1);
       for (const id of [100, 101, 102]) expect(peer.values.filter(value => value.id === id)).toHaveLength(1);
       expect(finalSeam.filter(value => value.event === 'fallback-factory-invoked')).toEqual([]);

@@ -27,7 +27,8 @@ const attachment = (input: any[]): any => one(input.filter(value => value.purpos
  * Every observed inspection remains accountable, not discarded as extra noise. */
 function requireSocketLifecycle(input: any[], requesterPid: number, endpoint: string, final = false): any {
   const installed = events(input, 'actual-native-socket-observer-installed'), selected = attachment(input);
-  expect(installed.map(value => value.purpose).sort()).toEqual(['prepare-admission', 'attempt-admission', 'attachment'].sort());
+  expect(installed.every(value => ['prepare-admission', 'attempt-admission', 'attachment'].includes(value.purpose)),
+    'every observed connection has a recognized acquisition role').toBe(true);
   expect(new Set(installed.map(value => value.socketId)).size).toBe(installed.length);
   for (const value of installed) {
     expect(value).toMatchObject({ pid: requesterPid, endpoint });

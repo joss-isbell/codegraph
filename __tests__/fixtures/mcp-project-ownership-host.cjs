@@ -239,14 +239,19 @@ async function main() {
   } else if (role === 'workers') {
     const actual = resolveQueryPolicy({ poolSize: '1', busyTimeoutMs: '10000' }, 'direct', 3);
     const prospective = resolveQueryPolicy(actual.requested, 'shared-daemon', 3);
-    engine = new MCPEngine({ executionMode: 'direct', queryPolicy: actual, queryAdmissionPolicy: prospective,
-      projectRoute: captureMcpIndexRoute(root), watch: false, queryPool: true });
-    await engine.ensureInitialized(root);
-    const handler = engine.getToolHandler();
-    const first = await handler.execute('codegraph_search', { query: 'alphaOriginal' });
-    const second = await handler.execute('codegraph_search', { query: 'betaOriginal', projectPath: beta });
-    send({ event: 'answers', first, second, diagnostics: engine.getQueryDiagnostics() });
-    await stop();
+    const observer = require('./mcp-project-ownership-observer.cjs');
+    try {
+      engine = new MCPEngine({ executionMode: 'direct', queryPolicy: actual, queryAdmissionPolicy: prospective,
+        projectRoute: captureMcpIndexRoute(root), watch: false, queryPool: true });
+      await engine.ensureInitialized(root);
+      const handler = engine.getToolHandler();
+      const first = await handler.execute('codegraph_search', { query: 'alphaOriginal' });
+      const second = await handler.execute('codegraph_search', { query: 'betaOriginal', projectPath: beta });
+      send({ event: 'answers', first, second, diagnostics: engine.getQueryDiagnostics() });
+    } finally {
+      await stop();
+      send({ event: 'worker-identities', pid: process.pid, workers: observer.workerFacts() });
+    }
   } else if (role === 'measurements' || role === 'measurement-drift') {
     const { measurePendingChanges, endFreshnessMeasurements } = require('../../dist/mcp/index-freshness');
     const observer = require('./mcp-project-ownership-observer.cjs');

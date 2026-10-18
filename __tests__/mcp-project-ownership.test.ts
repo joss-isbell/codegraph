@@ -374,13 +374,57 @@ describe('real MCP project ownership precedes native writes', () => {
 
   it('real default and cached explicit query-worker handles stay read-only under a read-write policy', owned(async () => {
     const alpha = temp(), beta = temp(); await indexed(alpha); await indexed(beta, 'betaOriginal'); const log = path.join(alpha, 'worker-native.jsonl');
+    const capture = { kind: 'query-worker-native-log', log, bytes: 0, sha256: null as string | null,
+      raw: null as string | null, failure: null as string | null };
+    facts.push(capture);
+    const captureLog = () => {
+      let fd: number | undefined;
+      try {
+        fd = fs.openSync(log, 'r');
+        const data = Buffer.alloc(128 * 1024 + 1); let size = 0, count = 0;
+        while (size < data.length && (count = fs.readSync(fd, data, size, data.length - size, size)) > 0) size += count;
+        capture.bytes = fs.fstatSync(fd).size;
+        if (size > 128 * 1024 || size !== capture.bytes) throw new Error('Worker native log overflow or incomplete read; full file retained');
+        const raw = data.subarray(0, size);
+        capture.raw = raw.toString('utf8'); capture.sha256 = createHash('sha256').update(raw).digest('hex'); capture.failure = null;
+        return capture.raw;
+      } catch (error) { capture.failure = String(error).slice(0, 2048); throw error; }
+      finally { if (fd !== undefined) fs.closeSync(fd); }
+    };
+    // LIFO cleanup: the existing host close runs before the final complete-log capture, even after a body failure.
+    cleanup.push(async () => { captureLog(); });
     const peer = host('workers', alpha, beta, log); await bounded(peer.close, 'worker host close', 20_000);
-    const observed = peer.snapshot(); expect(observed.exit).toEqual({ code: 0, signal: null }); expect(observed.stdout).toContain('betaOriginal');
-    const rows: NativeFact[] = fs.readFileSync(log, 'utf8').trim().split(/\r?\n/).map(line => JSON.parse(line));
-    const workers = rows.filter(record => record.threadId > 0); expect(workers.length).toBeGreaterThan(0);
-    expect(workers.every(record => record.readOnly)).toBe(true);
-    expect(workers.some(record => record.file === route(alpha).index)).toBe(true);
-    expect(workers.some(record => record.file === route(beta).index)).toBe(true);
+    const observed = peer.snapshot(), raw = captureLog();
+    expect(observed).toMatchObject({ exit: { code: 0, signal: null }, didClose: true, stdoutEnd: true, stderrEnd: true, firstFailure: undefined });
+    type WorkerFact = { file: string; workerId: number; exited: boolean; code: number | null };
+    type Answer = { isError?: boolean; content?: Array<{ text?: string }> };
+    const messages: Array<{ event: string; pid?: number; workers?: { overflow: boolean; records: WorkerFact[] };
+      first?: Answer; second?: Answer }> = observed.stdout.trim().split(/\r?\n/).map(line => JSON.parse(line));
+    const identities = messages.filter(message => message.event === 'worker-identities'); expect(identities).toHaveLength(1);
+    expect(identities[0].pid).toBe(observed.pid); expect(identities[0].workers?.overflow).toBe(false);
+    const constructors = identities[0].workers!.records, workerIds = new Set(constructors.map(record => record.workerId));
+    expect(workerIds.size).toBe(constructors.length);
+    for (const record of constructors) expect(Number.isInteger(record.workerId) && record.workerId > 0).toBe(true);
+    const ownIndexes = [route(alpha).index, route(beta).index];
+    const rows: NativeFact[] = raw.trim().split(/\r?\n/).map(line => JSON.parse(line)); expect(rows.length).toBeGreaterThan(0);
+    for (const record of rows) {
+      expect(record.pid).toBe(observed.pid); expect(ownIndexes).toContain(record.file);
+      expect(typeof record.readOnly).toBe('boolean'); expect(Number.isInteger(record.threadId) && record.threadId >= 0).toBe(true);
+      if (record.threadId > 0) expect(workerIds.has(record.threadId)).toBe(true);
+      if (!record.readOnly) { expect(record.file).toBe(ownIndexes[0]); expect(record.writer).toMatchObject({ pid: observed.pid }); }
+    }
+    expect(rows.some(record => !record.readOnly)).toBe(true);
+    const queryWorkers = constructors.filter(record => record.file === path.resolve(__dirname, '../dist/mcp/query-worker.js'));
+    expect(queryWorkers.length).toBeGreaterThan(0);
+    const queryIds = new Set(queryWorkers.map(record => record.workerId));
+    const queryOpens = rows.filter(record => queryIds.has(record.threadId)); expect(queryOpens.length).toBeGreaterThan(0);
+    for (const record of queryOpens) expect(record.readOnly).toBe(true);
+    for (const index of ownIndexes) expect(queryOpens.some(record => record.file === index)).toBe(true);
+    for (const record of queryWorkers) { expect(record.exited).toBe(true); expect(Number.isInteger(record.code)).toBe(true); }
+    const answers = messages.filter(message => message.event === 'answers'); expect(answers).toHaveLength(1);
+    expect(answers[0].first?.isError).not.toBe(true); expect(answers[0].second?.isError).not.toBe(true);
+    expect(answers[0].first?.content?.map(item => item.text ?? '').join('\n')).toContain('alphaOriginal');
+    expect(answers[0].second?.content?.map(item => item.text ?? '').join('\n')).toContain('betaOriginal');
     expect(observed.stdout).toContain('"capability":"read-write"');
   }), 30_000);
 
