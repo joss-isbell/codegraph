@@ -2,6 +2,8 @@
 import ctypes
 from ctypes import wintypes
 import importlib.util
+import io
+import json
 import os
 from pathlib import Path
 import sys
@@ -24,6 +26,55 @@ def adapter():
 
 @unittest.skipUnless(os.name == "nt", "real Windows native boundary")
 class NativeReceiptChecks(unittest.TestCase):
+    def test_unicode_failed_command_retains_complete_final_receipt_on_cp1252_stdout(self):
+        ci = adapter()
+        with tempfile.TemporaryDirectory(prefix="codegraph-ci-unicode-report-") as temporary:
+            root = Path(temporary)
+            npm_cli = root / "node_modules" / "npm" / "bin" / "npm-cli.js"
+            npm_cli.parent.mkdir(parents=True)
+            # External-command fixture only: real Python processes, native Jobs,
+            # raw UTF-8 output, unchanged CI stages and actual receipt persistence.
+            npm_cli.write_text("import sys\n"
+                "if sys.argv[1] == 'test':\n"
+                "    sys.stdout.buffer.write((chr(0x276f) + ' test failed\\n').encode('utf-8'))\n"
+                "    sys.stdout.buffer.flush()\n"
+                "    sys.exit(23)\n"
+                "print('fixture command passed')\n", encoding="utf-8")
+            encoded = io.BytesIO()
+            console = io.TextIOWrapper(encoded, encoding="cp1252", errors="strict", write_through=True)
+            def which(command):
+                return sys.executable if command == "node" else str(root / "npm.cmd")
+            with patch.object(ci.shutil, "which", side_effect=which), \
+                    patch.dict(os.environ, {"RUNNER_TEMP": str(root / "attempt")}), \
+                    patch.object(sys, "stdout", console):
+                exit_code = ci.main()
+            paths = list((root / "attempt" / "codegraph-windows-ci").glob("*/receipt.json"))
+            self.assertEqual(len(paths), 1)
+            receipt = json.loads(paths[0].read_text(encoding="utf-8"))
+            stage_path = paths[0].parent / "test" / "result.json"
+            stage = json.loads(stage_path.read_text(encoding="utf-8"))
+            if [entry["stage"] for entry in receipt["stages"]] != ["install", "build", "test"]:
+                print("CI_REPORTING_REPRO=" + json.dumps({"receipt": receipt, "testStage": stage}))
+            self.assertEqual(exit_code, 1)
+            self.assertEqual([entry["stage"] for entry in receipt["stages"]], ["install", "build", "test"])
+            self.assertEqual(receipt["stages"][-1], stage)
+            self.assertEqual(receipt["outcome"], "fail")
+            self.assertEqual(receipt["commandSequenceOutcome"], "fail")
+            self.assertEqual(stage["exitCode"], 23)
+            self.assertEqual(stage["outcome"], "fail")
+            self.assertIn("\u276f test failed", stage["failureExcerpt"])
+            self.assertIn(b"\xe2\x9d\xaf test failed", (stage_path.parent / "stdout.log").read_bytes())
+            self.assertTrue(stage["cleanup"]["complete"])
+            self.assertEqual(stage["cleanup"]["remainingPids"], [])
+            self.assertEqual(stage["cleanup"]["intentionallyStoppedOwnedPids"], [])
+            self.assertTrue(stage["gateHandleCloseChecked"])
+            self.assertNotIn("supervisorError", receipt)
+            for capture in stage["logs"].values():
+                self.assertTrue(capture["joined"])
+                self.assertTrue(capture["pipeCloseCompleted"])
+                self.assertIsNone(capture["pipeCloseError"])
+            console.close()
+
     def test_native_job_close_error_cannot_be_reported_as_success(self):
         ci = adapter()
         native_factory = ctypes.WinDLL

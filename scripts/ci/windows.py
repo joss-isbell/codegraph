@@ -240,10 +240,20 @@ def run_stage(core, name, command, seconds, output, whole_end, interrupted):
         result["failures"].append("whole CI deadline expired while saving result")
         result["outcome"] = "fail"
         save(output / "result.json", result)
-    print(f"{name}: {result['outcome']} ({result['elapsedSeconds']:.1f}s); logs: {output}", flush=True)
-    if not passed:
-        print("\n".join(result["failures"]), flush=True)
-        print(result["failureExcerpt"], flush=True)
+    try:
+        # Windows pipes can retain an ANSI encoding. Escape unsupported console
+        # glyphs without changing the exact UTF-8 captures or JSON excerpt.
+        reconfigure = getattr(sys.stdout, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(errors="backslashreplace")
+        print(f"{name}: {result['outcome']} ({result['elapsedSeconds']:.1f}s); logs: {output}", flush=True)
+        if not passed:
+            print("\n".join(result["failures"]), flush=True)
+            print(result["failureExcerpt"], flush=True)
+    except BaseException as exc:
+        result["failures"].append(f"stage reporting failed: {type(exc).__name__}: {exc}")
+        result["outcome"] = "fail"
+        save(output / "result.json", result)
     return result
 
 
