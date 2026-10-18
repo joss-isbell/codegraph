@@ -21,6 +21,7 @@ const { getDaemonPidPath }: typeof import('../src/mcp/daemon-paths') = require('
 const { resolveQueryPolicy }: typeof import('../src/mcp/query-policy') = require('../dist/mcp/query-policy');
 const roots: string[] = [], engines: Array<InstanceType<typeof MCPEngine>> = [];
 const cleanup: Array<() => Promise<void>> = [], facts: unknown[] = [];
+const fixtureTempDir = fs.realpathSync(os.tmpdir()), fixturePrefix = 'cg-ownership-';
 let body: Promise<void> | undefined, settled = true, closing = false, poison: string | undefined;
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 function active(): void { if (closing || poison) throw new Error('Ownership fixture cannot acquire after cleanup'); }
@@ -37,7 +38,14 @@ async function until(test: () => boolean, label: string): Promise<void> {
   const end = Date.now() + 10_000;
   while (!test()) { if (Date.now() >= end) throw new Error(`${label} deadline`); await sleep(20); }
 }
-function temp(): string { active(); const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ownership-'))); roots.push(root); return root; }
+function temp(): string { active(); const root = fs.realpathSync(fs.mkdtempSync(path.join(fixtureTempDir, fixturePrefix))); roots.push(root); return root; }
+function assertDisposableRoot(root: string): void {
+  const absolute = path.resolve(root), stat = fs.lstatSync(absolute);
+  if (root !== absolute || path.dirname(absolute) !== fixtureTempDir || !path.basename(absolute).startsWith(fixturePrefix)
+    || !stat.isDirectory() || stat.isSymbolicLink() || fs.realpathSync(absolute) !== absolute) {
+    throw new Error(`Refusing unsafe ownership fixture cleanup: ${root}`);
+  }
+}
 async function indexed(root: string, symbol = 'alphaOriginal'): Promise<void> {
   active(); fs.writeFileSync(path.join(root, 'app.ts'), `export function ${symbol}() { return 7; }\n`);
   const graph = await CodeGraph.init(root);
@@ -105,8 +113,9 @@ afterEach(async context => {
   for (const engine of engines.splice(0)) try { await bounded(engine.stop(), 'engine drain'); } catch (error) { failures.push(String(error).slice(0, 2048)); }
   for (const release of cleanup.splice(0).reverse()) try { await release(); } catch (error) { failures.push(String(error).slice(0, 2048)); }
   if (pending) try { await bounded(pending, 'body join'); } catch (error) { failures.push(String(error).slice(0, 2048)); }
-  facts.push({ test: context.task.name, primary: context.task.result?.errors?.slice(0, 4).map(error => String(error.message).slice(0, 2048)),
-    roots: roots.splice(0), sqlite: native.facts(), failures, poison, settled });
+  const currentRoots = roots.splice(0), ordinary = !process.env.VALIDATION_OUT;
+  const primary = context.task.result?.errors?.slice(0, 4).map(error => String(error.message).slice(0, 2048));
+  facts.push({ test: context.task.name, primary, roots: currentRoots, sqlite: native.facts(), failures, poison, settled });
   try {
     if (process.env.VALIDATION_OUT) {
       const encoded = JSON.stringify(facts); if (Buffer.byteLength(encoded) > 2 * 1024 * 1024) throw new Error('Ownership evidence overflow');
@@ -114,7 +123,22 @@ afterEach(async context => {
     }
   } catch (error) { failures.push(String(error).slice(0, 2048)); process.stderr.write(`Ownership evidence failure: ${String(error)}\n`); }
   finally { vi.unstubAllEnvs(); }
-  // Retain disposable indexes and native logs, including every failed fixture.
+  // Explicit validation retains evidence. Ordinary runs remove only this row's
+  // successful fixtures after every owned body/native/engine cleanup has settled.
+  if (ordinary) {
+    const retained = currentRoots.slice();
+    if (body && settled && !pending && context.task.result && context.task.result.state !== 'fail'
+      && !primary?.length && !failures.length && !poison && !native.facts().overflow) {
+      try {
+        currentRoots.forEach(assertDisposableRoot); // preflight the whole current batch before deleting any root
+        for (const root of currentRoots) {
+          assertDisposableRoot(root); // never follow a replaced/reparse root
+          fs.rmSync(root, { recursive: true }); retained.shift();
+        }
+      } catch (error) { failures.push(String(error).slice(0, 2048)); }
+    }
+    if (retained.length) process.stderr.write(`Ownership retained fixture roots: ${JSON.stringify({ test: context.task.name, roots: retained }).slice(0, 8192)}\n`);
+  }
   expect(failures).toEqual([]); expect(native.facts().overflow).toBe(false); expect(poison).toBeUndefined();
 }, 60_000);
 afterAll(() => { if (settled) native.restore(); });

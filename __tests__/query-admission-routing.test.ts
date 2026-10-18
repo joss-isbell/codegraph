@@ -22,6 +22,7 @@ const { SocketTransport } = require('../dist/mcp/transport') as typeof import('.
 const { getDaemonSocketPath } = require('../dist/mcp/daemon-paths') as typeof import('../src/mcp/daemon-paths');
 
 const roots: string[] = [];
+const fixtureTempDir = fs.realpathSync(os.tmpdir()), fixturePrefix = 'cg-admission-routing-';
 const engines: Array<InstanceType<typeof MCPEngine>> = [];
 const facts: unknown[] = [];
 const nativeCleanup: Array<() => Promise<void>> = [];
@@ -245,8 +246,15 @@ function proxyChild(root: string, hint = root) {
 }
 function temp(): string {
   assertBodyActive();
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-admission-routing-')));
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(fixtureTempDir, fixturePrefix)));
   roots.push(root); return root;
+}
+function assertDisposableRoot(root: string): void {
+  const absolute = path.resolve(root), stat = fs.lstatSync(absolute);
+  if (root !== absolute || path.dirname(absolute) !== fixtureTempDir || !path.basename(absolute).startsWith(fixturePrefix)
+    || !stat.isDirectory() || stat.isSymbolicLink() || fs.realpathSync(absolute) !== absolute) {
+    throw new Error(`Refusing unsafe admission fixture cleanup: ${root}`);
+  }
 }
 async function indexed(root: string): Promise<void> {
   assertBodyActive();
@@ -285,14 +293,16 @@ afterEach(async context => {
   for (const close of nativeCleanup.splice(0)) { try { await bounded(close(), 'native cleanup phase', 16_000); } catch (error) { retainError(cleanup, error); } }
   for (const value of engines.splice(0)) { try { await bounded(value.stop(), 'engine stop'); } catch (error) { retainError(cleanup, error); } }
   if (incompleteBody) { try { await bounded(incompleteBody, 'incomplete test body settlement'); } catch (error) { retainError(cleanup, error); } }
-  const retained = roots.splice(0).map(root => {
+  const currentRoots = roots.splice(0), ordinary = !process.env.VALIDATION_OUT;
+  const retained = currentRoots.map(root => {
     try { return { root, index: fs.existsSync(path.join(root, '.codegraph')) ? membership(root) : null }; }
     catch (error) { retainError(cleanup, error); return { root, error: String(error).slice(0, 2048) }; }
   });
-  facts.push({ test: context.task.name, primary: context.task.result?.errors?.slice(0, 4).map(error => String(error.message).slice(0, 2048)),
+  const primary = context.task.result?.errors?.slice(0, 4).map(error => String(error.message).slice(0, 2048));
+  facts.push({ test: context.task.name, primary,
     roots: retained, sqlite: observer.facts(), cleanup, poison: fixturePoison, incompleteBodyAtCleanup: !!incompleteBody, bodySettled: caseToken.bodySettled, cleanupHookMs: CLEANUP_HOOK_MS });
   caseToken.open = false;
-  // Retain every disposable index and exact failure membership for inspection.
+  // Explicit validation retains every disposable index and exact membership.
   try {
     if (process.env.VALIDATION_OUT) {
       const encoded = JSON.stringify(facts);
@@ -305,6 +315,20 @@ afterEach(async context => {
     process.stderr.write(`Admission fixture evidence persistence failed: ${String(error).slice(0, 2048)}\n`);
   }
   persistLateFacts();
+  if (ordinary) {
+    const retainedRoots = currentRoots.slice();
+    if (caseToken.body && caseToken.bodySettled && !incompleteBody && context.task.result && context.task.result.state !== 'fail'
+      && !primary?.length && !cleanup.length && !fixturePoison && !observer.facts().overflow) {
+      try {
+        currentRoots.forEach(assertDisposableRoot); // preflight the whole current batch before deleting any root
+        for (const root of currentRoots) {
+          assertDisposableRoot(root); // never follow a replaced/reparse root
+          fs.rmSync(root, { recursive: true }); retainedRoots.shift();
+        }
+      } catch (error) { retainError(cleanup, error); }
+    }
+    if (retainedRoots.length) process.stderr.write(`Admission retained fixture roots: ${JSON.stringify({ test: context.task.name, roots: retainedRoots }).slice(0, 8192)}\n`);
+  }
   expect(cleanup).toEqual([]);
   expect(observer.facts().overflow).toBe(false);
   expect(fixturePoison).toBeUndefined();
