@@ -101,7 +101,7 @@ def run_stage(core, name, command, seconds, output, whole_end, interrupted):
         if interrupted.is_set() or time.monotonic() >= end:
             raise RuntimeError("interrupted or command deadline expired before launch")
         result["launchState"] = "gate-constructor-started"
-        child = subprocess.Popen([sys.executable, str(core.HERE / "runner.py"), "_gate"],
+        child = subprocess.Popen([sys.executable, "-B", str(core.HERE / "runner.py"), "_gate"],
             cwd=ROOT, env={**os.environ, "CODEGRAPH_DIR": ".codegraph",
                            "VALIDATION_OWNER_UUID": owner.token,
                            "NPM_CONFIG_CACHE": str(output.parent / "npm-cache")},
