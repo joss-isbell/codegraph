@@ -1,15 +1,17 @@
 /** Shared native project resources and writer ownership for MCP engines. */
 import type { Socket } from 'net';
+import { setTimeout as waitForStartup } from 'node:timers/promises';
 import { readFileSync, realpathSync } from 'fs';
 import * as path from 'path';
 import type CodeGraph from '../index';
 import { admitMcpRoute, assertMcpIndexRoute, canonicalProjectRoot, type McpIndexRoute } from '../directory';
 import { LockUnavailableError, watchDisabledReason, type PendingFile } from '../sync';
-import { canProbeDaemonIdentity, getDaemonSocketCandidates } from './daemon-paths';
+import { canProbeDaemonIdentity, getDaemonSocketCandidates, type DaemonLockInfo } from './daemon-paths';
 import { connectForProjectFreshness, connectWithHello } from './proxy';
 import type { ResolvedQueryPolicy } from './query-policy';
 import { isServicePolicyRefusal, servicePolicyRefusal } from './query-service-compatibility';
-import { assertNoLiveQueryDaemon, assertReadableQueryOwners, readQueryServiceOwners } from './query-service-owner';
+import { assertNoLiveQueryDaemon, assertReadableQueryOwners, readQueryServiceOwners, type QueryServiceOwners } from './query-service-owner';
+import { CodeGraphPackageVersion } from './version';
 import { assertNoRebuild, decodeWriterLockInfo, getWriterPidPath, markWriterReady, readWriterLock, releaseWriterLock, tryAcquireWriterLock, type WriterLockInfo } from './writer-lock';
 
 export interface IndexProgressLease { release(): Promise<void> }
@@ -203,17 +205,54 @@ export function rollbackStartupProjectWriter(route: McpIndexRoute,
 
 /** Mandatory caller-specific permission. Shared resources cache no verdict. */
 export async function admitQueryProject(root: string, policy: ResolvedQueryPolicy, signal?: AbortSignal): Promise<void> {
-  if (signal?.aborted) throw cancelled();
-  const owners = readQueryServiceOwners(root); assertReadableQueryOwners(root, owners);
-  const candidates = getDaemonSocketCandidates(root);
-  if (owners.daemon.kind === 'live' && canProbeDaemonIdentity(owners.daemon.value)) candidates.unshift(owners.daemon.value.socketPath);
-  for (const candidate of new Set(candidates)) {
+  // Match index.ts's existing 240 x 25ms bind allowance and 10s election grace.
+  // This is readiness observation only: no policy permission until the ordinary
+  // hello, implementation, project and actual-owner checks all succeed.
+  const bindDeadline = performance.now() + 240 * 25;
+  let starting: { daemon: DaemonLockInfo; writer: WriterLockInfo | null } | undefined;
+  const observeOwners = (): QueryServiceOwners => {
+    const owners = readQueryServiceOwners(root); assertReadableQueryOwners(root, owners);
+    if (starting) {
+      const { daemon, writer } = owners;
+      // Bind refreshes daemon.startedAt, but may not switch service identity.
+      // Once a writer appears, its reservation identity must stay fixed too.
+      if (daemon.kind !== 'live' || daemon.value.pid !== starting.daemon.pid
+        || daemon.value.version !== starting.daemon.version || daemon.value.socketPath !== starting.daemon.socketPath
+        || (writer.kind !== 'absent' && (writer.kind !== 'live' || writer.value.pid !== starting.daemon.pid
+          || writer.value.mode !== 'daemon' || !Number.isFinite(writer.value.startedAt) || writer.value.startedAt <= 0))
+        || (starting.writer && (writer.kind !== 'live' || !sameOwner(starting.writer, writer.value)))) {
+        throw servicePolicyRefusal('unknown', root, 'the observed starting service ownership changed before compatible attachment');
+      }
+      if (writer.kind === 'live') starting.writer ??= writer.value;
+    }
+    return owners;
+  };
+  for (;;) {
     if (signal?.aborted) throw cancelled();
-    const socket = await connectWithHello(candidate, undefined, policy, root);
-    if (!socket) continue;
-    socket.destroy(); if (signal?.aborted) throw cancelled(); return;
+    const owners = observeOwners();
+    const candidates = getDaemonSocketCandidates(root);
+    if (owners.daemon.kind === 'live' && canProbeDaemonIdentity(owners.daemon.value)) candidates.unshift(owners.daemon.value.socketPath);
+    for (const candidate of new Set(candidates)) {
+      if (signal?.aborted) throw cancelled();
+      const socket = await connectWithHello(candidate, undefined, policy, root);
+      if (!socket) continue;
+      socket.destroy(); if (signal?.aborted) throw cancelled(); observeOwners(); return;
+    }
+    if (signal?.aborted) throw cancelled();
+    const current = observeOwners(), daemon = current.daemon, writer = current.writer;
+    if (!starting && daemon.kind === 'live' && daemon.value.pid !== process.pid
+      && daemon.value.version === CodeGraphPackageVersion && canProbeDaemonIdentity(daemon.value)
+      && Number.isFinite(daemon.value.startedAt) && daemon.value.startedAt > 0
+      && Date.now() >= daemon.value.startedAt && Date.now() - daemon.value.startedAt < 10_000
+      && (writer.kind === 'absent' || (writer.kind === 'live' && writer.value.pid === daemon.value.pid
+        && writer.value.mode === 'daemon' && Number.isFinite(writer.value.startedAt) && writer.value.startedAt > 0))) {
+      starting = { daemon: daemon.value, writer: writer.kind === 'live' ? writer.value : null };
+    }
+    if (!starting || performance.now() >= bindDeadline) {
+      assertNoLiveQueryDaemon(root, current); return;
+    }
+    await waitForStartup(Math.min(25, bindDeadline - performance.now()), undefined, { signal });
   }
-  if (signal?.aborted) throw cancelled(); assertNoLiveQueryDaemon(root);
 }
 
 /** One existing coordinator; actual query readers never become writers. */
