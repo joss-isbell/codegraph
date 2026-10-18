@@ -312,9 +312,17 @@ if (require.main === module && process.argv[2] === '--ordinary-writer') {
       process.send?.({ kind: 'ordinary-writer-stopped', root, pid: process.pid }); process.disconnect();
     }, failure);
   });
-  engine.ensureInitialized(root).then(() => {
+  engine.ensureInitialized(root).then(async () => {
+    // Initialization publishes the catch-up gate; it does not join it. The
+    // parent's exact no-write baseline must start after a useful public read
+    // has joined that gate, not while this ordinary owner is still syncing.
+    const result = await engine.getToolHandler().execute('codegraph_files', {});
+    if (result.isError || !result.content?.some(item => item.type === 'text' && item.text.includes('app.ts'))) {
+      throw new Error('Ordinary writer did not complete its public indexed-files request');
+    }
     const writer = readJson(path.join(root, '.codegraph/writer.pid'));
-    if (writer.pid !== process.pid || writer.mode !== 'fallback') throw new Error('Ordinary writer did not hold actual fallback lease');
+    if (writer.pid !== process.pid || writer.mode !== 'fallback' || writer.ready !== true) throw new Error('Ordinary writer did not hold an actually ready fallback lease');
+    record({ event: 'ordinary-writer-ready-after-public-read', root, writer, query: 'codegraph_files', result });
     process.send?.({ kind: 'ordinary-writer-ready', root, pid: process.pid, writer });
   }).catch(failure);
 }

@@ -218,12 +218,24 @@ function registerRoot(root: string): void { if (!current.roots.includes(root)) c
 function arm(fault: 'stop-before-status' | 'exit78-before-status' | 'hold-before-status' | 'observe', attempt = 'initial'): void {
   fs.writeFileSync(current.control, JSON.stringify({ fault, attempt }));
 }
-function proveUnavailable(server: SpawnedServer, attempt = 'initial', expectedDeadDaemon?: { pid: number; contents: string }): void {
+function proveUnavailable(server: SpawnedServer, attempt = 'initial', expectedDeadDaemon?: { pid: number; contents: string }, allowPostFactoryRetries = false): number {
   const records = trace().filter(record => record.pid === server.child.pid);
   const candidates = records.filter(record => record.event === 'candidate-spawn' && record.attempt === attempt);
-  expect(candidates).toHaveLength(1);
-  const candidatePid = candidates[0].candidatePid;
+  expect(candidates.length).toBeGreaterThan(0);
   const firstFactory = records.find(record => record.event === 'engine-constructor' && record.sequence > candidates[0].sequence);
+  // The one-shot control owns the acquisition before the first local factory,
+  // not every later retry which happened to read the same control label.
+  // Count ALL candidates in that acquisition, including differently labelled
+  // ones: an extra pre-factory candidate is still a failure.
+  const acquisition = records.filter(record => record.event === 'candidate-spawn' && record.sequence >= candidates[0].sequence &&
+    (!firstFactory || record.sequence < firstFactory.sequence));
+  expect(acquisition).toHaveLength(1);
+  if (allowPostFactoryRetries) {
+    expect(firstFactory).toBeDefined();
+    expect(records.filter(record => record.event === 'candidate-spawn' && record.sequence < firstFactory!.sequence)).toHaveLength(1);
+  } else expect(candidates).toHaveLength(1);
+  const candidatePid = acquisition[0].candidatePid;
+  expect(JSON.parse(bounded(`${current.control}.${attempt}.claim`).toString('utf8'))).toEqual({ pid: candidatePid, attempt });
   expect(records.find(record => record.event === 'candidate-controlled-stop' && record.candidatePid === candidatePid))
     .toMatchObject({ statuses: 0, acknowledgements: 0, signal: 'SIGKILL' });
   expect(records.find(record => record.event === 'candidate-exit' && record.candidatePid === candidatePid)).toMatchObject({ code: null, signal: 'SIGKILL' });
@@ -251,6 +263,7 @@ function proveUnavailable(server: SpawnedServer, attempt = 'initial', expectedDe
   current.observations.push({ event: 'controlled-pre-service-unavailable', candidatePid, attempt, held,
     daemonAbsent: !expectedDeadDaemon, deadDaemonPid: expectedDeadDaemon?.pid ?? null, writer: readWriterInfo(current.root),
     evidence: 'native fault before status/ACK; exit+close; fresh absent or exact known-dead owner/held-route records' });
+  return candidatePid;
 }
 function proveQualified78(server: SpawnedServer): void {
   const records = trace().filter(record => record.pid === server.child.pid);
@@ -275,6 +288,47 @@ function proveQualified78(server: SpawnedServer): void {
   expect(candidates[0].controls).toEqual({ CODEGRAPH_QUERY_MODE: 'unlimited', CODEGRAPH_QUERY_POOL_SIZE: '2', CODEGRAPH_QUERY_BUSY_TIMEOUT_MS: 'unlimited' });
   current.observations.push({ event: 'controlled-native-pre-status-78', pid, spawned: candidates[0], entry,
     daemonAbsent: true, writer: readWriterInfo(current.root), held: fs.realpathSync(path.join(current.root, '.codegraph/codegraph.db')) });
+}
+async function proveBlockedOrdinaryWriterRetry(server: SpawnedServer, candidate: any): Promise<void> {
+  const pid = candidate.candidatePid;
+  // These are uncontrolled retries, not another synthetic unavailable fault.
+  // Join actual exit + IPC + every parent-owned stdio tail. Aggregate close is
+  // recorded if Node emits it, never substituted for a missing native event.
+  expect(candidate.stdio.map((channel: any) => channel.index)).toEqual([0,1,2,3]);
+  const tail = await waitFor(() => {
+    const native = trace().filter(record => record.pid === server.child.pid && record.candidatePid === pid);
+    const exited = native.find(record => record.event === 'candidate-exit');
+    const disconnected = native.find(record => record.event === 'candidate-disconnect');
+    if (!exited || !disconnected) return null;
+    const channels = candidate.stdio.map((channel: any) => {
+      if (channel.kind === 'ignore') return { ...channel, childBindingRetiredByNativeExit: exited };
+      if (channel.kind === 'ipc') return { ...channel, disconnected };
+      if (channel.kind === 'pipe') {
+        const ended = native.find(record => record.event === 'candidate-stdio-end' && record.index === channel.index);
+        const closed = native.find(record => record.event === 'candidate-stdio-close' && record.index === channel.index);
+        return closed && (!channel.readable || ended) ? { ...channel, ended: ended ?? null, closed } : null;
+      }
+      if (channel.kind === 'file-fd' || channel.kind === 'native-fd') {
+        const parentClosed = native.find(record => record.event === 'candidate-parent-file-fd-close' && record.index === channel.index && record.fd === channel.fd);
+        return parentClosed ? { ...channel, parentClosed, childCopyClosedByNativeExit: exited } : null;
+      }
+      throw new Error(`Unproved retry candidate stdio shape: ${channel.kind}`);
+    });
+    if (channels.some((channel: any) => !channel) || isAlive(pid)) return null;
+    return { exited, disconnected, channels, aggregateClose: native.find(record => record.event === 'candidate-close') ?? null };
+  }, 5000, 25, `ordinary-writer retry ${pid} native outcome`);
+  expect(tail.exited).toMatchObject({ code: 1, signal: null, statuses: 0, acknowledgements: 0 });
+  expect(tail.disconnected).toMatchObject({ connected: false, channelPresent: false, statuses: 0, acknowledgements: 0 });
+  if (tail.aggregateClose) expect(tail.aggregateClose).toMatchObject({ code: 1, signal: null, statuses: 0, acknowledgements: 0 });
+  for (const channel of tail.channels) if (channel.parentClosed) {
+    expect(channel.parentClosed.identityError).toBeUndefined(); expect(channel.parentClosed.identity).toEqual(channel.identity);
+  }
+  const records = trace();
+  expect(records.filter(record => record.pid === server.child.pid && record.candidatePid === pid &&
+    ['candidate-status','candidate-parent-send','candidate-controlled-stop','candidate-stdio-error','candidate-parent-file-fd-close-error','candidate-error'].includes(record.event))).toEqual([]);
+  expect(records.filter(record => record.pid === pid &&
+    ['candidate-entered-before-status','candidate-controlled-exit','engine-before-constructor','engine-constructor','sqlite-constructor','graph-open','graph-openSync','graph-sync','graph-watch','tool-start','history'].includes(record.event))).toEqual([]);
+  current.observations.push({ event: 'ordinary-writer-retry-native-outcome', candidate, ...tail });
 }
 async function proveTypedUnsupported(server: SpawnedServer, root: string): Promise<void> {
   const records = trace().filter(record => record.pid === server.child.pid);
@@ -345,14 +399,15 @@ async function ordinaryWriter(root: string) {
   registerRoot(root);
   const child = spawn(process.execPath, [...WASM_RUNTIME_FLAGS, OBSERVER, '--ordinary-writer', root], {
     cwd: root, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
-    env: { ...process.env, CG_DAEMON_RECON_TRACE: current.trace, CG_DAEMON_RECON_ROOTS: JSON.stringify(current.roots) },
+    env: { ...process.env, CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS: '0',
+      CG_DAEMON_RECON_TRACE: current.trace, CG_DAEMON_RECON_ROOTS: JSON.stringify(current.roots) },
   }) as ChildProcessWithoutNullStreams;
   const server = observeChild(child, 'ordinary-writer');
   const owner = { child, server, root }; ordinaryOwners.push(owner);
   const ready = await deadline(new Promise<any>(resolve => child.on('message', message => {
     if ((message as any)?.kind === 'ordinary-writer-ready') resolve(message);
   })), 10000, 'ordinary writer readiness');
-  expect(ready).toMatchObject({ root, pid: child.pid, writer: { pid: child.pid, mode: 'fallback' } });
+  expect(ready).toMatchObject({ root, pid: child.pid, writer: { pid: child.pid, mode: 'fallback', ready: true } });
   expect(readLockPid(root)).toBeNull(); return owner;
 }
 async function stopOrdinary(owner: typeof ordinaryOwners[number]) {
@@ -1358,11 +1413,19 @@ describe('Shared MCP daemon (issue #411)', () => {
 
     await realExplore(server, 1000);
     const warmHistory = actualHistory(); expect(warmHistory.filter(record => record.root === realRoot)).toHaveLength(1);
+    const daemonLock = { pid: daemonPid, contents: bounded(path.join(realRoot, '.codegraph/daemon.pid')).toString('utf8') };
+    expect(JSON.parse(daemonLock.contents).pid).toBe(daemonPid); expect(isAlive(daemonPid)).toBe(true);
     arm('stop-before-status', 'post-loss');
     // Kill the daemon out from under the live proxy; the actual NEXT candidate
     // is stopped natively before bootstrap status/ACK, not relabelled unknown.
     process.kill(daemonPid, 'SIGTERM');
     expect(await waitProcessExit(daemonPid, 8000)).toBe(true);
+    const daemonExit = await waitFor(() => trace().find(record => record.pid === server.child.pid &&
+      record.event === 'candidate-exit' && record.candidatePid === daemonPid), 8000, 25, 'served daemon actual native exit');
+    expect(isAlive(daemonPid)).toBe(false);
+    const retainedDaemonLock = fs.existsSync(path.join(realRoot, '.codegraph/daemon.pid')) ? daemonLock : undefined;
+    current.observations.push({ event: 'post-loss-served-daemon-native-exit', daemonLock, daemonExit,
+      retained: retainedDaemonLock !== undefined, alive: false });
 
     // The proxy must still be alive and still answer — served in-process now.
     expect(isAlive(server.child.pid!)).toBe(true);
@@ -1371,7 +1434,7 @@ describe('Shared MCP daemon (issue #411)', () => {
     const resp = await waitFor(() => findResponse(server.stdout, 3), 15000);
     expect(resp.error).toBeUndefined();
     expect(JSON.stringify(resp.result)).toContain('CodeGraph Status');
-    proveUnavailable(server, 'post-loss');
+    proveUnavailable(server, 'post-loss', retainedDaemonLock);
     expect(readWriterInfo(realRoot)).toMatchObject({ pid: server.child.pid, mode: 'fallback' });
     expect(trace().some(record => record.pid === server.child.pid && record.event === 'engine-diagnostics' && record.diagnostics.effective.executionMode === 'writable-fallback')).toBe(true);
     await realExplore(server, 1001);
@@ -1561,7 +1624,7 @@ describe('Shared MCP daemon (issue #411)', () => {
     const local = await waitFor(() => findResponse(server.stdout, 2), 10000, 25, 'read-only tools/call');
     expect(local.error).toBeUndefined();
     expect(server.stderr.some(line => line.includes('Serving reads in-process without auto-sync'))).toBe(true);
-    proveUnavailable(server); arm('observe', 'ordinary-writer-retries');
+    const controlledCandidate = proveUnavailable(server, 'initial', undefined, true); arm('observe', 'ordinary-writer-retries');
     expect(readLockPid(realRoot)).toBeNull();
     expect(readWriterInfo(realRoot)).toMatchObject({ pid: owner.child.pid, mode: 'fallback' });
     const localPolicy = trace().find(record => record.pid === server.child.pid && record.event === 'engine-diagnostics')?.diagnostics;
@@ -1595,6 +1658,38 @@ describe('Shared MCP daemon (issue #411)', () => {
     expect(new Set(history.map(record => record.historyId)).size).toBe(2);
     for (const id of [2,3,20,21,22]) expect(server.stdout.filter(line => { try { return JSON.parse(line).id === id; } catch { return false; } })).toHaveLength(1);
     expect(trace().some(record => record.event === 'engine-diagnostics' && record.diagnostics.ownership.pid === daemonPid && record.diagnostics.effective.executionMode === 'shared-daemon')).toBe(true);
+    // Account for EVERY later actual candidate, including retries which still
+    // read `initial` before the parent switched the control to observation.
+    // Only the exact first claim is the controlled unavailable acquisition.
+    const records = trace().filter(record => record.pid === server.child.pid);
+    const candidates = records.filter(record => record.event === 'candidate-spawn');
+    expect(candidates[0].candidatePid).toBe(controlledCandidate);
+    expect(new Set(candidates.map(record => record.candidatePid)).size).toBe(candidates.length);
+    expect(candidates[candidates.length - 1].candidatePid).toBe(daemonPid);
+    const firstFactory = records.find(record => record.event === 'engine-constructor'); expect(firstFactory).toBeDefined();
+    for (const candidate of candidates.slice(1)) {
+      expect(candidate.sequence).toBeGreaterThan(firstFactory!.sequence);
+      expect(['initial','ordinary-writer-retries']).toContain(candidate.attempt);
+      expect(candidate.args).toEqual(candidates[0].args); expect(candidate.command).toBe(candidates[0].command);
+      expect(candidate.controls).toEqual(candidates[0].controls); expect(candidate.startupCpu).toBe(candidates[0].startupCpu);
+      const identity = JSON.parse(bounded(path.join(current.trace, `candidate-spawn-${candidate.candidatePid}.json`)).toString('utf8'));
+      expect(identity).toEqual({ candidatePid: candidate.candidatePid, launcherPid: server.child.pid, root: realRoot,
+        command: candidate.command, args: candidate.args, identity: 'actual-delegated-child-spawn' });
+      const noFault = records.filter(record => record.event === 'candidate-later-attempt-no-fault' && record.candidatePid === candidate.candidatePid);
+      if (candidate.attempt === 'initial') expect(noFault).toHaveLength(1); else expect(noFault).toEqual([]);
+      expect(records.filter(record => record.candidatePid === candidate.candidatePid &&
+        ['candidate-pre-service-barrier','candidate-controlled-stop','candidate-error'].includes(record.event))).toEqual([]);
+      if (candidate.candidatePid !== daemonPid) await proveBlockedOrdinaryWriterRetry(server, candidate);
+      else {
+        const statuses = records.filter(record => record.event === 'candidate-status' && record.candidatePid === daemonPid);
+        const acknowledgements = records.filter(record => record.event === 'candidate-parent-send' && record.candidatePid === daemonPid);
+        expect(statuses).toHaveLength(1); expect(statuses[0].message).toMatchObject({ protocol: 1, kind: 'permitted' });
+        expect(acknowledgements).toHaveLength(1); expect(acknowledgements[0].message).toEqual({ protocol: 1, kind: 'acknowledged' });
+        expect(isAlive(daemonPid)).toBe(true);
+        current.observations.push({ event: 'ordinary-writer-retry-attached-outcome', candidate, statuses, acknowledgements, attached });
+      }
+    }
+    expect(trace().filter(record => record.pid === server.child.pid && record.event === 'candidate-spawn')).toEqual(candidates);
   }, 60000);
 
   it('post-loss compatible reattachment stays distinct from genuine unavailable fallback', async () => {

@@ -168,6 +168,8 @@ export class CompatibilityClient {
   }
 }
 
-export function saveCompatibilityEvidence(name: string, value: unknown): void {
-  if (process.env.VALIDATION_OUT) fs.writeFileSync(path.join(process.env.VALIDATION_OUT, name + '.json'), JSON.stringify(value, null, 2) + '\n');
+export function saveCompatibilityEvidence(name: string, value: unknown, ordinaryFallbackPath?: string): void {
+  const destination = process.env.VALIDATION_OUT
+    ? path.join(process.env.VALIDATION_OUT, name + '.json') : ordinaryFallbackPath;
+  if (destination) fs.writeFileSync(destination, JSON.stringify(value, null, 2) + '\n');
 }

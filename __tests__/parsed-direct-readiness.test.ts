@@ -16,6 +16,7 @@ import { MCPSession } from '../src/mcp/session';
 import { SocketTransport, type JsonRpcResponse } from '../src/mcp/transport';
 import { resolveQueryPolicy } from '../src/mcp/query-policy';
 import { getWriterPidPath } from '../src/mcp/writer-lock';
+import { absent, localCensus, type NativeSample } from './native-process-observer';
 
 type Message = Record<string, any>;
 const wait = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
@@ -63,9 +64,15 @@ class NativeHost {
   };
   exit: { code: number | null; signal: NodeJS.Signals | null } | null = null;
   rawClose = false;
+  rawCloseNs: string | null = null;
   disconnected = false;
   nativeIdentity: Message | null = null;
   readonly watchdogIdentities: Message[] = [];
+  readonly nativeProbes: Message[] = [];
+  readonly nativeSamples: Array<NativeSample & { requestedPid: number; requestedNs: string; phase: string }> = [];
+  readonly nativeAbsenceFacts: Message[] = [];
+  private nativeObserverFailure: string | null = null;
+  private readonly ordinaryCensus = localCensus(this.nativeProbes, (file, error) => this.fail(`native proc close ${file}: ${String(error).slice(0, 256)}`));
   readonly progressWrites: Message[] = [];
   readonly watchdogCloseFacts: Message[] = [];
   readonly expectedExitCode: number;
@@ -131,7 +138,7 @@ class NativeHost {
     });
     this.child.on('error', error => { this.fail(`child: ${String(error).slice(0, 256)}`); });
     this.child.on('exit', (code, signal) => { this.exit = { code, signal }; });
-    this.child.on('close', () => { this.rawClose = true; });
+    this.child.on('close', () => { this.rawClose = true; this.rawCloseNs = process.hrtime.bigint().toString(); });
     this.child.on('disconnect', () => { this.disconnected = true; });
   }
   fail(message: string): void { this.failureCount++; if (this.failures.length < 24) this.failures.push(message.slice(0, 512)); }
@@ -144,6 +151,64 @@ class NativeHost {
     await until(() => this.messages.some(value => value.id === id && ('result' in value || 'error' in value)), timeoutMs);
     return this.messages.find(value => value.id === id && ('result' in value || 'error' in value))!;
   }
+  private observerFailed(error: unknown): never {
+    if (this.nativeObserverFailure === null) {
+      this.nativeObserverFailure = String(error).slice(0, 512);
+      this.fail(`native identity observer: ${this.nativeObserverFailure}`);
+    }
+    throw error;
+  }
+  private async ordinarySample(pid: number, phase: string): Promise<NativeSample & { requestedPid: number; requestedNs: string; phase: string }> {
+    if (this.nativeObserverFailure !== null) throw new Error(this.nativeObserverFailure);
+    try {
+      if (this.nativeSamples.length >= 64) throw new Error('native identity samples exceeded 64');
+      const requestedNs = process.hrtime.bigint().toString();
+      const sample = { ...await this.ordinaryCensus(pid), requestedPid: pid, requestedNs, phase };
+      this.nativeSamples.push(sample);
+      return sample;
+    } catch (error) { return this.observerFailed(error); }
+  }
+  private async ordinaryIdentity(pid: number, watchdog: boolean): Promise<Message> {
+    const live = () => {
+      if (this.exit || this.rawClose || this.disconnected || this.streams.stdout || this.streams.stderr
+        || this.streamEnds.stdout || this.streamEnds.stderr) throw new Error('native host closed before identity acquisition');
+      if (watchdog) {
+        if (pid === this.child.pid || !this.events.some(value => value.event === 'watchdog-spawned' && value.pid === pid)) {
+          throw new Error('native watchdog identity conflicts with actual host/spawn observation');
+        }
+        if (this.events.some(value => value.event === 'watchdog-closed' && value.pid === pid)) throw new Error('native watchdog closed before identity acquisition');
+      } else if (pid !== this.child.pid) throw new Error('native host identity PID conflicts with actual child');
+    };
+    try {
+      live();
+      const sample = await this.ordinarySample(pid, watchdog ? 'live-watchdog-identity' : 'inert-host-identity');
+      live();
+      const row = sample.processes.find(value => value.pid === pid);
+      if (!row || !row.creationIdentity) throw new Error('actual native creation identity is missing');
+      const previous = watchdog ? this.watchdogIdentities.find(value => value.pid === pid) : this.nativeIdentity;
+      if (previous && previous.creationIdentity !== row.creationIdentity) throw new Error('native PID creation identity changed');
+      return { pid, creationIdentity: row.creationIdentity, elapsedSeconds: sample.elapsedSeconds,
+        sampleToken: sample.token, provenance: sample.provenance, acquiredNs: sample.completedNs };
+    } catch (error) { return this.observerFailed(error); }
+  }
+  private async ordinaryAbsence(): Promise<void> {
+    if (process.env.VALIDATION_OUT) return;
+    try {
+      if (!this.nativeIdentity || !this.rawCloseNs) throw new Error('native host identity/raw close is missing before absence');
+      for (const identity of [this.nativeIdentity, ...this.watchdogIdentities]) {
+        const sample = await this.ordinarySample(identity.pid, 'post-raw-close-absence');
+        if (BigInt(sample.requestedNs) < BigInt(this.rawCloseNs) || BigInt(sample.completedNs) < BigInt(sample.requestedNs)) {
+          throw new Error('native absence sample did not follow actual raw close');
+        }
+        const strictEsrch = absent(identity.pid);
+        const fact = { pid: identity.pid, creationIdentity: identity.creationIdentity, rawCloseNs: this.rawCloseNs,
+          sampleToken: sample.token, requestedNs: sample.requestedNs, completedNs: sample.completedNs,
+          nativeAbsent: !sample.processes.some(value => value.pid === identity.pid), strictEsrch };
+        this.nativeAbsenceFacts.push(fact);
+        if (!fact.nativeAbsent || !strictEsrch) throw new Error('native process remains or PID was reused after raw close');
+      }
+    } catch (error) { this.observerFailed(error); }
+  }
   async begin(): Promise<void> {
     await this.event('online');
     // Acquisition is separately bounded while the fixture is inert. Linux must
@@ -153,12 +218,17 @@ class NativeHost {
       if (identity) this.nativeIdentity = identity;
       return !!identity;
     }, 15000);
+    else this.nativeIdentity = await this.ordinaryIdentity(this.child.pid!, false);
     // Do not await the new prepare callback here. A future red against the old
     // proxy must reach its actual handshake/tool result, not a setup timeout.
     this.command('begin');
   }
   async acquireWatchdogIdentity(pid: number): Promise<void> {
-    if (!process.env.VALIDATION_OUT) return;
+    if (!process.env.VALIDATION_OUT) {
+      const identity = await this.ordinaryIdentity(pid, true);
+      if (!this.watchdogIdentities.some(value => value.pid === pid)) this.watchdogIdentities.push(identity);
+      return;
+    }
     await until(() => {
       const identity = sampledIdentity(pid, message => this.fail(message));
       if (identity && !this.watchdogIdentities.some(value => value.pid === pid)) this.watchdogIdentities.push(identity);
@@ -169,12 +239,12 @@ class NativeHost {
     if (!this.exit && !this.child.stdin!.writableEnded) this.child.stdin!.end();
     // This is an independent cleanup bound, not a CodeGraph request deadline.
     await until(() => !!this.exit && this.rawClose && this.streams.stdout && this.streams.stderr && this.disconnected, 40000);
-    await until(() => !exists(this.child.pid!), 3000);
+    await until(() => absent(this.child.pid!), 3000);
     const evidenceSize = fs.statSync(this.evidence).size;
     if (evidenceSize > 65536) throw new Error('native final events exceed bounded capture');
     const finalEvents = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(fs.readFileSync(this.evidence))).events as Message[];
     const watchdogPids = finalEvents.filter(value => value.event === 'watchdog-spawned').map(value => value.pid);
-    await until(() => watchdogPids.every(pid => !exists(pid)), 5000);
+    await until(() => watchdogPids.every(pid => absent(pid)), 5000);
     for (const pid of watchdogPids) {
       const observedClose = finalEvents.some(value => value.event === 'watchdog-closed' && value.pid === pid);
       this.watchdogCloseFacts.push({ pid, observedClose, pidAbsent: !exists(pid),
@@ -187,12 +257,14 @@ class NativeHost {
         expect(this.watchdogIdentities.some(value => value.pid === pid)).toBe(true);
       } else expect(observedClose).toBe(true);
     }
+    await this.ordinaryAbsence();
     expect(this.exit).toEqual({ code: this.expectedExitCode, signal: null });
   }
   facts(): object {
     return { pid: this.child.pid, nativeIdentity: this.nativeIdentity, watchdogIdentities: this.watchdogIdentities, watchdogCloseFacts: this.watchdogCloseFacts, progressWrites: this.progressWrites,
-      scenario: this.scenario, expectedExitCode: this.expectedExitCode, exit: this.exit, rawClose: this.rawClose,
+      scenario: this.scenario, expectedExitCode: this.expectedExitCode, exit: this.exit, rawClose: this.rawClose, rawCloseNs: this.rawCloseNs,
       streams: this.streams, streamEnds: this.streamEnds, disconnected: this.disconnected, pidAbsent: !exists(this.child.pid!),
+      nativeProbes: this.nativeProbes, nativeSamples: this.nativeSamples, nativeAbsenceFacts: this.nativeAbsenceFacts, nativeObserverFailure: this.nativeObserverFailure,
       failureCount: this.failureCount, captures: Object.fromEntries(Object.entries(this.captures).map(([key, value]) => [key,
         { seenBytes: value.seenBytes, retainedBytes: value.retainedBytes, truncated: value.truncated,
           prefixBase64: value.prefix.toString('base64'), sha256: createHash('sha256').update(value.prefix).digest('hex') }])),

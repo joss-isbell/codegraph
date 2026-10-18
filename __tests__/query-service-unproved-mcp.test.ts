@@ -198,8 +198,7 @@ function save(name: string, root: string, fixture: string, evidence: object, cli
       primary: primary instanceof Error ? primary.stack : String(primary ?? ''), ownersAfterCleanup: finalOwners,
       spawns: finalSpawns, cleanup, clients: clients.map(client => client.facts()), traces: finalTraces };
     try {
-      if (!process.env.VALIDATION_OUT) throw new Error('Qualified evidence output is unavailable');
-      saveCompatibilityEvidence(name, retained);
+      saveCompatibilityEvidence(name, retained, `${fixture}.evidence.json`);
     } catch (error) { failPersistence('final-evidence-persistence', error); }
   } catch (error) { failPersistence('final-evidence-snapshot', error); }
   const failed = cleanup.filter(value => value.error);

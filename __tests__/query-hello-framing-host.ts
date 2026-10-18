@@ -128,8 +128,7 @@ export async function finishFraming(name: string, root: string, fixture: string,
         retention: { disposition: 'All inert disposable fixture/index/control/trace/spawn evidence retained; arming control is renamed without overwriting retained bytes to disarm decoration; native cleanup asserted separately',
           fixtureRoot: fixture, spawnLog: spawnLogFor(root), traceFiles: finalTraces.map(value => (value.facts as { file: string }).file) } };
       try {
-        if (!process.env.VALIDATION_OUT) throw new Error('Qualified evidence output is unavailable');
-        saveCompatibilityEvidence(name, retained);
+        saveCompatibilityEvidence(name, retained, `${fixture}.evidence.json`);
       } catch (error) { secondary('final-evidence-persistence', error); }
     } catch (error) { secondary('final-evidence-snapshot', error); }
   }
