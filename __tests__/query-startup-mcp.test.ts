@@ -312,6 +312,53 @@ function boundedFailure(error: unknown): string {
   try { return String(error).slice(0, 4096); } catch { return 'unprintable thrown value'; }
 }
 
+/** First removal failure only; root metadata is not a handle-owner observation. */
+function removalFailureDiagnostic(error: unknown, operation: string, fixture: string, cleanup: any[]) {
+  const diagnostic: any = { operation, fixture: { value: fixture.slice(0, 256), truncated: fixture.length > 256 },
+    holder: 'unattributed', error: null, cause: null, secondary: [],
+    limits: { entries: 64, depth: 3, recordBytes: 65536, causeDepth: 1 },
+    residual: { method: 'exact-fixture opaque lstat only', entryCount: 0, depth: 0, state: 'unobserved', metadata: null,
+      children: 'unobserved', subtrees: 'unobserved', omission: 'Non-reparse traversal is unproven; no directory enumeration, link following or file-content reads.' } };
+  const secondary = (phase: string, failure: unknown) => {
+    const text = boundedFailure(failure);
+    cleanup.push({ phase: `fixture-remove-diagnostic-${phase}`, failure: text });
+    diagnostic.secondary.push({ phase, failure: text.slice(0, 128), truncated: text.length > 128 });
+  };
+  const property = (value: unknown, key: string) => {
+    if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return { state: 'missing' };
+    try {
+      const raw = Reflect.get(value, key);
+      return raw === undefined ? { state: 'missing' } : { state: 'present', raw };
+    } catch (failure) { secondary(`getter-${key}`, failure); return { state: 'unreadable' }; }
+  };
+  const scalar = (field: ReturnType<typeof property>, maximum: number) => {
+    if (field.state !== 'present') return { state: field.state, truncated: false };
+    const raw = field.raw;
+    if (typeof raw === 'string') return { state: 'present', value: raw.slice(0, maximum), truncated: raw.length > maximum };
+    if (raw === null || typeof raw === 'boolean' || (typeof raw === 'number' && Number.isFinite(raw))) {
+      return { state: 'present', value: raw, truncated: false };
+    }
+    return { state: 'unreadable', reason: 'non-JSON-scalar value not coerced', truncated: false };
+  };
+  const fields = (value: unknown) => Object.fromEntries(['code', 'path', 'syscall', 'errno', 'name', 'message', 'stack']
+    .map(key => [key, scalar(property(value, key), key === 'stack' ? 1024 : 256)]));
+  diagnostic.error = fields(error);
+  const cause = property(error, 'cause');
+  diagnostic.cause = cause.state === 'present' && cause.raw !== null && (typeof cause.raw === 'object' || typeof cause.raw === 'function')
+    ? { state: 'present', fields: fields(cause.raw), nestedCause: 'unobserved-depth-limit' } : scalar(cause, 256);
+  try {
+    const stat = fs.lstatSync(fixture, { bigint: true });
+    diagnostic.residual.state = 'observed'; diagnostic.residual.entryCount = 1;
+    diagnostic.residual.metadata = { relative: '.', kind: stat.isSymbolicLink() ? 'link' : stat.isDirectory() ? 'directory' : stat.isFile() ? 'file' : 'other',
+      values: Object.fromEntries(['dev', 'ino', 'mode', 'nlink', 'uid', 'gid', 'rdev', 'size', 'blksize', 'blocks',
+        'atimeNs', 'mtimeNs', 'ctimeNs', 'birthtimeNs'].map(key => [key, String(stat[key as keyof fs.BigIntStats])])) };
+  } catch (failure) {
+    diagnostic.residual.state = property(failure, 'code').raw === 'ENOENT' ? 'missing' : 'unreadable';
+    secondary('lstat', failure);
+  }
+  return diagnostic;
+}
+
 let receiptSequence = 0;
 
 /** Never open the last complete receipt for truncation, including after removal. */
@@ -429,10 +476,11 @@ describe('one captured startup through actual CLI and native candidate', () => {
     let spawnLog: ReturnType<typeof boundedSpawnLog> = null;
     let mergedLog: ReturnType<typeof boundedNativeLog> | null = null;
     let candidateAbsences: Array<{ pid: number; presence: string; ownExit: unknown }> = [];
+    let firstRemovalFailure: ReturnType<typeof removalFailureDiagnostic> | null = null;
     const events = () => evidence.events();
     const persist = (stage: string) => evidence.persist(stage, () => ({ mode, roots,
       primaryFailed, primaryFailure: primaryFailed ? boundedFailure(primaryFailure) : null, diagnostics, routes, setupFailures,
-      capture: client?.capture(), cleanup, spawnLog, mergedLog, candidateAbsences, fixtureRemoved: !fs.existsSync(fixture) }));
+      capture: client?.capture(), cleanup, spawnLog, mergedLog, candidateAbsences, firstRemovalFailure, fixtureRemoved: !fs.existsSync(fixture) }));
     try {
       for (const [i, root] of roots.entries()) {
         fs.mkdirSync(root);
@@ -601,8 +649,18 @@ describe('one captured startup through actual CLI and native candidate', () => {
       persist('native-cleanup');
       if (!primaryFailed && !evidence.failed && setupFailures.length === 0 && cleanup.every(item => !item.failure)) {
         evidence.allowObservationRemoval();
-        try { removeSpawnLog(roots[0]); fs.rmSync(fixture, { recursive: true, force: true }); }
-        catch (error) { cleanup.push({ phase: 'fixture-remove', failure: boundedFailure(error) }); }
+        let operation = 'removeSpawnLog';
+        try { removeSpawnLog(roots[0]); operation = 'fixture-rm'; fs.rmSync(fixture, { recursive: true, force: true }); }
+        catch (error) {
+          cleanup.push({ phase: 'fixture-remove', failure: boundedFailure(error) });
+          try {
+            const diagnostic = removalFailureDiagnostic(error, operation, fixture, cleanup);
+            const bytes = Buffer.from(`[owned-startup-first-removal-failure] ${JSON.stringify(diagnostic)}\n`);
+            if (bytes.length > 65536) throw new Error('first removal diagnostic exceeded 64KiB');
+            firstRemovalFailure = diagnostic;
+            if (fs.writeSync(2, bytes) !== bytes.length) throw new Error('first removal diagnostic stderr short write');
+          } catch (failure) { cleanup.push({ phase: 'fixture-remove-diagnostic-capture-or-write', failure: boundedFailure(failure) }); }
+        }
       }
       persist('final');
     }
