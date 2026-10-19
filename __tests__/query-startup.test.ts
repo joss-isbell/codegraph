@@ -3,13 +3,13 @@ import { MCPServer } from '../src/mcp';
 
 afterEach(() => vi.unstubAllEnvs());
 
-describe('strict MCP startup query policy', () => {
-  it('rejects invalid requested settings before a server can start', () => {
-    vi.stubEnv('CODEGRAPH_QUERY_MODE', 'default');
+describe('MCP startup query policy', () => {
+  it('rejects an unsupported new preset before a server can start', () => {
+    vi.stubEnv('CODEGRAPH_QUERY_MODE', 'turbo');
     vi.stubEnv('CODEGRAPH_QUERY_POOL_SIZE', '1e3');
     vi.stubEnv('CODEGRAPH_QUERY_BUSY_TIMEOUT_MS', 'unlimited');
     expect(() => new MCPServer()).toThrow(
-      'Invalid CODEGRAPH_QUERY_POOL_SIZE value "1e3"; expected decimal whole numbers 0–9,007,199,254,740,991 or unlimited.',
+      'Invalid CODEGRAPH_QUERY_MODE value "turbo"; expected default or unlimited.',
     );
   });
 });

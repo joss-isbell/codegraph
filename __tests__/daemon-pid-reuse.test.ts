@@ -337,6 +337,7 @@ describe('Shared MCP daemon (issue #411)', () => {
   const servers: SpawnedServer[] = [];
 
   beforeEach(async () => {
+    servers.length = 0;
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-mcp-daemon-'));
     realRoot = fs.realpathSync(tempDir);
     // Ordinary CI gets its own retained sibling, not a shared filename or a directory the fixture cleanup removes.
@@ -412,7 +413,7 @@ describe('Shared MCP daemon (issue #411)', () => {
     expect(evidence.secondary).toEqual([]);
   }, 30000);
 
-  it('takes over after SIGKILL even when the stale PID has been reused (#1553)', async () => {
+  it.each([CodeGraphPackageVersion, '0.0.1'])('takes over after SIGKILL even when the stale PID has been reused (#1553) [stale record version %s]', async version => {
     try {
       const env = { CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '30000' };
       const first = spawnServer(tempDir, env, 'first');
@@ -433,7 +434,7 @@ describe('Shared MCP daemon (issue #411)', () => {
         path.join(realRoot, '.codegraph', 'daemon.pid'),
         JSON.stringify({
           pid: process.pid,
-          version: CodeGraphPackageVersion,
+          version,
           socketPath: getDaemonSocketPath(realRoot),
           startedAt: Date.now() - 60_000,
         }),

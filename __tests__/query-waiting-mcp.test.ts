@@ -64,15 +64,14 @@ describe('independent unlimited waiting through actual MCP requests', () => {
       const initialize = await client.request('initialize', { protocolVersion: '2024-11-05', capabilities: {},
         clientInfo: { name: 'waiting-proof', version: '1' }, rootUri: pathToFileURL(roots[0]).href });
       expect(initialize.serverInfo.name).toBe('codegraph');
-      const strict = mode !== 'shared-daemon';
       const maximum = Math.max(1, Math.min(os.cpus().length - 1, mode === 'shared-daemon' ? 16 : 2));
       const status = async (stage: string) => {
         const value = parseQueryDiagnostics(await client!.request('tools/call', { name: 'codegraph_status', arguments: {} }));
         diagnostics.push({ stage, value });
         expect(value.requested).toEqual({ mode: 'default', busyTimeoutMs: 'unlimited' });
-        expect(value.effective).toMatchObject({ executionMode: mode, source: strict ? 'strict' : 'legacy', preset: 'default',
+        expect(value.effective).toMatchObject({ executionMode: mode, source: 'strict', preset: 'default',
           concurrency: { kind: 'finite', maximum }, deadline: { kind: 'absent' }, retention: 'ordinary', classification: 'custom' });
-        expect(value.implementation.support.combinedPreset).toBe(strict);
+        expect(value.implementation.support.combinedPreset).toBe(true);
         expect(value.ownership).toMatchObject({ writerAuthority: true, synchronizationAuthority: true,
           capability: 'read-write', resourceScope: mode === 'shared-daemon' ? 'shared-project' : 'local-engine' });
         if (mode === 'shared-daemon') daemonPids.add(value.ownership.pid);
@@ -106,7 +105,7 @@ describe('independent unlimited waiting through actual MCP requests', () => {
       const spawned = observed.filter(event => event.event === 'spawn');
       expect(spawned.length).toBeGreaterThan(0);
       for (const event of spawned) expect(event.execution.policy).toMatchObject({ executionMode: mode,
-        source: strict ? 'strict' : 'legacy', preset: 'default', concurrency: { kind: 'finite', maximum },
+        source: 'strict', preset: 'default', concurrency: { kind: 'finite', maximum },
         deadline: { kind: 'absent' }, retention: 'ordinary' });
       const controlled = observed.filter(event => event.event.startsWith('controlled-'));
       expect(controlled.map(event => event.event)).toEqual(['controlled-start', 'controlled-release']);

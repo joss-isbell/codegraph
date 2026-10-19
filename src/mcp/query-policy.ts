@@ -64,40 +64,19 @@ function invalid(setting: string, raw: string, alternatives: string): never {
   throw new Error(`Invalid ${setting} value ${JSON.stringify(raw)}; expected ${alternatives}.`);
 }
 
-function numericOverride(setting: string, raw: string, min: number, max: number): number | 'unlimited' {
-  const value = raw.trim();
-  if (value === 'unlimited') return value;
-  const alternatives = `decimal whole numbers ${min.toLocaleString('en-US')}–${max.toLocaleString('en-US')} or unlimited`;
-  if (!/^\d+$/.test(value)) invalid(setting, raw, alternatives);
-  const number = Number(value);
-  if (!Number.isSafeInteger(number) || number < min || number > max) invalid(setting, raw, alternatives);
-  return number;
-}
-
 /** Resolve a captured request for the selected execution mode. */
 export function resolveQueryPolicy(requested: RequestedQueryPolicy, executionMode: QueryExecutionMode, cpuCount: number): ResolvedQueryPolicy {
-  const defaults = queryDefaults(executionMode, cpuCount);
   const mode = requested.mode?.trim() ?? 'default';
   if (mode !== 'default' && mode !== 'unlimited') invalid('CODEGRAPH_QUERY_MODE', requested.mode!, 'default or unlimited');
-  let concurrency: QueryConcurrency = mode === 'unlimited' ? { kind: 'unlimited' } : defaults.concurrency;
-  let deadline: QueryDeadline = mode === 'unlimited' ? { kind: 'absent' } : defaults.deadline;
-  let unlimitedPool = false;
-  if (requested.poolSize !== undefined) {
-    const size = numericOverride('CODEGRAPH_QUERY_POOL_SIZE', requested.poolSize, 0, MAX_QUERY_POOL_SIZE);
-    unlimitedPool = size === 'unlimited';
-    concurrency = size === 'unlimited' ? { kind: 'unlimited' } : size === 0 ? { kind: 'disabled' } : { kind: 'finite', maximum: size };
-    // Explicit pooling in the read-only mode uses the ordinary pooled deadline.
-    if (deadline.kind === 'inapplicable' && concurrency.kind !== 'disabled') deadline = { kind: 'finite', milliseconds: QUERY_BUSY_TIMEOUT_MS };
-  }
-  if (requested.busyTimeoutMs !== undefined) {
-    const timeout = numericOverride('CODEGRAPH_QUERY_BUSY_TIMEOUT_MS', requested.busyTimeoutMs, 1_000, MAX_QUERY_BUSY_TIMEOUT_MS);
-    deadline = timeout === 'unlimited' ? { kind: 'absent' } : { kind: 'finite', milliseconds: timeout };
-  }
-  if (concurrency.kind === 'disabled') deadline = { kind: 'inapplicable' };
-  const unlimited = concurrency.kind === 'unlimited' && deadline.kind === 'absent';
-  const classification = unlimited ? 'unlimited' : mode === 'unlimited' || requested.poolSize !== undefined || requested.busyTimeoutMs !== undefined ? 'custom' : 'default';
-  return immutable({ requested: { ...requested }, executionMode, defaults, preset: mode, concurrency, deadline,
-    retention: mode === 'unlimited' || unlimitedPool ? 'retire-idle' : 'ordinary', classification, source: 'strict' });
+  // The preset supplies defaults only. Explicit controls keep the existing
+  // Number/floor/fallback semantics, including empty and malformed values.
+  const policy = resolveLegacyQueryPolicy(mode === 'unlimited' ? {
+    ...requested, poolSize: requested.poolSize ?? 'unlimited', busyTimeoutMs: requested.busyTimeoutMs ?? 'unlimited',
+  } : requested, executionMode, cpuCount);
+  return immutable({ ...policy, requested: { ...requested }, preset: mode,
+    retention: mode === 'unlimited' ? 'retire-idle' : policy.retention,
+    // Retain the captured-startup diagnostic tag; it is not a numeric grammar.
+    source: 'strict' });
 }
 
 /** Original permissive parser retained for existing public settings and callers. */
@@ -125,8 +104,8 @@ export function resolveLegacyQueryPolicy(requested: RequestedQueryPolicy, execut
   if (options.poolEnabled === false || (executionMode === 'read-only-fallback' && !explicitReadOnlyPool)) size = 0;
   const pooledUnlimited = unlimitedPool && options.poolEnabled !== false;
   const n = Number(requested.busyTimeoutMs);
-  // Node clamps an overflowing timeout to 1 ms. Until strict public parsing
-  // lands, preserve malformed-input fallback rather than scheduling that timer.
+  // Node clamps an overflowing timeout to 1 ms. Preserve the ordinary fallback
+  // for malformed or out-of-range inputs rather than scheduling that timer.
   const milliseconds = requested.busyTimeoutMs !== undefined && requested.busyTimeoutMs !== '' && Number.isFinite(n) && n >= 1000 && n <= MAX_QUERY_BUSY_TIMEOUT_MS ? Math.floor(n) : QUERY_BUSY_TIMEOUT_MS;
   return immutable({ requested: { ...requested }, executionMode, defaults, preset: 'default', source: 'legacy',
     concurrency: pooledUnlimited ? { kind: 'unlimited' } : size === 0 ? { kind: 'disabled' } : { kind: 'finite', maximum: size },

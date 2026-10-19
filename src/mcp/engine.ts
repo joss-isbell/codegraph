@@ -318,7 +318,7 @@ export class MCPEngine {
     return immutable({ schemaVersion: 1,
       implementation: { packageVersion: CodeGraphPackageVersion, policySchemaVersion: 1,
         support: { independentControls: true,
-          combinedPreset: effective.source === 'strict' && (effective.executionMode === 'direct' || effective.executionMode === 'writable-fallback'),
+          combinedPreset: effective.source === 'strict',
           idleRetirement: true } },
       requested, effective,
       ownership: { writerAuthority: this.execution.ownership.writer, synchronizationAuthority: this.execution.ownership.synchronization,

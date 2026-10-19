@@ -1116,8 +1116,8 @@ describe('Shared MCP daemon (issue #411)', () => {
     const betaGraph = await CodeGraph.init(beta); try { await betaGraph.indexAll(); } finally { betaGraph.close(); }
     const readOnly = mode === 'read-only-fallback' || mode === 'legacy-read-only-fallback';
     const legacy = mode.startsWith('legacy-');
+    const shared = mode === 'shared-daemon' || mode === 'legacy-shared-daemon';
     const owner = readOnly ? await ordinaryWriter(realRoot) : undefined;
-    const beforeAlpha = snapshot(realRoot), beforeBeta = snapshot(beta);
     const alphaDB = bounded(path.join(realRoot, '.codegraph/codegraph.db')), betaDB = bounded(path.join(beta, '.codegraph/codegraph.db'));
     if (readOnly) arm('stop-before-status');
     if (mode === 'writable-fallback') arm('exit78-before-status');
@@ -1136,24 +1136,9 @@ describe('Shared MCP daemon (issue #411)', () => {
     expect(pending.result.tools.map((tool: any) => tool.name).sort()).toEqual([
       'codegraph_explore','codegraph_node','codegraph_search','codegraph_callers','codegraph_callees','codegraph_impact','codegraph_files','codegraph_status',
     ].sort());
-    if (mode === 'read-only-fallback' || mode === 'shared-daemon') {
-      // Original exact combined controls are retained, but combined RO is not
-      // activated until #31. BOTH original exact-profile positive [1,1,2]
-      // obligations remain pending #31→15, never replaced by the legacy rows.
-      await terminal(server, 'unsupported-mode', realRoot, 3);
-      if (mode === 'read-only-fallback') proveUnavailable(server); else await proveTypedUnsupported(server, realRoot);
-      zeroRequesterWork(server, true);
-      expect(snapshot(realRoot)).toEqual(beforeAlpha); expect(snapshot(beta)).toEqual(beforeBeta);
-      if (owner) { expect(isAlive(owner.child.pid!)).toBe(true); expect(readWriterInfo(realRoot)).toMatchObject({ pid: owner.child.pid, mode: 'fallback' }); }
-      // Candidate absence does not clear a primary terminal latch.
-      await terminal(server, 'unsupported-mode', realRoot, 7);
-      expect(snapshot(realRoot)).toEqual(beforeAlpha); expect(snapshot(beta)).toEqual(beforeBeta);
-      await closedClient(server);
-      zeroRequesterWork(server, true);
-      expect(snapshot(realRoot)).toEqual(beforeAlpha); expect(snapshot(beta)).toEqual(beforeBeta);
-      if (owner) { expect(isAlive(owner.child.pid!)).toBe(true); expect(readWriterInfo(realRoot)).toMatchObject({ pid: owner.child.pid, mode: 'fallback' }); }
-      return;
-    }
+    // Revised #29 supports the same preset requests in every public route.
+    // Shared/read-only now retain the real positive history and authority
+    // assertions below instead of the historical unsupported-mode early return.
     for (const [id, projectPath, symbol] of [[3, undefined, 'alphaPolicySymbol'], [4, beta, 'betaPolicySymbol'], [5, undefined, 'alphaPolicySymbol']] as const) {
       sendMessage(server.child, { jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'codegraph_explore', arguments: { query: symbol, ...(projectPath ? { projectPath } : {}) } } });
       const reply = await waitFor(() => findResponse(server.stdout, id), 15000);
@@ -1175,8 +1160,8 @@ describe('Shared MCP daemon (issue #411)', () => {
     expect(reports.map(report => report.session.callIndex)).toEqual([1,1,2]);
     expect(reports[2].session.priorCalls).toBe(1); expect(reports[2].session.priorFiles.length).toBeGreaterThan(0);
     const actual = trace().filter(record => record.event === 'engine-diagnostics').map(record => record.diagnostics)
-      .find(value => value.ownership?.pid === (mode === 'legacy-shared-daemon' ? readLockPid(realRoot) : server.child.pid));
-    expect(actual.effective).toMatchObject({ executionMode: mode === 'direct' ? 'direct' : mode === 'legacy-shared-daemon' ? 'shared-daemon' : readOnly ? 'read-only-fallback' : 'writable-fallback',
+      .find(value => value.ownership?.pid === (shared ? readLockPid(realRoot) : server.child.pid));
+    expect(actual.effective).toMatchObject({ executionMode: mode === 'direct' ? 'direct' : shared ? 'shared-daemon' : readOnly ? 'read-only-fallback' : 'writable-fallback',
       concurrency: { kind: 'finite', maximum: 2 }, deadline: { kind: 'absent' }, retention: legacy ? 'ordinary' : 'retire-idle' });
     if (mode === 'writable-fallback') {
       // Controlled actual CLI pre-status native78 allows supported strict W.
@@ -1193,7 +1178,7 @@ describe('Shared MCP daemon (issue #411)', () => {
       expect(readLockPid(realRoot)).toBeNull();
       expect(readWriterInfo(realRoot)).toMatchObject({ pid: owner!.child.pid, mode: 'fallback' });
     }
-    const daemonPid = mode === 'legacy-shared-daemon' ? readLockPid(realRoot) : null;
+    const daemonPid = shared ? readLockPid(realRoot) : null;
     await closedClient(server);
     if (daemonPid) expect(await waitProcessExit(daemonPid, 10000)).toBe(true);
     expect(server.stderr.some(line => line.includes('up to unlimited'))).toBe(false);
@@ -1772,7 +1757,8 @@ describe('Shared MCP daemon (issue #411)', () => {
 
   it('native held pre-service preparation exposes only static discovery before permission', async () => {
     const before = snapshot(realRoot); arm('hold-before-status');
-    const server = spawnServer(tempDir, { CODEGRAPH_QUERY_MODE: 'unlimited', CODEGRAPH_QUERY_POOL_SIZE: '2', CODEGRAPH_QUERY_BUSY_TIMEOUT_MS: 'unlimited' }); servers.push(server);
+    const server = spawnServer(tempDir, { CODEGRAPH_QUERY_MODE: 'unlimited', CODEGRAPH_QUERY_POOL_SIZE: '2',
+      CODEGRAPH_QUERY_BUSY_TIMEOUT_MS: 'unlimited', CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '1000' }); servers.push(server);
     sendInitialize(server.child, `file://${tempDir}`, 1);
     const initialized = await waitFor(() => findResponse(server.stdout, 1), 3000);
     expect(initialized.result.instructions).toContain('verification is pending');
@@ -1781,11 +1767,20 @@ describe('Shared MCP daemon (issue #411)', () => {
     await waitFor(() => trace().find(record => record.pid === server.child.pid && record.event === 'candidate-pre-service-barrier'), 3000);
     zeroRequesterWork(server, true); expect(snapshot(realRoot)).toEqual(before);
     fs.writeFileSync(`${current.control}.initial.release`, 'release actual CLI startup');
-    await terminal(server, 'unsupported-mode', realRoot, 3);
-    await proveTypedUnsupported(server, realRoot);
-    zeroRequesterWork(server, true); expect(snapshot(realRoot)).toEqual(before);
+    // Permission now selects the supported shared preset; the pre-permission
+    // zero-effects assertions above remain unchanged.
+    sendMessage(server.child, { jsonrpc: '2.0', id: 3, method: 'tools/call',
+      params: { name: 'codegraph_explore', arguments: { query: 'originalSymbol' } } });
+    const served = await waitFor(() => findResponse(server.stdout, 3), 15000);
+    expect(served.error).toBeUndefined(); expect(served.result.isError).toBeFalsy();
+    expect(served.result.content[0].text).toContain('function originalSymbol');
+    expect(server.stdout.filter(line => { try { return JSON.parse(line).id === 3; } catch { return false; } })).toHaveLength(1);
+    const daemonPid = readLockPid(realRoot)!;
+    expect(isAlive(daemonPid)).toBe(true);
+    expect(readWriterInfo(realRoot)).toMatchObject({ pid: daemonPid, mode: 'daemon' });
+    expect(trace().some(record => record.pid === server.child.pid && record.event === 'engine-constructor')).toBe(false);
     await closedClient(server);
-    zeroRequesterWork(server, true); expect(snapshot(realRoot)).toEqual(before);
+    expect(await waitProcessExit(daemonPid, 10000)).toBe(true);
   }, 30000);
 
 });

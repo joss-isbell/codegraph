@@ -7,6 +7,7 @@ import type CodeGraph from '../index';
 import { admitMcpRoute, assertMcpIndexRoute, canonicalProjectRoot, type McpIndexRoute } from '../directory';
 import { LockUnavailableError, watchDisabledReason, type PendingFile } from '../sync';
 import { canProbeDaemonIdentity, getDaemonSocketCandidates, type DaemonLockInfo } from './daemon-paths';
+import { clearStaleDaemonArtifacts } from './daemon-registry';
 import { connectForProjectFreshness, connectWithHello } from './proxy';
 import type { ResolvedQueryPolicy } from './query-policy';
 import { isServicePolicyRefusal, servicePolicyRefusal } from './query-service-compatibility';
@@ -249,6 +250,32 @@ export async function admitQueryProject(root: string, policy: ResolvedQueryPolic
       starting = { daemon: daemon.value, writer: writer.kind === 'live' ? writer.value : null };
     }
     if (!starting || performance.now() >= bindDeadline) {
+      // A structured, old record can name a reused PID after its actual daemon
+      // died. Restore only that unpaired native-absent path to the existing
+      // exclusive-writer/snapshot cleanup fence; a live writer is never stale.
+      if (!starting && daemon.kind === 'live' && daemon.value.pid !== process.pid
+        && canProbeDaemonIdentity(daemon.value)
+        && Number.isFinite(daemon.value.startedAt) && daemon.value.startedAt > 0
+        && Date.now() - daemon.value.startedAt >= 10_000
+        && owners.daemon.kind === 'live' && owners.daemon.raw === daemon.raw
+        && (writer.kind === 'absent' || writer.kind === 'dead')) {
+        const cleared = await clearStaleDaemonArtifacts(root, { expectedLockContents: daemon.raw, confirm: async () => {
+          // Re-probe through modern admission: only native pre-connect absence
+          // returns null. Connected-unproved, timeout and compatibility failures
+          // must propagate, not turn the legacy false probe into permission.
+          for (const candidate of new Set([daemon.value.socketPath, ...getDaemonSocketCandidates(root)])) {
+            if (signal?.aborted) throw cancelled();
+            const socket = await connectWithHello(candidate, undefined, policy, root);
+            if (socket) { socket.destroy(); return false; }
+          }
+          if (signal?.aborted) throw cancelled();
+          const checked = observeOwners();
+          return checked.daemon.kind === 'live' && checked.daemon.raw === daemon.raw
+            && checked.writer.kind === writer.kind
+            && (writer.kind === 'absent' || (checked.writer.kind === 'dead' && checked.writer.raw === writer.raw));
+        } });
+        if (cleared) continue; // Fresh endpoint, policy, project and owner admission; never permission from cleanup.
+      }
       assertNoLiveQueryDaemon(root, current); return;
     }
     await waitForStartup(Math.min(25, bindDeadline - performance.now()), undefined, { signal });

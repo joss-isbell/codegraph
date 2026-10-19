@@ -154,8 +154,8 @@ class ProcessClient {
   }
 }
 
-describe('strict policy through actual MCP startup', () => {
-  it('rejects the complete invalid syntax table before direct, proxy or daemon startup touches authority', async () => {
+describe('query policy through actual MCP startup', () => {
+  it('rejects unsupported new presets before direct, proxy or daemon startup touches authority', async () => {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-strict-invalid-')));
     const clients: ProcessClient[] = [];
     const facts: any[] = [];
@@ -182,10 +182,6 @@ describe('strict policy through actual MCP startup', () => {
       before = inventory(index); registryBefore = inventory(registry);
       const invalid = [
         ...['', ' ', 'Default', 'Unlimited', 'DEFAULT', 'unlimited x', '0'].map(raw => ['CODEGRAPH_QUERY_MODE', raw, 'default or unlimited']),
-        ...['', ' ', '-1', '+1', '1.0', '.5', '1e3', '0x10', 'NaN', 'Infinity', '-Infinity', 'abc', 'UNLIMITED', '1_000', '9007199254740992', '99999999999999999999999999999999999999']
-          .map(raw => ['CODEGRAPH_QUERY_POOL_SIZE', raw, 'decimal whole numbers 0–9,007,199,254,740,991 or unlimited']),
-        ...['', ' ', '0', '999', '-1000', '+1000', '1000.0', '1e3', '0x1000', 'NaN', 'Infinity', 'abc', 'UNLIMITED', '2147483648', '9007199254740991']
-          .map(raw => ['CODEGRAPH_QUERY_BUSY_TIMEOUT_MS', raw, 'decimal whole numbers 1,000–2,147,483,647 or unlimited']),
       ];
       for (const route of ['direct', 'automatic', 'daemon-internal']) for (const [key, raw, alternatives] of invalid) {
         const client = new ProcessClient([cli, 'serve', '--mcp', '--path', root], root, environment({
@@ -212,14 +208,14 @@ describe('strict policy through actual MCP startup', () => {
       attempt('ownership', () => { finalOwners = owners(index); });
       attempt('registry-inventory', () => { finalRegistry = inventory(registry); });
       persist();
-      if (!primaryFailed && failures.length === 0 && facts.length === 114
+      if (!primaryFailed && failures.length === 0 && facts.length === 21
         && clients.every(client => client.capture().failure === null && client.capture().nativeClose?.code === 1 && client.capture().nativeClose?.signal === null)) {
         attempt('fixture-remove', () => fs.rmSync(root, { recursive: true, force: true }));
       }
       persist();
     }
     if (primaryFailed) throw primaryFailure;
-    expect(facts).toHaveLength(114); expect(failures).toEqual([]);
+    expect(facts).toHaveLength(21); expect(failures).toEqual([]);
   }, 120000);
 
   it.each(['direct', 'writable-fallback'] as const)('keeps the constructor request through a later environment change and default/explicit/default real queries in %s', async mode => {
@@ -504,9 +500,9 @@ describe('one captured startup through actual CLI and native candidate', () => {
       diagnostics.push(state);
       expect(state.requested).toEqual({});
       expect(state.effective).toMatchObject({ executionMode: mode === 'disconnected-native' ? 'writable-fallback' : mode,
-        source: mode === 'shared-daemon' ? 'legacy' : 'strict',
+        source: 'strict',
         preset: 'default', concurrency: { kind: 'finite', maximum: 2 }, deadline: { kind: 'finite', milliseconds: 45000 } });
-      expect(state.implementation.support.combinedPreset).toBe(mode !== 'shared-daemon');
+      expect(state.implementation.support.combinedPreset).toBe(true);
       for (const i of [0, 1, 0]) {
         const query = `${i ? 'beta' : 'alpha'}SnapshotSymbol`;
         for (const name of ['codegraph_search', 'codegraph_explore']) {

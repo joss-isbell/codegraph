@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { createHash } from 'crypto';
+import { performance } from 'perf_hooks';
 import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
 import { pathToFileURL } from 'url';
 import { CodeGraph, getDatabasePath } from '../src';
@@ -143,7 +144,180 @@ export type Mode = 'direct' | 'writable-fallback' | 'read-only-fallback' | 'shar
 export const queryUnlimitedCases = (['direct', 'writable-fallback', 'read-only-fallback', 'shared-daemon'] as const)
   .flatMap(mode => (Object.keys(profiles) as Profile[]).map(profile => [mode, profile] as const));
 
-/** One real public-host scenario, reused by the complete matrix and focused refusal red. */
+/** Focused revised-29 route cases: real stdio -> worker -> SQLite result. */
+export async function runPresetMCPCase(mode: Mode, scenario: 'finite-override' | 'finite-overlap' | 'unlimited-overlap'): Promise<void> {
+  const fixture = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-preset-mcp-')));
+  const root = path.join(fixture, 'project');
+  const observations = path.join(fixture, 'workers.jsonl'), release = path.join(fixture, 'release');
+  const clients: Client[] = [];
+  const cleanup: Array<{ phase: string; error: string | null }> = [];
+  const unlimited = scenario === 'unlimited-overlap';
+  const demand = unlimited ? mode === 'shared-daemon' ? 17 : mode === 'read-only-fallback' ? 2 : 3 : 3;
+  const facts: Record<string, unknown> = { root, mode, scenario,
+    selection: { mode: 'unlimited', poolSize: unlimited ? null : '2', busyTimeoutMs: null } };
+  let primary: unknown, daemonPid: number | undefined, candidatePids: number[] = [], fixtureRemoved = false;
+  let owner: CodeGraph | undefined, observer: ReturnType<typeof createDatabase>['db'] | undefined;
+  let readOnlyBefore: unknown;
+  const readOnlyState = () => ({ writer: fs.readFileSync(getWriterPidPath(root), 'utf8'),
+    db: digest(getDatabasePath(root)), wal: digest(getDatabasePath(root) + '-wal'),
+    metadata: digest(path.join(root, '.codegraph/.gitignore')),
+    version: observer!.pragma('data_version', { simple: true }), schema: observer!.pragma('schema_version', { simple: true }) });
+  let phase = 'fixture setup';
+  const events = (): any[] => {
+    if (!fs.existsSync(observations)) return [];
+    if (fs.statSync(observations).size > 1048576) throw new Error('Owned preset worker observation overflow');
+    return fs.readFileSync(observations, 'utf8').split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line));
+  };
+  try {
+    fs.mkdirSync(root);
+    fs.writeFileSync(path.join(root, 'app.ts'), 'export function presetRouteSymbol() { return 42; }\nexport function overlapSymbol() { return 73; }\n');
+    const graph = await CodeGraph.init(root);
+    try { await graph.indexAll(); } finally { graph.close(); }
+    if (mode === 'read-only-fallback') {
+      owner = await CodeGraph.open(root);
+      expect(tryAcquireWriterLock(root, 'direct').kind).toBe('acquired');
+      owner.watch({ debounceMs: 50 });
+      observer = createDatabase(getDatabasePath(root), { readOnly: true }).db;
+      readOnlyBefore = readOnlyState(); facts.readOnlyBefore = readOnlyBefore;
+    }
+    const environment = {
+      CODEGRAPH_QUERY_MODE: 'unlimited', CODEGRAPH_QUERY_POOL_SIZE: unlimited ? undefined : '2', CODEGRAPH_QUERY_BUSY_TIMEOUT_MS: undefined,
+    };
+    const client = new Client(root, mode, observations, release, 'default', { environment });
+    clients.push(client);
+    await client.request('initialize', { protocolVersion: '2024-11-05', capabilities: {},
+      clientInfo: { name: 'shared-preset-proof', version: '1' }, rootUri: pathToFileURL(root).href });
+    phase = 'preset request reaches actual worker and SQLite';
+    const result = await client.query('presetRouteSymbol'); facts.result = result;
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('presetRouteSymbol');
+    expect(result.content[0].text).toContain('app.ts:1');
+    phase = 'effective executing policy';
+    const value = diagnostic(await client.request('tools/call', { name: 'codegraph_status', arguments: {} }));
+    facts.diagnostics = value;
+    expect(value.implementation.support.combinedPreset).toBe(true);
+    expect(value.effective).toMatchObject({ executionMode: mode, preset: 'unlimited',
+      concurrency: unlimited ? { kind: 'unlimited' } : { kind: 'finite', maximum: 2 }, deadline: { kind: 'absent' } });
+    expect(value.ownership).toMatchObject({ resourceScope: mode === 'shared-daemon' ? 'shared-project' : 'local-engine',
+      capability: owner ? 'read-only' : 'read-write', writerAuthority: !owner, synchronizationAuthority: !owner });
+    expect(value.lifecycle).toMatchObject({ dispatch: 'worker', ready: true, workers: 1 });
+    const observed = events();
+    const spawned = observed.filter(event => event.event === 'spawn');
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0].execution.policy).toEqual({ ...value.effective, requested: value.requested });
+    expect(observed.filter(event => event.event === 'call-start' && event.query === 'presetRouteSymbol')).toHaveLength(1);
+    expect(observed.filter(event => event.event === 'result')).toHaveLength(1);
+    expect(spawned[0].pid).toBe(value.ownership.pid);
+    if (mode === 'shared-daemon') daemonPid = value.ownership.pid;
+    if (scenario !== 'finite-override') {
+      phase = 'actual simultaneous worker execution before release';
+      const resultsPromise = Promise.all(Array.from({ length: demand }, () => client.query('overlapSymbol')));
+      void resultsPromise.catch(() => {});
+      const expectedExecuting = unlimited ? demand : 2;
+      await until(() => events().filter(event => event.event === 'call-start' && event.query === 'overlapSymbol').length >= expectedExecuting,
+        30000, () => JSON.stringify({ events: events(), stderr: client.stderr }));
+      const held = events().filter(event => event.event === 'call-start' && event.query === 'overlapSymbol');
+      expect(held).toHaveLength(expectedExecuting);
+      expect(new Set(held.map(event => `${event.pid}:${event.threadId}`)).size).toBe(expectedExecuting);
+      phase = 'responsive requests while real worker calls are held';
+      const probeStarted = performance.now();
+      await client.request('ping');
+      const waiting = diagnostic(await client.request('tools/call', { name: 'codegraph_status', arguments: {} }));
+      facts.responsivenessMs = performance.now() - probeStarted;
+      facts.waitingDiagnostics = waiting;
+      expect(waiting.effective).toEqual(value.effective);
+      expect(waiting.ownership).toEqual(value.ownership);
+      expect(waiting.lifecycle).toMatchObject({ dispatch: 'worker', ready: true,
+        executing: expectedExecuting, workers: expectedExecuting, queued: demand - expectedExecuting });
+      expect(events().filter(event => event.event === 'call-start' && event.query === 'overlapSymbol')).toHaveLength(expectedExecuting);
+      expect(events().filter(event => event.event === 'result')).toHaveLength(1);
+      for (const spawned of events().filter(event => event.event === 'spawn')) {
+        expect(spawned.execution.policy).toEqual({ ...value.effective, requested: value.requested });
+        if (owner) expect(spawned.execution).toMatchObject({ capability: 'read-only', ownership: { writer: false, synchronization: false } });
+      }
+      facts.demand = demand; facts.peakOverlap = expectedExecuting;
+      facts.releaseControl = 'owned input delivery hold; real worker handler and SQLite produce every result';
+      fs.writeFileSync(release, 'release actual worker input to ordinary SQLite handler');
+      phase = 'correct real SQLite results after controlled overlap';
+      const results = await resultsPromise; facts.results = results;
+      expect(results).toHaveLength(demand);
+      for (const result of results) {
+        expect(result.isError).toBeFalsy();
+        expect(result.content[0].text).toContain('overlapSymbol');
+        expect(result.content[0].text).toContain('app.ts:2');
+      }
+      expect(events().filter(event => event.event === 'spawn')).toHaveLength(expectedExecuting);
+      if (mode === 'shared-daemon') {
+        phase = 'compatible peer reuses the executing shared pool';
+        const peer = new Client(root, mode, observations, release, 'default', { environment }); clients.push(peer);
+        await peer.request('initialize', { protocolVersion: '2024-11-05', capabilities: {},
+          clientInfo: { name: 'shared-preset-peer', version: '1' } });
+        const reply = await peer.query('presetRouteSymbol');
+        expect(reply.isError).toBeFalsy(); expect(reply.content[0].text).toContain('app.ts:1');
+        const peerStatus = diagnostic(await peer.request('tools/call', { name: 'codegraph_status', arguments: {} }));
+        facts.peerDiagnostics = peerStatus;
+        expect(peerStatus.ownership).toEqual(value.ownership); expect(peerStatus.effective).toEqual(value.effective);
+        expect(events().filter(event => event.event === 'spawn')).toHaveLength(expectedExecuting);
+      }
+    }
+    if (owner) {
+      facts.readOnlyAfter = readOnlyState();
+      expect(facts.readOnlyAfter).toEqual(readOnlyBefore); expect(owner.isWatching()).toBe(true);
+    }
+  } catch (error) { primary = error; throw error; }
+  finally {
+    const detail = (error: unknown) => error instanceof Error ? error.stack ?? error.message : String(error);
+    const attempt = async (name: string, action: () => unknown | Promise<unknown>) => {
+      try { await action(); cleanup.push({ phase: name, error: null }); }
+      catch (error) { cleanup.push({ phase: name, error: detail(error) }); }
+    };
+    await attempt('capture owned service candidates', () => {
+      if (fs.existsSync(spawnLogFor(root))) candidatePids = fs.readFileSync(spawnLogFor(root), 'utf8')
+        .split(/\r?\n/).map(Number).filter(pid => Number.isSafeInteger(pid) && pid > 0);
+      const pidFile = path.join(root, '.codegraph/daemon.pid');
+      if (!daemonPid && fs.existsSync(pidFile)) daemonPid = JSON.parse(fs.readFileSync(pidFile, 'utf8')).pid;
+    });
+    await attempt('release owned worker delivery', () => fs.writeFileSync(release, 'cleanup release'));
+    await Promise.all(clients.map((client, index) => attempt(`client ${index} native exit`, () => client.close())));
+    await attempt('shared service native exit', async () => {
+      if (daemonPid && alive(daemonPid)) await until(() => !alive(daemonPid!), 10000);
+    });
+    await attempt('owned candidate exits', () => settleLosingCandidates(root, () => process.pid));
+    await attempt('read-only observer close', () => observer?.close());
+    if (owner) {
+      await attempt('ordinary writer owner close', () => owner!.close());
+      await attempt('ordinary writer lock release', () => releaseWriterLock(root));
+    }
+    let observed: any[] = [];
+    await attempt('all native resources released', () => {
+      observed = events();
+      expect(clients.every(client => client.child.exitCode !== null || client.child.signalCode !== null)).toBe(true);
+      expect(daemonPid ? alive(daemonPid) : false).toBe(false);
+      expect(candidatePids.filter(alive)).toEqual([]);
+      expect(observed.filter(event => event.event === 'exit')).toHaveLength(observed.filter(event => event.event === 'spawn').length);
+    });
+    if (cleanup.every(row => !row.error)) {
+      await attempt('owned spawn log removal', () => removeSpawnLog(root));
+      await attempt('owned fixture removal', async () => {
+        await fs.promises.rm(fixture, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+        fixtureRemoved = !fs.existsSync(fixture); expect(fixtureRemoved).toBe(true);
+      });
+    }
+    const evidenceFile = process.env.VALIDATION_OUT ? path.join(process.env.VALIDATION_OUT, `${mode}-preset-${scenario}.json`) : fixture + '-evidence.json';
+    fs.writeFileSync(evidenceFile,
+      JSON.stringify({ ...facts, phase, primary: primary ? detail(primary) : null,
+        outcome: primary || cleanup.some(row => row.error) ? 'fail' : 'pass', cleanup, fixtureRemoved,
+        events: observed, captures: clients.map(client => client.capture()), replies: clients.map(client => client.replies),
+        daemonPid, daemonAlive: daemonPid ? alive(daemonPid) : false, candidatePids, candidatesStillAlive: candidatePids.filter(alive),
+      }, null, 2));
+    if (!process.env.VALIDATION_OUT) process.stderr.write(`[Owned preset evidence] ${evidenceFile.slice(0, 1024)}\n`);
+    const failed = cleanup.filter(row => row.error);
+    if (failed.length && !primary) throw new Error('Owned preset cleanup incomplete: ' + JSON.stringify(failed));
+    if (failed.length && primary) process.stderr.write('Owned preset cleanup also failed: ' + JSON.stringify(failed) + '\n');
+  }
+}
+
+/** Existing real public-host matrix, retained without its superseded refusal oracle. */
 export async function runUnlimitedMCPCase(mode: Mode, profile: Profile): Promise<void> {
     const fixture = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-unlimited-mcp-')));
     const roots = [path.join(fixture, 'alpha'), path.join(fixture, 'beta')];
@@ -195,51 +369,6 @@ export async function runUnlimitedMCPCase(mode: Mode, profile: Profile): Promise
       phase = 'initialize';
       const initialize = () => client.request('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'unlimited-proof', version: '1' }, rootUri: pathToFileURL(roots[0]).href });
       expect((await initialize()).serverInfo.name).toBe('codegraph');
-      const unsupported = (mode === 'shared-daemon' || mode === 'read-only-fallback')
-        && (profile === 'disabled' || profile === 'finite-no-deadline');
-      if (unsupported) {
-        phase = 'unwired combined preset refusal before authority or constructor';
-        const refused = async (name: string, args: unknown = {}) => {
-          const beforeReplies = client.replies.length;
-          let failure: unknown;
-          try { await client.request('tools/call', { name, arguments: args }); } catch (error) { failure = error; }
-          expect(failure).toBeInstanceOf(RPCError);
-          const response = (failure as RPCError).response;
-          expect(response).toMatchObject({ code: -32603, data: {
-            code: 'CODEGRAPH_QUERY_POLICY_REFUSED', reason: 'unsupported-mode', projectRoot: roots[0],
-          } });
-          expect(response.data.guidance).toEqual(expect.any(String)); expect(response.data.guidance.length).toBeGreaterThan(0);
-          expect(client.replies.slice(beforeReplies).filter(reply => reply.error)).toHaveLength(1);
-          refusals.push({ name, args, response });
-        };
-        await refused('codegraph_status');
-        for (const index of [0, 1, 0]) for (const name of ['codegraph_search', 'codegraph_explore']) {
-          await refused(name, { query: index ? 'betaRouteSymbol' : 'alphaRouteSymbol', ...(index ? { projectPath: roots[index] } : {}) });
-        }
-        const observed = events();
-        expect(observed.filter(event => ['engine-constructor', 'spawn', 'call-start', 'result', 'session-history'].includes(event.event))).toEqual([]);
-        expect(ownership()).toEqual(ownershipBefore);
-        expect(registryInventory(registry)).toEqual(registryBefore);
-        if (observer) {
-          expect({ version: observer.pragma('data_version', { simple: true }), db: roots.map(root => digest(getDatabasePath(root))),
-            wal: roots.map(root => digest(getDatabasePath(root) + '-wal')), metadata: roots.map(root => digest(path.join(root, '.codegraph/.gitignore'))),
-            schema: observer.pragma('schema_version', { simple: true }) }).toEqual(readonlyBefore);
-          expect(owners.every(owner => owner.isWatching())).toBe(true);
-        }
-        if (mode === 'read-only-fallback') {
-          const candidates = observed.filter(event => event.event === 'unavailable-candidate');
-          expect(candidates).toHaveLength(1);
-          expect(observed.filter(event => event.event === 'unavailable-candidate-exit').map(event => [event.candidatePid, event.code]))
-            .toEqual([[candidates[0].candidatePid, 78]]);
-        }
-        if (process.env.VALIDATION_OUT) fs.writeFileSync(path.join(process.env.VALIDATION_OUT, `${evidenceName}.json`), JSON.stringify({
-          mode, profile, unsupported: true, refusals, roots, ownershipBefore, ownershipAfter: ownership(),
-          registryBefore, registryAfter: registryInventory(registry), readonlyBefore, events: observed,
-          captures: clients.map(item => item.capture()), replies: clients.map(item => item.replies),
-        }, null, 2));
-        return;
-      }
-      const strict = mode === 'direct' || mode === 'writable-fallback';
       const disabled = profile === 'disabled' || profile === 'independent-disabled';
       const noDeadline = profile === 'finite-no-deadline' || profile === 'independent-finite-no-deadline';
       const status = async (phase: string, index = 0, target = client) => {
@@ -247,7 +376,7 @@ export async function runUnlimitedMCPCase(mode: Mode, profile: Profile): Promise
         diagnostics.push({ phase, value });
         expect(value.project).toEqual({ route: index ? 'explicit' : 'default', root: roots[index], index: fs.realpathSync(getDatabasePath(roots[index])) });
         expect(value.effective.executionMode).toBe(mode);
-        expect(value.implementation).toMatchObject({ policySchemaVersion: 1, support: { independentControls: true, combinedPreset: strict, idleRetirement: true } });
+        expect(value.implementation).toMatchObject({ policySchemaVersion: 1, support: { independentControls: true, combinedPreset: true, idleRetirement: true } });
         expect(value.ownership).toMatchObject({ capability: mode === 'read-only-fallback' ? 'read-only' : 'read-write',
           writerAuthority: mode !== 'read-only-fallback', synchronizationAuthority: mode !== 'read-only-fallback',
           resourceScope: mode === 'shared-daemon' ? 'shared-project' : 'local-engine' });
@@ -260,7 +389,7 @@ export async function runUnlimitedMCPCase(mode: Mode, profile: Profile): Promise
         ready: !enabled, workers: 0, queued: 0, executing: 0, starting: 0, retiring: 0, reason: null });
       expect(cold.requested).toEqual(Object.fromEntries(Object.entries(profiles[profile]).filter(([, value]) => value !== undefined)
         .map(([key, value]) => [key === 'CODEGRAPH_QUERY_MODE' ? 'mode' : key === 'CODEGRAPH_QUERY_POOL_SIZE' ? 'poolSize' : 'busyTimeoutMs', value])));
-      expect(cold.effective).toMatchObject({ source: strict ? 'strict' : 'legacy', preset: profile === 'disabled' || profile === 'finite-no-deadline' ? 'unlimited' : 'default',
+      expect(cold.effective).toMatchObject({ source: 'strict', preset: profile === 'disabled' || profile === 'finite-no-deadline' ? 'unlimited' : 'default',
         concurrency: !enabled ? { kind: 'disabled' } : profile === 'unlimited' ? { kind: 'unlimited' }
           : { kind: 'finite', maximum: noDeadline ? 2 : Math.max(1, Math.min(os.cpus().length - 1, mode === 'shared-daemon' ? 16 : 2)) },
         deadline: !enabled ? { kind: 'inapplicable' } : noDeadline ? { kind: 'absent' } : { kind: 'finite', milliseconds: 45000 },
@@ -361,7 +490,7 @@ export async function runUnlimitedMCPCase(mode: Mode, profile: Profile): Promise
       expect(workerPids.size).toBe(1);
       expect(firstWave.filter(event => event.event === 'spawn')).toHaveLength(20);
       for (const event of firstWave.filter(event => event.event === 'spawn')) {
-        expect(event.execution.policy).toMatchObject({ source: strict ? 'strict' : 'legacy', executionMode: mode, preset: 'default',
+        expect(event.execution.policy).toMatchObject({ source: 'strict', executionMode: mode, preset: 'default',
           concurrency: { kind: 'unlimited' }, deadline: { kind: 'finite', milliseconds: 45000 }, retention: 'retire-idle', classification: 'custom' });
         if (mode === 'read-only-fallback') expect(event.execution).toMatchObject({ capability: 'read-only', ownership: { writer: false, synchronization: false } });
       }

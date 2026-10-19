@@ -43,6 +43,10 @@ const unlimitedRows: Array<[string | undefined, string | undefined, Expected]> =
   ['unlimited', 'unlimited', { concurrency: 'unlimited', deadline: 'absent', retention: 'retire-idle', classification: 'unlimited' }],
 ];
 const rows: Row[] = [
+  // Existing numeric controls use Number coercion; adding the preset must not
+  // reject a previously supported finite setting when the preset is absent.
+  { name: 'legacy-exponent-pool-size-without-preset', requested: { poolSize: '1e0' },
+    expected: { concurrency: 1, deadline: 45000, retention: 'ordinary', classification: 'custom' } },
   ...[undefined, 'default'].flatMap(mode => defaultRows.map(([poolSize, busyTimeoutMs, expected], i) => ({
     name: `${mode ?? 'unset'}-${i + 1}`, requested: {
       ...(mode === undefined ? {} : { mode }), ...(poolSize === undefined ? {} : { poolSize }),
@@ -125,7 +129,7 @@ class Client {
     this.child.on('error', error => this.fail(error));
     this.child.stdin.on('error', error => this.fail(error));
     this.closed = new Promise(resolve => this.child.once('close', (code, signal) => {
-      this.nativeClose = { code, signal }; this.rejectPending(new Error(`owned host closed ${code}/${signal}`)); resolve(this.nativeClose);
+      this.nativeClose = { code, signal }; this.rejectPending(new Error(`owned host closed ${code}/${signal}: ${this.stderr}`)); resolve(this.nativeClose);
     }));
   }
   private rejectPending(error: Error) { for (const request of this.pending.values()) { clearTimeout(request.timer); request.reject(error); } this.pending.clear(); }
@@ -152,7 +156,7 @@ class Client {
   }
 }
 
-describe('strict preset and overrides through real direct and writable MCP hosts', () => {
+describe('preset and overrides through real direct and writable MCP hosts', () => {
   it.each((['direct', 'writable-fallback'] as const).flatMap(mode => rows.map(row => [mode, row.name, row] as const)))
   ('reports the complete policy and routes real queries in %s / %s', async (mode, _name, row) => {
     const fixture = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-policy-mcp-')));

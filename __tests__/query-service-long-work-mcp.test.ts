@@ -10,6 +10,7 @@ import { CompatibilityClient, alive, until, wait, saveCompatibilityEvidence } fr
 describe('shared service preserves healthy work through refused acquisitions', () => {
   it.runIf(process.platform === 'win32')('survives a healthy 47-second shared query through repeated concurrent incompatible acquisitions and unknown reconnects', async () => {
     const fixture = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-policy-long-work-')));
+    const ordinaryEvidence = `${fixture}-evidence.json`;
     const root = path.join(fixture, 'project'); fs.mkdirSync(root);
     const workers = path.join(fixture, 'workers.jsonl');
     const timing = path.join(fixture, 'timing.jsonl');
@@ -249,7 +250,8 @@ describe('shared service preserves healthy work through refused acquisitions', (
         issuedTools: issuedTools.map(({ client, id }) => ({ client: client.name, id })),
         outcome: primary || cleanup.some(row => row.error) ? 'fail' : 'pass',
         primary: primary instanceof Error ? primary.stack : String(primary ?? ''), cleanup, fixtureRemoved,
-        workerEvents, timingEvents, networkEvents, clients: clients.map(client => client.facts()), daemonPid, candidatePids }));
+        workerEvents, timingEvents, networkEvents, clients: clients.map(client => client.facts()), daemonPid, candidatePids }, ordinaryEvidence));
+      if (!process.env.VALIDATION_OUT) process.stderr.write(`Long-work evidence: ${ordinaryEvidence}\n`);
       const failures = cleanup.filter(row => row.error);
       if (failures.length && !primary) throw new Error('Owned long-work cleanup incomplete: ' + JSON.stringify(failures));
       if (failures.length && primary) process.stderr.write('Owned long-work cleanup also failed: ' + JSON.stringify(failures) + '\n');

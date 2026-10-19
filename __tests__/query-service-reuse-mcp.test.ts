@@ -47,7 +47,7 @@ describe('behavior-equivalent shared services through actual MCP', () => {
       const before = parseQueryDiagnostics((await first.tool('codegraph_status')).result);
       daemonPid = before.ownership.pid;
       expect(before.effective.executionMode).toBe('shared-daemon');
-      expect(before.implementation.support).toEqual({ independentControls: true, combinedPreset: false, idleRetirement: true });
+      expect(before.implementation.support).toEqual({ independentControls: true, combinedPreset: true, idleRetirement: true });
       const peerSettings = profile.peer(before);
       const second = new CompatibilityClient(roots[0]!, 'equivalent-right', { ...observationEnv, ...peerSettings }, 80000, [preload]);
       clients.push(second); await second.initialize();

@@ -44,7 +44,7 @@ import { getCodeGraphDir, codeGraphDirNameFor, resolveMcpRoot, admitMcpRoute,
 import type { JsonRpcTransport } from './transport';
 import { MCPEngine } from './engine';
 import { MCPSession } from './session';
-import { immutable, resolveQueryPolicy, resolveLegacyQueryPolicy, type QueryStartupRequest,
+import { immutable, resolveQueryPolicy, type QueryStartupRequest,
   type QueryExecutionMode, type ResolvedQueryPolicy } from './query-policy';
 import { captureMcpQueryStartup, daemonQueryEnvironment } from './query-startup-transport';
 import { QueryPolicyRefusalError, isQueryPolicyRefusal } from './query-policy-refusal';
@@ -120,16 +120,8 @@ const HANDOVER_CANDIDATE_WAIT_MS = 5_000;
  * Say so on stderr: otherwise a session that quietly stopped syncing looks
  * the same as a healthy one in the logs.
  */
-function selectedQueryPolicy(startup: QueryStartupRequest, mode: QueryExecutionMode, root: string): ResolvedQueryPolicy {
-  const strict = resolveQueryPolicy(startup.requested, mode, startup.cpuCount);
-  if (mode === 'direct' || mode === 'writable-fallback') return strict;
-  if (strict.preset === 'unlimited') {
-    throw new QueryPolicyRefusalError('unsupported-mode', root,
-      'Use direct or writable fallback for the combined query preset until this mode supports it.',
-      `The combined query preset is unsupported in ${mode}.`);
-  }
-  // Independent controls keep their existing mode semantics and truthful support=false.
-  return resolveLegacyQueryPolicy(startup.requested, mode, startup.cpuCount, { poolEnabled: true });
+function selectedQueryPolicy(startup: QueryStartupRequest, mode: QueryExecutionMode): ResolvedQueryPolicy {
+  return resolveQueryPolicy(startup.requested, mode, startup.cpuCount);
 }
 
 function cancelled(signal?: AbortSignal): void {
@@ -178,7 +170,7 @@ function retainObservedStartupWriter(route: McpIndexRoute, observed: StartupWrit
 
 function readOnlyFallback(holder: string, startup: QueryStartupRequest, prospective: ResolvedQueryPolicy,
   route: McpIndexRoute, controls: LocalHandshakePreparationControls): MCPEngine {
-  const queryPolicy = selectedQueryPolicy(startup, 'read-only-fallback', route.root);
+  const queryPolicy = selectedQueryPolicy(startup, 'read-only-fallback');
   process.stderr.write(`[CodeGraph MCP] Serving reads in-process without auto-sync: ${holder}; local read-only fallback resources are not shared across chats.\n`);
   return new MCPEngine({ readOnly: true, queryPool: true, queryPolicy, queryAdmissionPolicy: prospective,
     projectRoute: route, executionMode: 'read-only-fallback', resourceObserver: controls.resourceObserver,
@@ -314,12 +306,6 @@ export function watchdogProgressPaths(root: string | null): { progressPaths?: st
   if (!root) return {};
   const dbPath = path.join(getCodeGraphDir(root), 'codegraph.db');
   return { progressPaths: [dbPath, `${dbPath}-wal`] };
-}
-
-/** One initial spawn's route-bound evidence; it never caches permission. */
-interface BootstrapSeed {
-  readonly route: McpIndexRoute;
-  readonly result: Extract<DaemonBootstrapResult, { kind: 'unavailable' }>;
 }
 
 async function connectHeldService(route: McpIndexRoute, prospective: ResolvedQueryPolicy, signal: AbortSignal) {
@@ -635,11 +621,6 @@ export class MCPServer {
     if (daemonOptOutSet()) return { kind: 'direct', route: null,
       makeSession: (transport, factorySignal) => this.makeDirectSession(null, transport, factorySignal, controls),
       stop: () => this.stop() };
-    const unsupportedShared = this.queryAdmissionPolicy.preset === 'unlimited';
-    // Only closed, unacknowledged attempts can be retained during discovery.
-    // The selected route consumes its one result; no seed grants permission.
-    const seeds = new Map<string, BootstrapSeed>();
-    const routeKey = (route: McpIndexRoute) => JSON.stringify([route.root, route.index]);
     const progress = new Set<IndexProgressLease>();
     let primaryFailed = false;
     try {
@@ -648,43 +629,16 @@ export class MCPServer {
       cancelled(signal);
       await admitQueryProject(route.root, this.queryAdmissionPolicy, signal);
       cancelled(signal);
-      if (!unsupportedShared) return;
-      // Normal supported discovery classifies admitted schemas without starting
-      // speculative services. Combined shared selection is still unsupported:
-      // its actual inert preflight must finish before the parent's schema probe.
-      const existing = await connectHeldService(route, this.queryAdmissionPolicy, signal);
-      if (existing) { await closeOwnedDaemonSocket(existing); return; }
-      assertNoLiveQueryDaemon(route.root);
-      const result = seeds.get(routeKey(route))?.result
-        ?? await spawnDetachedDaemon(route, this.queryStartup, false, signal, false);
-      if (result.kind === 'refused') throw result.refusal;
-      if (result.kind === 'permitted') {
-        // The no-ACK helper cannot return permitted. Keep an explicit fence if
-        // its implementation ever changes; discovery cannot promote a service.
-        throw unknownStartup(route.root, 'Unsupported discovery unexpectedly advertised startup permission.');
-      }
-      await admitQueryProject(route.root, this.queryAdmissionPolicy, signal);
-      cancelled(signal);
-      assertStartupRoute(route);
-      assertNoLiveQueryDaemon(route.root);
-      const writer = readQueryServiceOwners(route.root).writer;
-      selectedQueryPolicy(this.queryStartup, writer.kind === 'live' ? 'read-only-fallback' : 'writable-fallback', route.root);
-      seeds.set(routeKey(route), Object.freeze({ route, result }));
     } }).catch(error => {
-      seeds.clear();
       cancelled(signal);
       if (isQueryPolicyRefusal(error)) throw error;
       throw unknownStartup(this.projectPath ?? process.cwd(),
         `Primary project selection failed: ${error instanceof Error ? error.message : String(error)}`);
     });
     const route = resolution.route;
-    const seed = route ? seeds.get(routeKey(route)) : undefined;
-    // Invalid-nearer and ambiguous/rootless discovery cannot carry evidence to
-    // an ancestor, another candidate, a future retry or an explicit target.
-    seeds.clear();
     cancelled(signal);
     if (route) {
-      return { kind: 'proxy', deps: this.proxyDependencies(route, this.queryStartup, seed, signal, controls) };
+      return { kind: 'proxy', deps: this.proxyDependencies(route, this.queryStartup, signal, controls) };
     }
     return { kind: 'direct', route,
       makeSession: (transport, factorySignal) => this.makeDirectSession(route, transport, factorySignal, controls),
@@ -757,7 +711,7 @@ export class MCPServer {
         'Native candidate bootstrap IPC disconnected before daemon startup.');
       // Support is selected before any schema/authority; parent --path binds an
       // exact own index, never a nearest-root search inside the child.
-      queryPolicy = selectedQueryPolicy(this.queryStartup, 'shared-daemon', hint);
+      queryPolicy = selectedQueryPolicy(this.queryStartup, 'shared-daemon');
       const captured = captureMcpIndexRoute(hint);
       if (!captured) throw unknownStartup(hint, 'The detached candidate has no held own index.');
       route = await admitMcpRoute(captured, { admit: async held => {
@@ -852,28 +806,21 @@ export class MCPServer {
    * proxy falls back to an in-process engine if the daemon never binds, so this
    * never wedges a session.
    */
-  private proxyDependencies(route: McpIndexRoute, startup: QueryStartupRequest, initialSeed: BootstrapSeed | undefined,
+  private proxyDependencies(route: McpIndexRoute, startup: QueryStartupRequest,
     signal: AbortSignal, controls: LocalHandshakePreparationControls): LocalHandshakeDeps {
     const root = route.root;
     const prospective = this.queryAdmissionPolicy;
-    let seed = initialSeed;
     const connectAnyCandidate = () => connectHeldService(route, prospective, signal);
     const getDaemonSocket = async () => {
-      // Every attempt performs current permission; a bootstrap seed is evidence
-      // for its one actual spawn, never a cached caller verdict or attachment.
+      // Every attempt performs current permission before attachment or spawn.
       cancelled(signal);
-      const capturedSeed = seed;
-      seed = undefined;
-      if (capturedSeed && (capturedSeed.route.root !== root || capturedSeed.route.index !== route.index)) {
-        throw unknownStartup(root, 'The bootstrap seed does not belong to the held route.');
-      }
       await admitQueryProject(root, prospective, signal);
       cancelled(signal);
       assertStartupRoute(route);
       const probe = await connectAnyCandidate();
       if (probe) return probe;
       assertNoLiveQueryDaemon(root);
-      const bootstrapResult = capturedSeed?.result ?? await spawnDetachedDaemon(route, startup, false, signal);
+      const bootstrapResult = await spawnDetachedDaemon(route, startup, false, signal);
       if (bootstrapResult.kind === 'refused') throw bootstrapResult.refusal;
       cancelled(signal);
       assertStartupRoute(route);
@@ -893,7 +840,7 @@ export class MCPServer {
       if (appeared) return appeared;
       assertNoLiveQueryDaemon(root);
       const writer = readQueryServiceOwners(root).writer;
-      selectedQueryPolicy(startup, writer.kind === 'live' ? 'read-only-fallback' : 'writable-fallback', root);
+      selectedQueryPolicy(startup, writer.kind === 'live' ? 'read-only-fallback' : 'writable-fallback');
       return null;
     };
     return { getDaemonSocket, makeEngine: () => {
