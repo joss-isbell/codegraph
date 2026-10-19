@@ -288,7 +288,7 @@ describe('Symlink escape prevention (#527)', () => {
     }
   });
 
-  it('end-to-end (#935): indexes source reached through an in-root dir symlink to outside', async () => {
+  it('end-to-end (#935): indexes source reached through an in-root dir symlink to outside', async (context) => {
     // The Dota custom-game layout symlinks `game/` and `content/` into an SDK
     // tree outside the repo. Before #935 the batch reader's strict symlink-escape
     // guard blocked every file under them, so nothing indexed — even though the
@@ -296,7 +296,12 @@ describe('Symlink escape prevention (#527)', () => {
     // reader now agrees with discovery: the file indexes.
     fs.writeFileSync(path.join(outside, 'pkg', 'vendored.ts'),
       'export function vendoredHelper() { return "LEAKED-ZZZ-9"; }\n');
-    if (!link(path.join(root, 'game'), path.join(outside, 'pkg'))) return;
+    if (!link(path.join(root, 'game'), path.join(outside, 'pkg'))) {
+      console.warn('Skipping #935: could not create the required directory symlink on this host.');
+      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
+      return context.skip();
+    }
 
     const cg = CodeGraph.initSync(root, { config: { include: ['**/*.ts'], exclude: [] } });
     try {
