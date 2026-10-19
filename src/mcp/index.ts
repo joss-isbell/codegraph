@@ -308,6 +308,12 @@ export function watchdogProgressPaths(root: string | null): { progressPaths?: st
   return { progressPaths: [dbPath, `${dbPath}-wal`] };
 }
 
+/** One exact primary bootstrap outcome; never cached route permission. */
+interface BootstrapSeed {
+  readonly route: McpIndexRoute;
+  readonly result: Exclude<DaemonBootstrapResult, { kind: 'refused' }>;
+}
+
 async function connectHeldService(route: McpIndexRoute, prospective: ResolvedQueryPolicy, signal: AbortSignal) {
   cancelled(signal);
   assertStartupRoute(route);
@@ -621,14 +627,36 @@ export class MCPServer {
     if (daemonOptOutSet()) return { kind: 'direct', route: null,
       makeSession: (transport, factorySignal) => this.makeDirectSession(null, transport, factorySignal, controls),
       stop: () => this.stop() };
+    const seeds = new Map<string, BootstrapSeed>();
+    const routeKey = (route: McpIndexRoute) => JSON.stringify([route.root, route.index]);
     const progress = new Set<IndexProgressLease>();
     let primaryFailed = false;
     try {
+    const hint = path.resolve(this.projectPath ?? process.cwd());
+    let primary: McpIndexRoute | null;
+    try { primary = captureMcpIndexRoute(hint); }
+    catch (error) { throw unknownStartup(hint,
+      `The primary own-index route could not be captured: ${error instanceof Error ? error.message : String(error)}`); }
     const resolution = await resolveMcpRoot(this.projectPath ?? process.cwd(), { signal, admit: async route => {
       progress.add(await controls.resourceObserver.acquireIndexProgress(route, signal));
       cancelled(signal);
       await admitQueryProject(route.root, this.queryAdmissionPolicy, signal);
       cancelled(signal);
+      // Preserve the exact primary preset's pre-permission schema fence. Do
+      // not start services for speculative ancestor/subproject candidates.
+      if (this.queryAdmissionPolicy.preset !== 'unlimited'
+        || route.root !== primary?.root || route.index !== primary.index) return;
+      const existing = await connectHeldService(route, this.queryAdmissionPolicy, signal);
+      if (existing) { await closeOwnedDaemonSocket(existing); return; }
+      assertNoLiveQueryDaemon(route.root);
+      const result = await spawnDetachedDaemon(route, this.queryStartup, false, signal);
+      if (result.kind === 'refused') throw result.refusal;
+      cancelled(signal);
+      assertStartupRoute(route);
+      await admitQueryProject(route.root, this.queryAdmissionPolicy, signal);
+      cancelled(signal);
+      assertStartupRoute(route);
+      seeds.set(routeKey(route), Object.freeze({ route, result }));
     } }).catch(error => {
       cancelled(signal);
       if (isQueryPolicyRefusal(error)) throw error;
@@ -636,9 +664,14 @@ export class MCPServer {
         `Primary project selection failed: ${error instanceof Error ? error.message : String(error)}`);
     });
     const route = resolution.route;
+    const seed = primary ? seeds.get(routeKey(primary)) : undefined;
+    seeds.clear();
     cancelled(signal);
+    if (seed && (!route || route.root !== seed.route.root || route.index !== seed.route.index)) {
+      throw unknownStartup(seed.route.root, 'The bootstrapped primary own index did not remain the selected verified route.');
+    }
     if (route) {
-      return { kind: 'proxy', deps: this.proxyDependencies(route, this.queryStartup, signal, controls) };
+      return { kind: 'proxy', deps: this.proxyDependencies(route, this.queryStartup, seed, signal, controls) };
     }
     return { kind: 'direct', route,
       makeSession: (transport, factorySignal) => this.makeDirectSession(route, transport, factorySignal, controls),
@@ -806,21 +839,27 @@ export class MCPServer {
    * proxy falls back to an in-process engine if the daemon never binds, so this
    * never wedges a session.
    */
-  private proxyDependencies(route: McpIndexRoute, startup: QueryStartupRequest,
+  private proxyDependencies(route: McpIndexRoute, startup: QueryStartupRequest, initialSeed: BootstrapSeed | undefined,
     signal: AbortSignal, controls: LocalHandshakePreparationControls): LocalHandshakeDeps {
     const root = route.root;
     const prospective = this.queryAdmissionPolicy;
+    let seed = initialSeed;
     const connectAnyCandidate = () => connectHeldService(route, prospective, signal);
     const getDaemonSocket = async () => {
       // Every attempt performs current permission before attachment or spawn.
       cancelled(signal);
+      const capturedSeed = seed;
+      seed = undefined;
+      if (capturedSeed && (capturedSeed.route.root !== route.root || capturedSeed.route.index !== route.index)) {
+        throw unknownStartup(root, 'The bootstrap outcome does not belong to the held primary route.');
+      }
       await admitQueryProject(root, prospective, signal);
       cancelled(signal);
       assertStartupRoute(route);
       const probe = await connectAnyCandidate();
       if (probe) return probe;
       assertNoLiveQueryDaemon(root);
-      const bootstrapResult = await spawnDetachedDaemon(route, startup, false, signal);
+      const bootstrapResult = capturedSeed?.result ?? await spawnDetachedDaemon(route, startup, false, signal);
       if (bootstrapResult.kind === 'refused') throw bootstrapResult.refusal;
       cancelled(signal);
       assertStartupRoute(route);
