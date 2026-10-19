@@ -164,7 +164,10 @@ if ($LASTEXITCODE -ne 0) { throw 'Could not deny ListDirectory on the fixture' }
     const acl = (mode: string) => execFileSync(powershell, [
       '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script,
       '-Mode', mode, '-Target', target, '-FixtureBase', base, '-Descriptor', descriptor,
-    ], { timeout: 10_000, maxBuffer: 128 * 1024, windowsHide: true });
+    ], {
+      timeout: 10_000, maxBuffer: 128 * 1024, windowsHide: true,
+      env: { ...process.env, PSModulePath: path.join(path.dirname(powershell), 'Modules') },
+    });
     console.error(`CODEGRAPH_ACL_RECOVERY_FILE=${descriptor}`);
     try {
       acl('deny');
