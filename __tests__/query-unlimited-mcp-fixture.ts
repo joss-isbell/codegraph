@@ -267,6 +267,49 @@ export async function runPresetMCPCase(mode: Mode, scenario: 'finite-override' |
   } catch (error) { primary = error; throw error; }
   finally {
     const detail = (error: unknown) => error instanceof Error ? error.stack ?? error.message : String(error);
+    // Preserve files the existing cleanup removes; no new daemon/child observers.
+    const serviceEvidence = mode === 'shared-daemon' && !unlimited ? {
+      snapshots: [] as Array<Record<string, unknown>>, captureErrors: [] as Array<{ stage: string; error: string }>,
+      candidateNativeClose: { status: 'not-recorded', reason: 'The detached spawn recorder retains PIDs only, not candidate native close or IPC.' },
+    } : undefined;
+    const captureFile = (file: string): Record<string, unknown> => {
+      const limitBytes = 65536;
+      const record: Record<string, unknown> = { file, startedAt: new Date().toISOString(), limitBytes,
+        status: 'read-error', fileSizeBytes: null, retainedBytes: 0, truncated: null, sha256: null, text: null, base64: null, error: null, closeError: null };
+      let fd: number | undefined;
+      try {
+        fd = fs.openSync(file, 'r');
+        const stat = fs.fstatSync(fd);
+        record.fileSizeBytes = stat.size;
+        record.modifiedAt = stat.mtime.toISOString();
+        const buffer = Buffer.alloc(Math.min(stat.size, limitBytes));
+        const retained = buffer.subarray(0, fs.readSync(fd, buffer, 0, buffer.length, 0));
+        Object.assign(record, { status: 'captured', retainedBytes: retained.length, truncated: stat.size > retained.length,
+          sha256: createHash('sha256').update(retained).digest('hex'), text: retained.toString('utf8'), base64: retained.toString('base64') });
+      } catch (error) {
+        record.status = (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'missing' : 'read-error';
+        record.error = detail(error);
+      } finally {
+        if (fd !== undefined) {
+          try { fs.closeSync(fd); } catch (error) { record.closeError = detail(error); }
+        }
+        record.completedAt = new Date().toISOString();
+      }
+      return record;
+    };
+    const preserveServiceEvidence = (stage: string) => {
+      if (!serviceEvidence) return;
+      try {
+        const startedAt = new Date().toISOString();
+        const captures = clients.map(client => client.capture());
+        const files = [path.join(root, '.codegraph/daemon.log'), path.join(root, '.codegraph/daemon.pid'),
+          getWriterPidPath(root), spawnLogFor(root)].map(captureFile);
+        serviceEvidence.snapshots.push({ stage, phase, trigger: primary ? 'primary-failure' : 'case-complete',
+          startedAt, completedAt: new Date().toISOString(), captures, files,
+          consistency: 'Sequential prefix reads, not an atomic snapshot; files may change during capture. Hashes cover retained bytes only.' });
+      } catch (error) { serviceEvidence.captureErrors.push({ stage, error: detail(error) }); }
+    };
+    preserveServiceEvidence('before-cleanup');
     const attempt = async (name: string, action: () => unknown | Promise<unknown>) => {
       try { await action(); cleanup.push({ phase: name, error: null }); }
       catch (error) { cleanup.push({ phase: name, error: detail(error) }); }
@@ -296,6 +339,7 @@ export async function runPresetMCPCase(mode: Mode, scenario: 'finite-override' |
       expect(candidatePids.filter(alive)).toEqual([]);
       expect(observed.filter(event => event.event === 'exit')).toHaveLength(observed.filter(event => event.event === 'spawn').length);
     });
+    preserveServiceEvidence('after-cleanup-before-removal-decision');
     if (cleanup.every(row => !row.error)) {
       await attempt('owned spawn log removal', () => removeSpawnLog(root));
       await attempt('owned fixture removal', async () => {
@@ -304,13 +348,19 @@ export async function runPresetMCPCase(mode: Mode, scenario: 'finite-override' |
       });
     }
     const evidenceFile = process.env.VALIDATION_OUT ? path.join(process.env.VALIDATION_OUT, `${mode}-preset-${scenario}.json`) : fixture + '-evidence.json';
-    fs.writeFileSync(evidenceFile,
-      JSON.stringify({ ...facts, phase, primary: primary ? detail(primary) : null,
-        outcome: primary || cleanup.some(row => row.error) ? 'fail' : 'pass', cleanup, fixtureRemoved,
-        events: observed, captures: clients.map(client => client.capture()), replies: clients.map(client => client.replies),
-        daemonPid, daemonAlive: daemonPid ? alive(daemonPid) : false, candidatePids, candidatesStillAlive: candidatePids.filter(alive),
-      }, null, 2));
-    if (!process.env.VALIDATION_OUT) process.stderr.write(`[Owned preset evidence] ${evidenceFile.slice(0, 1024)}\n`);
+    try {
+      fs.writeFileSync(evidenceFile,
+        JSON.stringify({ ...facts, phase, primary: primary ? detail(primary) : null,
+          outcome: primary || cleanup.some(row => row.error) ? 'fail' : 'pass', cleanup, fixtureRemoved,
+          events: observed, captures: clients.map(client => client.capture()), replies: clients.map(client => client.replies),
+          daemonPid, daemonAlive: daemonPid ? alive(daemonPid) : false, candidatePids, candidatesStillAlive: candidatePids.filter(alive),
+          ...(serviceEvidence ? { serviceEvidence } : {}),
+        }, null, 2));
+      if (!process.env.VALIDATION_OUT) process.stderr.write(`[Owned preset evidence] ${evidenceFile.slice(0, 1024)}\n`);
+    } catch (error) {
+      if (!serviceEvidence || (!primary && cleanup.every(row => !row.error))) throw error;
+      process.stderr.write('Owned preset evidence persistence also failed: ' + detail(error) + '\n');
+    }
     const failed = cleanup.filter(row => row.error);
     if (failed.length && !primary) throw new Error('Owned preset cleanup incomplete: ' + JSON.stringify(failed));
     if (failed.length && primary) process.stderr.write('Owned preset cleanup also failed: ' + JSON.stringify(failed) + '\n');

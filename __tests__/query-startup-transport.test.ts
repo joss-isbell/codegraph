@@ -54,12 +54,12 @@ describe('captured query startup across a native candidate environment', () => {
   });
 
   it('turns a qualified malformed public control into terminal unknown after scrubbing', () => {
-    const env = { CODEGRAPH_DAEMON_INTERNAL: '1', CODEGRAPH_QUERY_POOL_SIZE: '',
+    const env = { CODEGRAPH_DAEMON_INTERNAL: '1', CODEGRAPH_QUERY_MODE: 'unlimited x',
       [metadata]: '{"protocol":1,"cpuCount":3}' };
     expect(() => captureMcpQueryStartup(env, () => 99, true, root)).toThrow(expect.objectContaining({
       code: 'CODEGRAPH_QUERY_POLICY_REFUSED', reason: 'unknown',
     }));
-    expect(env.CODEGRAPH_QUERY_POOL_SIZE).toBeUndefined();
+    expect(env.CODEGRAPH_QUERY_MODE).toBeUndefined();
   });
 
   it.each([{ marker: '1', ipc: false }, { marker: 'true', ipc: true }, { marker: undefined, ipc: true }])
