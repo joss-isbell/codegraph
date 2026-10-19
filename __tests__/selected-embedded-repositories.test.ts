@@ -166,7 +166,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Could not deny ListDirectory on the fixture' }
       '-Mode', mode, '-Target', target, '-FixtureBase', base, '-Descriptor', descriptor,
     ], {
       timeout: 10_000, maxBuffer: 128 * 1024, windowsHide: true,
-      env: { ...process.env, PSModulePath: path.join(path.dirname(powershell), 'Modules') },
+      env: Object.fromEntries(Object.entries(process.env).filter(([key]) => key.toUpperCase() !== 'PSMODULEPATH')),
     });
     console.error(`CODEGRAPH_ACL_RECOVERY_FILE=${descriptor}`);
     try {
