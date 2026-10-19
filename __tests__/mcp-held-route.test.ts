@@ -40,7 +40,7 @@ function active(): void {
 }
 function temp(): string {
   active();
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-held-route-')));
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-hr-')));
   roots.push(root);
   return root;
 }
