@@ -1113,7 +1113,21 @@ describe('selected public query lifetime', () => {
           expect(histories()).toEqual(recoveredHistory);
           expect(events().filter(event => event.event === 'read-handler-start' && /^exhaustionDemand/.test(event.query))).toEqual([]);
           expect(events().filter(event => event.event === 'worker-created')).toHaveLength(createdBeforeRefusal);
-          for (const failure of events().filter(event => event.event === 'safe-self-exit')) expect(failure.collected).toBe(true);
+          // Injected exits must call the real best-effort helper first; its
+          // actual boolean is diagnostic, not an always-successful GC promise.
+          const observed = events(), exits = observed.filter(event => event.event === 'safe-self-exit');
+          const collections = observed.filter(event => event.event === 'exit-collection-observation-complete');
+          for (const failure of exits) {
+            const sameWorker = (event: any) => event.pid === failure.pid && event.threadId === failure.threadId;
+            expect(exits.filter(sameWorker)).toHaveLength(1);
+            const completed = collections.filter(event => sameWorker(event) && event.reason === failure.reason);
+            expect(completed).toHaveLength(1);
+            expect(typeof failure.collected).toBe('boolean');
+            expect(completed[0]).toMatchObject({ collected: failure.collected, overflow: false });
+            expect(observed.indexOf(completed[0])).toBeLessThan(observed.indexOf(failure));
+            expect(BigInt(completed[0].monotonicNs)).toBeLessThan(BigInt(failure.monotonicNs));
+            expect(observed.filter(event => event.event === 'worker-created' && sameWorker(event))).toHaveLength(1);
+          }
           expect(events().filter(event => event.event === 'safe-self-exit' && event.reason === 'first-pre-ready')).toHaveLength(1);
           expect(events().filter(event => event.event === 'safe-self-exit' && event.reason === 'controlled-ready-loss')).toHaveLength(1);
           assertNoEscape();
