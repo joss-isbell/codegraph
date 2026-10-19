@@ -1756,6 +1756,7 @@ describe('Shared MCP daemon (issue #411)', () => {
   }, 45000);
 
   it('native held pre-service preparation exposes only static discovery before permission', async () => {
+    await indexLifecycleSymbol(realRoot);
     const before = snapshot(realRoot); arm('hold-before-status');
     const server = spawnServer(tempDir, { CODEGRAPH_QUERY_MODE: 'unlimited', CODEGRAPH_QUERY_POOL_SIZE: '2',
       CODEGRAPH_QUERY_BUSY_TIMEOUT_MS: 'unlimited', CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '1000' }); servers.push(server);
@@ -1769,12 +1770,7 @@ describe('Shared MCP daemon (issue #411)', () => {
     fs.writeFileSync(`${current.control}.initial.release`, 'release actual CLI startup');
     // Permission now selects the supported shared preset; the pre-permission
     // zero-effects assertions above remain unchanged.
-    sendMessage(server.child, { jsonrpc: '2.0', id: 3, method: 'tools/call',
-      params: { name: 'codegraph_explore', arguments: { query: 'originalSymbol' } } });
-    const served = await waitFor(() => findResponse(server.stdout, 3), 15000);
-    expect(served.error).toBeUndefined(); expect(served.result.isError).toBeFalsy();
-    expect(served.result.content[0].text).toContain('function originalSymbol');
-    expect(server.stdout.filter(line => { try { return JSON.parse(line).id === 3; } catch { return false; } })).toHaveLength(1);
+    await realExplore(server, 3);
     const daemonPid = readLockPid(realRoot)!;
     expect(isAlive(daemonPid)).toBe(true);
     expect(readWriterInfo(realRoot)).toMatchObject({ pid: daemonPid, mode: 'daemon' });
