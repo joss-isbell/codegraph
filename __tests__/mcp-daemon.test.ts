@@ -1133,9 +1133,14 @@ describe('Shared MCP daemon (issue #411)', () => {
     expect((await waitFor(() => findResponse(server.stdout, 1), 10000)).result.serverInfo.name).toBe('codegraph');
     sendMessage(server.child, { jsonrpc: '2.0', id: 2, method: 'tools/list' });
     const pending = await waitFor(() => findResponse(server.stdout, 2), 10000);
-    expect(pending.result.tools.map((tool: any) => tool.name).sort()).toEqual([
+    const staticTools = [
       'codegraph_explore','codegraph_node','codegraph_search','codegraph_callers','codegraph_callees','codegraph_impact','codegraph_files','codegraph_status',
-    ].sort());
+    ].sort();
+    // Initialize responds before direct background opening finishes: this
+    // first list may still be pending/static or already use the tiny-repo trio.
+    // Proxies stay static; the post-query assertion below proves direct's trio.
+    const firstLists = mode === 'direct' ? [staticTools, ['codegraph_explore','codegraph_node','codegraph_search'].sort()] : [staticTools];
+    expect(firstLists).toContainEqual(pending.result.tools.map((tool: any) => tool.name).sort());
     // Revised #29 supports the same preset requests in every public route.
     // Shared/read-only now retain the real positive history and authority
     // assertions below instead of the historical unsupported-mode early return.
