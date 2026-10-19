@@ -26,6 +26,7 @@
 import { Worker } from 'worker_threads';
 import * as path from 'path';
 import * as os from 'os';
+import type { McpIndexRoute } from '../directory';
 import type { ToolResult } from './tools';
 import { createQueryExecutionContext, type QueryExecutionContext, type QueryRequestContext } from './query-context';
 import { requestedQueryPolicy, resolveLegacyQueryPolicy, resolveLegacyPoolSize } from './query-policy';
@@ -111,6 +112,8 @@ export interface QueryPoolOptions {
   execution?: QueryExecutionContext;
   /** Default project root each worker opens at spawn, or null for per-call projects. */
   root: string | null;
+  /** Exact acknowledged DB-file route from the engine, never re-resolved here. */
+  projectRoute?: McpIndexRoute;
   /** Max worker threads. Defaults to `clamp(cores-1, 1, 16)`. */
   size?: number;
   /** Admission-to-answer backstop (queue plus execution). Default 45s. */
@@ -177,6 +180,7 @@ export class QueryPool {
   private cleanupFailure: Error | null = null;
   private failure: string | null = null;
   private readonly root: string | null;
+  private readonly projectRoute?: McpIndexRoute;
   private readonly maxSize: number;
   private readonly softTimeoutMs: number | null;
   readonly execution: QueryExecutionContext;
@@ -187,6 +191,8 @@ export class QueryPool {
 
   constructor(opts: QueryPoolOptions) {
     this.root = opts.root;
+    if (opts.projectRoute && opts.projectRoute.root !== opts.root) throw new Error('Query worker route must match its default root.');
+    this.projectRoute = opts.projectRoute ? Object.freeze({ root: opts.projectRoute.root, index: opts.projectRoute.index }) : undefined;
     // Standalone legacy callers retain permissive parsing and ordinary defaults.
     // Engine callers always supply one already-resolved context; no env reread.
     this.execution = opts.execution ?? createQueryExecutionContext(resolveLegacyQueryPolicy({ ...requestedQueryPolicy(process.env),
@@ -198,7 +204,7 @@ export class QueryPool {
     this.maxSize = concurrency.kind === 'finite' ? concurrency.maximum : Infinity;
     this.softTimeoutMs = opts.execution ? (deadline.kind === 'finite' ? deadline.milliseconds : null) : opts.softTimeoutMs ?? (deadline.kind === 'finite' ? deadline.milliseconds : null);
     this.maxRetries = opts.maxRetries ?? 1;
-    this.createWorker = opts.createWorker ?? (() => new Worker(WORKER_FILE, { workerData: { root: this.root, execution: this.execution } }));
+    this.createWorker = opts.createWorker ?? (() => new Worker(WORKER_FILE, { workerData: { root: this.root, projectRoute: this.projectRoute, execution: this.execution } }));
     this.startSettleMs = opts.startSettleMs ?? WORKER_START_SETTLE_MS;
     if (opts.warmWorker !== false) this.spawnOne(); // preserve standalone callers
   }

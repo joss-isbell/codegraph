@@ -203,8 +203,15 @@ function removeDaemonArtifacts(root: string, expectedLockContents: string | null
   return true;
 }
 
-/** Remove daemon artifacts only when no matching daemon answers the socket hello. */
-export async function clearStaleDaemonArtifacts(root: string): Promise<boolean> {
+/** Remove daemon artifacts only when no matching daemon answers the socket hello.
+ * Query admission supplies its stricter native-absence observation instead of
+ * treating the legacy boolean identity probe's timeout/unproved peer as absent.
+ * The exact inspected record and exclusive writer fence still govern removal.
+ */
+export async function clearStaleDaemonArtifacts(root: string, unavailable?: {
+  readonly expectedLockContents: string;
+  readonly confirm: () => Promise<boolean>;
+}): Promise<boolean> {
   const pidPath = getDaemonPidPath(root);
   const hadArtifacts = fs.existsSync(pidPath) || (
     process.platform !== 'win32' && getDaemonSocketCandidates(root).some((p) => fs.existsSync(p))
@@ -216,7 +223,10 @@ export async function clearStaleDaemonArtifacts(root: string): Promise<boolean> 
     lockContents = fs.readFileSync(pidPath, 'utf8');
     info = decodeLockInfo(lockContents);
   } catch { /* missing/corrupt */ }
-  if (info && isProcessAlive(info.pid)) {
+  if (unavailable) {
+    if (lockContents !== unavailable.expectedLockContents || !info || !canProbeDaemonIdentity(info)
+      || !await unavailable.confirm()) return false;
+  } else if (info && isProcessAlive(info.pid)) {
     // A live legacy holder has no socket path to probe. That is inconclusive,
     // not proof of PID reuse, so preserve its lock rather than risk two writers.
     if (!canProbeDaemonIdentity(info) || await probeDaemonIdentity(info)) return false;

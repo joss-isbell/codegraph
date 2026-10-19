@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { Worker } from 'worker_threads';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -11,6 +11,11 @@ import { QueryPool } from '../src/mcp/query-pool';
 import { createQueryExecutionContext, createQueryRequestContext } from '../src/mcp/query-context';
 import { resolveQueryPolicy } from '../src/mcp/query-policy';
 import type { MCPEngine } from '../src/mcp/engine';
+import { pathToFileURL } from 'url';
+import { Client } from './query-unlimited-mcp-fixture';
+import { parseQueryDiagnostics } from './query-diagnostics-helper';
+import { getWriterPidPath, markWriterReady, readWriterLock, releaseWriterLock, tryAcquireWriterLock } from '../src/mcp/writer-lock';
+import { removeSpawnLog, settleLosingCandidates } from './daemon-candidates';
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 async function until(check: () => boolean, timeout = 5000): Promise<void> {
@@ -290,44 +295,101 @@ describe('actual MCP cancellation and disconnect', () => {
   }, 35000);
 
   it('does not start cancelled status measurement after explicit project activation while a peer completes', async () => {
-    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cancel-activation-')));
-    const explicit = path.join(root, 'explicit'); fs.mkdirSync(explicit);
-    for (const project of [root, explicit]) {
-      fs.writeFileSync(path.join(project, 'app.ts'), 'export function cancellationSymbol() { return 1; }\n');
-      const cg = await CodeGraph.init(project); await cg.indexAll(); cg.close();
-    }
-    const { MCPEngine: BuiltEngine } = require('../dist/mcp/engine');
-    const freshness = require('../dist/mcp/index-freshness');
-    const engine = new BuiltEngine({ watch: false, queryPolicy: resolveQueryPolicy({ poolSize: '0' }, 'direct', 8) });
-    await engine.ensureInitialized(root);
-    let release!: () => void, entered = false;
-    const gate = new Promise<void>(resolve => { release = resolve; });
-    engine.getToolHandler().setProjectLifecycle({ open: (_root, open) => open(),
-      activate: async cg => { entered = true; await gate; await cg.sync(); }, release: cg => { cg.close(); } });
-    const measurement = vi.spyOn(freshness, 'measurePendingChanges');
-    const connection = await connectSessions(engine, root);
+    const fixture = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cancel-activation-')));
+    const root = path.join(fixture, 'alpha'), explicit = path.join(fixture, 'beta');
+    const observations = path.join(fixture, 'workers.jsonl'), cancelledId = 'cold-explicit-status';
+    const events = (): any[] => {
+      if (!fs.existsSync(observations)) return [];
+      if (fs.statSync(observations).size > 1024 * 1024) throw new Error('Cold activation observation overflow');
+      return fs.readFileSync(observations, 'utf8').split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line));
+    };
+    let client: Client | undefined, owner: CodeGraph | undefined, ownsWriter = false, primary: unknown;
+    const cleanup: Array<{ phase: string; failure: string | null }> = [];
     try {
-      connection.send(0, { id: 1, method: 'tools/call', params: { name: 'codegraph_status', arguments: { projectPath: explicit } } });
-      await until(() => entered);
-      connection.send(1, { id: 1, method: 'tools/call', params: { name: 'codegraph_explore', arguments: { projectPath: explicit, query: 'cancellationSymbol' } } });
-      connection.send(0, { method: 'notifications/cancelled', params: { requestId: 1 } });
-      await sleep(50); release();
-      await until(() => connection.output[1].includes('cancellationSymbol'));
-      expect(measurement).not.toHaveBeenCalled();
-      expect(connection.output[0]).toBe('');
-      expect(connection.sessions[0].getExploreSessionState().view().projects).toHaveLength(0);
-      expect(connection.sessions[1].getExploreSessionState().view().projects[0].callCount).toBe(1);
-      // Call through the real status measurement once to prove the observation
-      // detects its owner seam, with no mock SQLite or moved status authority.
-      connection.send(1, { id: 2, method: 'tools/call', params: { name: 'codegraph_status', arguments: { projectPath: explicit } } });
-      await until(() => connection.output[1].includes('Changes since index'), 12000);
-      expect(measurement).toHaveBeenCalledTimes(1);
-      record({ scenario: 'activation-cancelled-status', cancelledMeasurements: 0, peerMeasurements: 1, peerHistory: 1, victimHistory: 0 });
-    } finally {
-      release(); measurement.mockRestore(); await connection.close(); await engine.stop();
-      fs.rmSync(root, { recursive: true, force: true });
+      for (const [project, source] of [[root, 'export function alphaForeignCancellationSymbol() { return 17; }\n'],
+        [explicit, 'export function betaCancellationPeerSymbol() { return 29; }\n']]) {
+        fs.mkdirSync(project); fs.writeFileSync(path.join(project, 'app.ts'), source);
+        const graph = await CodeGraph.init(project);
+        try { await graph.indexAll(); } finally { graph.close(); }
+      }
+      // The test process is a genuine live native writer. Its ordinary atomic
+      // readiness publication, not a replacement lifecycle, releases catch-up.
+      const acquired = tryAcquireWriterLock(explicit, 'direct');
+      expect(acquired.kind).toBe('acquired'); ownsWriter = acquired.kind === 'acquired';
+      owner = await CodeGraph.open(explicit);
+      expect(readWriterLock(explicit)).toMatchObject({ pid: process.pid, mode: 'direct', ready: false });
+      const index = fs.realpathSync(path.join(explicit, '.codegraph/codegraph.db'));
+      client = new Client(root, 'direct', observations, path.join(fixture, 'unused-release'), 'finite-no-deadline', {
+        preload: path.join(__dirname, 'fixtures/query-cold-activation-preload.cjs'),
+        environment: { QUERY_COLD_ACTIVATION_WRITER: getWriterPidPath(explicit), QUERY_COLD_ACTIVATION_INDEX: index },
+      });
+      expect((await client.request('initialize', { protocolVersion: '2024-11-05', capabilities: {},
+        clientInfo: { name: 'cold-activation-cancellation', version: '1' }, rootUri: pathToFileURL(root).href })).serverInfo.name).toBe('codegraph');
+      const cold = parseQueryDiagnostics(await client.request('tools/call', { name: 'codegraph_status', arguments: {} }));
+      expect(cold.lifecycle).toMatchObject({ state: 'cold', workers: 0 });
+      expect(events().filter(event => event.event === 'explicit-native-open')).toEqual([]);
+      client.child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: cancelledId, method: 'tools/call',
+        params: { name: 'codegraph_status', arguments: { projectPath: explicit } } }) + '\n');
+      // A genuine RO SQLite open followed by later ready:false native reads
+      // proves the cold activation is awaiting its live owner asynchronously.
+      await until(() => {
+        const observed = events(), opened = observed.find(event => event.event === 'explicit-native-open' && event.readOnly);
+        return !!opened && observed.some(event => event.event === 'explicit-writer-observed'
+          && event.owner.pid === process.pid && event.owner.ready === false
+          && BigInt(event.monotonicNs) - BigInt(opened.monotonicNs) >= 20_000_000n);
+      }, 12000);
+      expect(client.replies.filter(reply => reply.id === cancelledId)).toEqual([]);
+      const peer = client.request('tools/call', { name: 'codegraph_explore',
+        arguments: { projectPath: explicit, query: 'betaCancellationPeerSymbol' } });
+      void peer.catch(() => {});
+      client.child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: cancelledId } }) + '\n');
+      await client.request('ping');
+      expect(client.replies.filter(reply => reply.id === cancelledId)).toEqual([]);
+      expect(events().filter(event => event.event === 'session-history')).toEqual([]);
+      markWriterReady(explicit);
+      expect(readWriterLock(explicit)).toMatchObject({ pid: process.pid, ready: true });
+      const result = await peer;
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain('export function betaCancellationPeerSymbol() { return 29; }');
+      expect(result.content[0].text).toContain('app.ts');
+      expect(result.content[0].text).not.toContain('alphaForeignCancellationSymbol');
+      const status = await client.request('tools/call', { name: 'codegraph_status', arguments: { projectPath: explicit } });
+      expect(status.content[0].text).toContain('Changes since index');
+      const active = parseQueryDiagnostics(status);
+      expect(active.project).toEqual({ route: 'explicit', root: explicit, index });
+      expect(active.ownership).toEqual(cold.ownership); expect(active.ownership.pid).toBe(client.child.pid);
+      expect(active.lifecycle).toMatchObject({ state: 'active', dispatch: 'worker', workers: 1, queued: 0, executing: 0 });
+      await client.request('ping');
+      expect(client.replies.filter(reply => reply.id === cancelledId)).toEqual([]);
+      expect(events().filter(event => event.event === 'session-history')).toEqual([
+        expect.objectContaining({ query: 'betaCancellationPeerSymbol', projectRoot: explicit, index: 1 })]);
+      expect(events().filter(event => event.event === 'call-start')).toEqual([
+        expect.objectContaining({ query: 'betaCancellationPeerSymbol', context: expect.objectContaining({ project: active.project }) })]);
+    } catch (error) { primary = error; throw error; }
+    finally {
+      const attempt = async (phase: string, action: () => Promise<unknown>) => {
+        try { await action(); cleanup.push({ phase, failure: null }); }
+        catch (error) { cleanup.push({ phase, failure: String(error).slice(0, 2048) }); }
+      };
+      if (ownsWriter) markWriterReady(explicit);
+      if (client) await attempt('native-client-close', () => client!.close());
+      for (const project of [root, explicit]) await attempt('losing-candidates-' + path.basename(project), () => settleLosingCandidates(project, () => process.pid));
+      await attempt('native-writer-close', async () => { owner?.close(); owner = undefined; });
+      if (!owner && ownsWriter) await attempt('writer-release', async () => {
+        releaseWriterLock(explicit); expect(readWriterLock(explicit)).toBeNull();
+      });
+      await attempt('all-workers-exited', async () => {
+        const observed = events();
+        expect(observed.filter(event => event.event === 'exit')).toHaveLength(observed.filter(event => event.event === 'spawn').length);
+      });
+      record({ scenario: 'activation-cancelled-public-status', root, explicit, cancelledId, events: events(),
+        capture: client?.capture(), replies: client?.replies, primary: primary instanceof Error ? primary.stack : String(primary ?? ''), cleanup });
+      if (cleanup.every(item => item.failure === null)) {
+        for (const project of [root, explicit]) removeSpawnLog(project);
+        fs.rmSync(fixture, { recursive: true, force: true });
+      } else if (!primary) throw new Error('Cold activation cleanup incomplete: ' + JSON.stringify(cleanup));
     }
-  }, 20000);
+  }, 60000);
 
   it.each(['running-cancel', 'queued-cancel', 'running-disconnect', 'queued-disconnect', 'session-stop'])
   ('suppresses %s delivery and history while the other shared session with the same id survives', async signal => {

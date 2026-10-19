@@ -74,6 +74,236 @@ or final evidence, transient mutations and malformed/tampered receipts. Its
 unrelated sentinel must survive. Linux additionally proves that an adopted
 descendant's natural exit becomes observable while the producer remains live.
 
+## Windows input-integrity lifecycle
+
+New runner receipts use `codegraph-validation-v2` and an explicit platform
+integrity profile; historical v1 receipts retain their original meaning.
+The `windows-guard-v2` profile uses one aggregate `windows_witness.Guard` through
+`integrity.WindowsInputs`: actual native arming precedes a repeated full
+input baseline and target release. The observer stays active through process
+cleanup and the final input read. Its frozen closed ledger must establish
+timely startup, final native drain, joined readers, checked namespace identity
+and checked handle closure, exactly matching the Guard's selected watch and
+retained namespace domains; advisory snapshots cannot pass the reporting
+consumer. The complete terminal integrity file is compact JSON bounded to
+64 MiB, with bounded readback. Every new v2 receipt uses this finite integrity
+reader, including the Linux profile; historical v1 is not upgraded. Schema,
+profile, runtime and saved-plan mismatches refuse before integrity hashing or
+decoding, not after an unbounded read. Oversize is a whole failure, not an accepted
+row prefix. Startup has one 30-second maximum and close one 8-second maximum,
+not fresh budgets per directory. Keep an enclosing bounded owner for stalled
+native calls; incomplete observation never becomes acceptance.
+
+Current-runner artifact bindings use the host's literal `Path` identity rules:
+Windows case/separator aliases name the same binding, and equivalent keys with
+conflicting digests refuse before integrity evidence I/O. Ordinary route checks
+precede current-runner byte reads; resolution does not erase a linked route.
+Removing every new receipt/plan marker cannot reinterpret a binding to today's
+exact runner bytes as genuine historical-v1 evidence.
+
+Supported Windows inputs use literal ordinary local fixed-drive DOS paths,
+with native case-insensitive directories and actual same-object/path identity
+joins. UNC, device/extended syntax, subst/mapped/removable/virtual drives,
+reparse declared-root/ancestor routes, case-sensitive directories and unavailable native identity
+queries fail closed rather than inheriting weaker legacy guarantees. Retained
+directory handles require `FILE_LIST_DIRECTORY|FILE_READ_ATTRIBUTES`
+on every retained ancestor and leaf, with read/write sharing but no delete
+sharing. Denied or unknown access vetoes startup before target release;
+attributes-only fallback is not a supported mode.
+The source-only policy suppresses existing-directory modified timestamps caused
+by allowed child output; it does not promise transient directory-timestamp
+assurance. Strict artifact events retain their higher precedence.
+
+Source exclusions still permit generated outputs. Explicit artifacts are
+strict, including nested `__pycache__` content, and override source exclusions.
+On Windows, the input inventory visits members without following reparse
+points. It binds exact bounded junction/symlink reparse bytes and membership,
+not just the final resolved target. A nested link in an artifact or nonskipped
+source path is admitted only when its literal target route is ordinary on
+every component and is independently covered by an explicit strict artifact
+declaration. That actual target is also declared to the Guard for retained
+route identity. Dangling, unsupported, parent-traversing or linked-chain targets
+and undeclared targets refuse before target release. Do not resolve a linked
+declaration first or exempt all junctions/caches. The inventory caps members
+at 262144, link records at 4096, each native reparse record at 16 KiB and its
+conservative metadata domain at 64 MiB; overflow fails, never drops members.
+For example, a workspace dependency junction to ordinary `ui` requires `ui`
+as a strict artifact. A build writing `ui/dist` cannot use an unchanged strict
+whole-`ui` declaration; separate its mutable output rather than weakening the
+input policy. Ordinary viewer output outside `ui` is a different plan.
+The runner actually sets and records `PYTHONDONTWRITEBYTECODE=1` for children
+so importing validation helpers does not mutate those immutable inputs.
+The copied-B recovery caller uses the same Windows implementation and keeps
+its final component read under observation. Linux retains its existing inotify
+implementation and is labelled separately, not promoted to Windows guarantees.
+
+`integrity-tests.py` is the focused normal-caller check: real runner/receipt/
+report outcomes for generated writes, source write/restore, strict cached
+artifact mutation and separately declared ordinary junction targets; actual
+undeclared/linked-chain target preflight vetoes; rejection probes derived from a real completed receipt
+and the recovery-compatible single-Witness interface. Run it only through the
+same bounded outer supervision contract with a new output directory. It is not
+a substitute for the reusable native module's qualification or product suites.
+Its real clean positive enters the current runner CLI through a Windows case
+alias. Derived negatives strip every new marker and the closed lifecycle, or
+introduce conflicting equivalent artifact keys. Oversize checks share one
+readonly 64MiB+1 file; their v2 and stripped-plan phases retain exact raw plans
+and explicit replay contexts, then restore the active plan in `finally`.
+Phase-specific receipts are not all reconsumable under one simultaneous plan.
+
+The focused and existing selftest plan builders explicitly redeclare an actual
+configured `PYTHONPYCACHEPREFIX` when it matches `sys.pycache_prefix`, so nested
+runner gates/targets preserve an enclosing source-bound cache route despite the
+runner's inherited-`PYTHON*` scrub. No prefix is invented for standalone callers
+without one; the normal environment isolation policy and scenario counts stay
+unchanged. A wrapper using an immutable absent cache prefix must protect that
+absence for the complete observation; `-B` alone does not disable cache reads.
+
+### Source-bound normal Windows caller
+
+Use `launch-normal.ps1 -Plan <saved-plan.json> -LaunchOutput <new-launch-dir>`
+for normal source-bound builds and selected query tests. The plan must
+prospectively declare a fresh absent ordinary local path with an existing
+ordinary parent:
+
+```json
+{
+  "sourceBoundCache": {"prefix": "C:\\owned\\evidence\\absent-cache-attempt-1"},
+  "environment": {
+    "PYTHONPYCACHEPREFIX": "C:\\owned\\evidence\\absent-cache-attempt-1",
+    "PYTHONDONTWRITEBYTECODE": "1"
+  }
+}
+```
+
+Keep the existing plan's other required fields. Build plans retain their
+ordinary command `[python, stage.py, "build"]`; selected-test plans retain
+`[python, query-tests.py, suite]` and their declared exact test selection. The
+launcher uses the declared prefix and selected Python runtime, launching with
+`-B -X pycache_prefix=<prefix>` and the matching environment, and adds an
+enclosing hard deadline/log bound; it does not replace the runner's owned Job
+cleanup. `normal.py` refuses a missing, existing, mismatched or undeclared cache
+route before loading helpers, executes the runner/report/integrity/Windows
+witness from captured raw `.py` bytes, and invokes the original `runner.run`.
+
+The runner reconciles every executed raw-helper digest against its complete
+post-native-arm immutable binding before releasing the target. Its existing
+single `WindowsInputs` Guard additionally protects the prefix's absence, with
+the same native watch/retained namespace closure and close deadline. The saved
+plan environment carries that exact prefix through the existing gate and child
+adapters. Terminal evidence records the selected absent domain and the final
+absence read under observation; the actual report consumer checks those joins,
+the complete closed ledger and the bound raw helper sources. A transient prefix
+creation/removal therefore fails even if the terminal path is absent. No cache
+directory is created or removed by this route.
+
+For read-only receipt replay, launch the same interpreter with the saved prefix,
+`-B`, matching environment and `normal.py <attempt/plan.json> --report
+<attempt/receipt.json>`. The prefix must still be absent and the bound helper
+bytes unchanged. Legacy plans without `sourceBoundCache` still use `runner.py`
+and retain their original policy; they are not upgraded to this source-bound
+assurance by `-B` alone. Neither route constitutes product acceptance until the
+complete selected producer and consumer tail passes.
+
+### Describe and launch reviewed Windows inputs
+
+`normal.py PLAN --binding OUTPUT.json` uses the same raw-source loader and the
+runner's authoritative source/artifact selection, including its interpreter
+and complete helper directory. The JSON shape is the existing `source-before`
+shape: commit, dirty delta, file digests, root-inclusive membership and reparse
+records. It creates only the requested new file, outside source/artifacts,
+target output and the absent cache route. It starts no target or native input
+observation and creates no home/cache/acceptance receipt. Malformed runnable
+plans, invalid supervision bounds and an existing output refuse.
+
+Use the existing bounded launcher for this read-only command as well:
+
+```powershell
+$pythonExe = 'C:\Users\atramenta\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'
+$planFile = 'C:\owned\final-plan.json'
+$bindingFile = 'C:\owned\frozen-binding.json'
+pwsh -NoProfile -File scripts/validation/launch-normal.ps1 `
+  -Plan $planFile -Python $pythonExe -LaunchOutput C:\owned\describe-launch `
+  -BindingOutput $bindingFile -DeadlineSeconds 60
+if ($LASTEXITCODE -ne 0) { throw 'Input description failed.' }
+```
+
+Finalize the selected plan and its applicable controlling inputs **before**
+this description. Declare the plan itself and those control files as strict
+artifacts. Reconcile the candidate source/build/dependency maps and existing
+release/proof references against their reviewed values before freezing the
+expectation; reject conflicting inherited digests instead of choosing the
+latest value. The description is current observation, not proof of that
+provenance. An old saved map is not a new observation, and a changed plan or
+control set needs a newly prepared expectation. No extra review/resource
+documents are required by these commands.
+
+The prospective caller is `launch-reviewed.py`. Its one frozen JSON input has
+the fields below; `binding` is the entire parsed description, not counts or a
+subset. `controls` holds the applicable existing `{path, sha256}` reference
+records with their previously reviewed digests (it may be empty). The selected
+plan is checked separately and is always a strict artifact. For example, after
+the provenance reconciliation above, prepare it in PowerShell:
+
+```powershell
+$selected = Get-Content -LiteralPath $planFile -Raw | ConvertFrom-Json -AsHashtable
+$frozen = Get-Content -LiteralPath $bindingFile -Raw | ConvertFrom-Json -AsHashtable
+$reviewedControls = @() # Populate from the selected run's existing reviewed references.
+function Read-GitFacts([string[]]$Arguments) {
+  $rows = @(& git -C $selected.sourceRoot @Arguments)
+  if ($LASTEXITCODE -ne 0) { throw 'Git identity read failed.' }
+  return $rows
+}
+$review = [ordered]@{
+  plan = @{path=$planFile; sha256=(Get-FileHash -LiteralPath $planFile -Algorithm SHA256).Hash.ToLowerInvariant()}
+  binding = $frozen
+  controls = $reviewedControls
+  git = @{tree=(Read-GitFacts @('rev-parse','HEAD^{tree}')); branch=(Read-GitFacts @('branch','--show-current')); status=@(Read-GitFacts @('status','--porcelain=v1'))}
+  python = $pythonExe
+  powershell = (Get-Command pwsh).Source
+  inheritedTEMP = $env:TEMP
+  inheritedTMP = $env:TMP
+  launchOutput = 'C:\owned\selected-launch'
+  deadlineSeconds = 900
+}
+$reviewFile = 'C:\owned\reviewed-launch.json' # Outside the observed input roots.
+$review | ConvertTo-Json -Depth 32 | Out-File -LiteralPath $reviewFile -Encoding utf8 -NoClobber
+$reviewHash = (Get-FileHash -LiteralPath $reviewFile -Algorithm SHA256).Hash.ToLowerInvariant()
+& $pythonExe -I -S -B scripts/validation/launch-reviewed.py $reviewFile `
+  --sha256 $reviewHash --output C:\owned\immediate-preflight
+if ($LASTEXITCODE -ne 0) { throw 'Reviewed launch did not pass.' }
+```
+
+Retain the frozen review-file digest with the selected launch instruction;
+do not replace it with a new digest after an unexpected change. The caller
+checks exact parsed maps, control/interpreter/caller hashes, Git commit/tree/
+branch/status, inherited TEMP/TMP, absent process/plan name filters and fresh
+endpoints. It invokes `normal.py --binding` through `launch-normal.ps1` before
+comparing, then delegates dispatch and native exit/cleanup checks to that same
+ordinary launcher. Directory/member totals in `preflight.json` are display
+only. Add `--check-only` with its own fresh `--output` for static feedback
+without dispatch; neither that success nor a matching description is target
+acceptance. A normal run and its complete consumer tail still decide that.
+This full-selection caller deliberately rejects `QUERY_TEST_NAME_PATTERN`;
+ordinary explicitly filtered focused plans retain their existing launcher.
+
+Keep inputs quiet between the comparison and native arming. This extension
+does not add an armed expected-binding protocol or close that existing
+interval. Expectation and preflight outputs stay outside observed roots to
+avoid circular control hashes. Historical callers/results stay unchanged.
+
+For focused helper feedback, run `integrity-tests.py --binding-only` in a saved
+normal bounded plan with scenario `windows-inputs` and environment
+`BINDING_POWERSHELL` set to the absolute `pwsh` executable. This selection
+uses disposable source/helper copies and a real normal run/report, and checks
+added/missing/changed strict helpers, root-inclusive directories, same-count
+membership changes, refusal paths and real reviewed dispatch. The existing
+`query-adapter-proof.py` synthetic fixture also preserves exact case-sensitive
+`(file, fullName)` identities; place its fresh output beneath the checkout's
+`.validation` so copied adapters can resolve the checkout's unchanged Vitest
+dependencies. A workspace dependency junction's ordinary `ui` target remains
+an independently declared strict input.
+
 ## Protected baseline and observation protocol
 
 `prepare.py` preserves the exact baseline Git archive and initial dirty-delta

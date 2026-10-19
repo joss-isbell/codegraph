@@ -293,7 +293,7 @@ describe.runIf(process.platform !== 'win32')('a real SQLite I/O error on open', 
 
     it('keeps the fix on the per-call retry path', async () => {
       engine = new BuiltMCPEngine({ watch: false });
-      engine.retryInitializeSync(root);
+      await engine.retryInitialize(root);
       expectGuidance(await engine.getToolHandler().execute('codegraph_search', { query: 'parseToken' }));
     });
 
@@ -304,9 +304,9 @@ describe.runIf(process.platform !== 'win32')('a real SQLite I/O error on open', 
 
     it('serves normally once the index opens again', async () => {
       engine = new BuiltMCPEngine({ watch: false });
-      engine.retryInitializeSync(root);
+      await engine.retryInitialize(root);
       fs.rmSync(`${dbPath}-shm`, { force: true });
-      engine.retryInitializeSync(root);
+      await engine.retryInitialize(root);
       const result = await engine.getToolHandler().execute('codegraph_search', { query: 'parseToken' });
       expect(result.isError).not.toBe(true);
       expect(result.content[0]!.text).toContain('parseToken');

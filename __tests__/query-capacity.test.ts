@@ -10,6 +10,10 @@ import { CodeGraph } from '../src';
 import { ToolHandler } from '../src/mcp/tools';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import { pathToFileURL } from 'url';
+import { Client } from './query-unlimited-mcp-fixture';
+import { parseQueryDiagnostics } from './query-diagnostics-helper';
+import { removeSpawnLog, settleLosingCandidates } from './daemon-candidates';
 
 const execution = () => createQueryExecutionContext(resolveQueryPolicy({ poolSize: '2', busyTimeoutMs: 'unlimited' }, 'direct', 8),
   { readOnly: false, writer: true, synchronization: true });
@@ -140,25 +144,73 @@ describe('dispatcher keeps configured pooling authoritative', () => {
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   }, 20000);
   it.each(['default', 'explicit'])('queues the cold %s project read and keeps status on the owner', async route => {
-    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cold-dispatch-')));
-    fs.writeFileSync(path.join(root, 'app.ts'), 'export function coldSymbol() { return 42; }\n');
-    const cg = await CodeGraph.init(root);
-    await cg.indexAll();
-    const context = execution();
-    const handler = new ToolHandler(route === 'default' ? cg : null, context);
-    handler.setProjectLifecycle({ open: project => CodeGraph.openSync(project), activate: async () => {}, release: graph => graph.close() });
-    const pool = new QueryPool({ root: null, execution: context,
-      createWorker: () => new Worker(path.join(__dirname, 'fixtures/query-capacity-worker.cjs'), { workerData: { readyDelay: 150 } }) });
-    handler.setQueryPool(pool);
+    const fixture = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cold-dispatch-')));
+    const roots = [path.join(fixture, 'alpha'), path.join(fixture, 'beta')];
+    const symbols = ['alphaColdCapacitySymbol', 'betaColdCapacitySymbol'];
+    const observations = path.join(fixture, 'workers.jsonl');
+    const events = (): any[] => {
+      if (!fs.existsSync(observations)) return [];
+      if (fs.statSync(observations).size > 1024 * 1024) throw new Error('Cold dispatch observation overflow');
+      return fs.readFileSync(observations, 'utf8').split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line));
+    };
+    let client: Client | undefined, primary: unknown;
+    const cleanup: Array<{ phase: string; failure: string | null }> = [];
     try {
-      expect(pool.ready).toBe(false);
-      const result = await handler.execute('codegraph_search', { query: 'coldSymbol', ...(route === 'explicit' ? { projectPath: root } : {}) });
-      expect(result.content[0].text).toMatch(/^worker:\d+:job:1$/);
-      const status = await handler.execute('codegraph_status', { projectPath: root });
-      expect(status.content[0].text).not.toMatch(/^worker:/);
-      expect(status.isError).toBeFalsy();
-    } finally { await pool.destroy(); await handler.closeAll(); cg.close(); fs.rmSync(root, { recursive: true, force: true }); }
-  }, 10000);
+      for (const [index, root] of roots.entries()) {
+        fs.mkdirSync(root);
+        fs.writeFileSync(path.join(root, 'app.ts'), `export function ${symbols[index]}() { return ${index + 41}; }\n`);
+        const graph = await CodeGraph.init(root);
+        try { await graph.indexAll(); } finally { graph.close(); }
+      }
+      client = new Client(roots[0], 'direct', observations, path.join(fixture, 'unused-release'), 'finite-no-deadline', { noWatch: true });
+      expect((await client.request('initialize', { protocolVersion: '2024-11-05', capabilities: {},
+        clientInfo: { name: 'cold-capacity', version: '1' }, rootUri: pathToFileURL(roots[0]).href })).serverInfo.name).toBe('codegraph');
+      const selected = route === 'explicit' ? 1 : 0;
+      const args = route === 'explicit' ? { projectPath: roots[selected] } : {};
+      const status = async () => parseQueryDiagnostics(await client!.request('tools/call', { name: 'codegraph_status', arguments: args }));
+      const cold = await status();
+      expect(cold.project).toEqual({ route, root: roots[selected], index: fs.realpathSync(path.join(roots[selected], '.codegraph/codegraph.db')) });
+      expect(cold.effective).toMatchObject({ executionMode: 'direct', concurrency: { kind: 'finite', maximum: 2 }, deadline: { kind: 'absent' } });
+      expect(cold.ownership).toMatchObject({ pid: client.child.pid, resourceScope: 'local-engine', capability: 'read-write' });
+      expect(cold.lifecycle).toMatchObject({ state: 'cold', dispatch: 'worker', workers: 0, queued: 0, executing: 0 });
+      expect(events().filter(event => event.event === 'spawn' || event.event === 'call-start')).toEqual([]);
+
+      // No default warm-up: the selected route is this host's first worker read.
+      const result = await client.query(symbols[selected], route === 'explicit' ? roots[selected] : undefined);
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain(symbols[selected]);
+      expect(result.content[0].text).toContain('app.ts:1');
+      expect(result.content[0].text).not.toContain(symbols[1 - selected]);
+      const active = await status();
+      expect(active.project).toEqual(cold.project); expect(active.ownership).toEqual(cold.ownership);
+      expect(active.effective).toEqual(cold.effective);
+      expect(active.lifecycle).toMatchObject({ state: 'active', dispatch: 'worker', ready: true, workers: 1, queued: 0, executing: 0 });
+      const observed = events(), starts = observed.filter(event => event.event === 'call-start');
+      expect(starts).toEqual([expect.objectContaining({ query: symbols[selected], pid: client.child.pid,
+        context: expect.objectContaining({ project: cold.project }) })]);
+      expect(starts[0].threadId).toBeGreaterThan(0);
+      expect(observed.filter(event => event.event === 'spawn')).toEqual([expect.objectContaining({ threadId: starts[0].threadId })]);
+      expect(observed.filter(event => event.event === 'result')).toHaveLength(1);
+    } catch (error) { primary = error; throw error; }
+    finally {
+      const attempt = async (phase: string, action: () => Promise<unknown>) => {
+        try { await action(); cleanup.push({ phase, failure: null }); }
+        catch (error) { cleanup.push({ phase, failure: String(error).slice(0, 2048) }); }
+      };
+      if (client) await attempt('native-client-close', () => client!.close());
+      for (const root of roots) await attempt('losing-candidates-' + path.basename(root), () => settleLosingCandidates(root, () => process.pid));
+      await attempt('all-workers-exited', async () => {
+        const observed = events();
+        expect(observed.filter(event => event.event === 'exit')).toHaveLength(observed.filter(event => event.event === 'spawn').length);
+      });
+      record({ scenario: 'cold-public-dispatch', route, roots, events: events(), capture: client?.capture(),
+        replies: client?.replies, primary: primary instanceof Error ? primary.stack : String(primary ?? ''), cleanup });
+      if (cleanup.every(item => item.failure === null)) {
+        for (const root of roots) removeSpawnLog(root);
+        fs.rmSync(fixture, { recursive: true, force: true });
+      } else if (!primary) throw new Error('Cold dispatch cleanup incomplete: ' + JSON.stringify(cleanup));
+    }
+  }, 60000);
   it.each([true, false])('does not escape to owner execution with zero live workers, recoverable=%s', async recoverable => {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-empty-dispatch-')));
     fs.writeFileSync(path.join(root, 'app.ts'), 'export function coldSymbol() { return 42; }\n');

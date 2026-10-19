@@ -17,40 +17,72 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { CodeGraph } from '../src';
 import { Daemon, tryAcquireDaemonLock, finalizeDaemonExit } from '../src/mcp/daemon';
 import { getDaemonPidPath, getDaemonSocketPath } from '../src/mcp/daemon-paths';
 
 const tmpRoots: string[] = [];
+const retainedFixtures = new Set<string>();
 afterEach(() => {
   while (tmpRoots.length) {
     const root = tmpRoots.pop()!;
+    if (retainedFixtures.has(root)) continue;
     try { fs.rmSync(root, { recursive: true, force: true }); } catch { /* best-effort */ }
   }
 });
 
 describe('Daemon.start() bind failure (#974)', () => {
   it.runIf(process.platform !== 'win32')('releases the lockfile it acquired when the socket cannot bind', async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bind-'));
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bind-')));
     tmpRoots.push(root);
 
-    // Acquire the lock exactly as the detached-daemon startup does.
-    const lock = tryAcquireDaemonLock(root);
-    expect(lock.kind).toBe('acquired');
-    const pidPath = getDaemonPidPath(root);
-    expect(fs.existsSync(pidPath)).toBe(true);
+    let sockPath: string | undefined, daemon: Daemon | undefined;
+    let restoreExit: (() => void) | undefined, previousExitCode: typeof process.exitCode;
+    let failed = false, primary: unknown, drained = false;
+    const cleanupFailure = (phase: string, error: unknown): void => {
+      if (!failed) { failed = true; primary = error; }
+      else try { process.stderr.write(`Bind fixture ${phase}: ${String(error).slice(0, 4096)}\n`); } catch { /* preserve primary */ }
+    };
+    try {
+      // An actual daemon requires its own existing DB. Prepare only this
+      // disposable fixture so refusal-before-schema cannot mask the bind path.
+      const graph = await CodeGraph.init(root); graph.close();
 
-    // Make the socket path un-bindable: a directory can't be unlink'd by the
-    // daemon's stale-socket clear, and listen() on it fails with EADDRINUSE.
-    const sockPath = getDaemonSocketPath(root);
-    fs.mkdirSync(sockPath, { recursive: true });
-    // The tmpdir-fallback socket path can live outside `root`; clean it too.
-    tmpRoots.push(sockPath);
+      // Keep preparation inside the same failure-retention boundary as start.
+      const lock = tryAcquireDaemonLock(root);
+      expect(lock.kind).toBe('acquired');
+      const pidPath = getDaemonPidPath(root);
+      expect(fs.existsSync(pidPath)).toBe(true);
 
-    const daemon = new Daemon(root);
-    await expect(daemon.start()).rejects.toThrow();
+      // A directory survives stale-socket clearing and makes listen fail.
+      sockPath = getDaemonSocketPath(root);
+      // Track the exact selected path even if mkdir creates it only partially.
+      tmpRoots.push(sockPath);
+      fs.mkdirSync(sockPath, { recursive: true });
 
-    // The lockfile must be gone so the next launcher doesn't spin on a stale lock.
-    expect(fs.existsSync(pidPath)).toBe(false);
+      // Install the restoration handle before configuring the spy or creating
+      // a daemon that must later be stopped without exiting the test process.
+      previousExitCode = process.exitCode;
+      const exit = vi.spyOn(process, 'exit');
+      restoreExit = () => exit.mockRestore();
+      exit.mockImplementation(() => undefined as never);
+      daemon = new Daemon(root);
+      await expect(daemon.start()).rejects.toThrow(/EADDRINUSE/);
+      // The lockfile must be gone so the next launcher doesn't spin on a stale lock.
+      expect(fs.existsSync(pidPath)).toBe(false);
+    } catch (error) { failed = true; primary = error; }
+    finally {
+      try { if (daemon) { await daemon.stop('bind fixture cleanup'); drained = true; } }
+      catch (error) { cleanupFailure('native cleanup failure', error); }
+      finally {
+        if (restoreExit) {
+          try { restoreExit(); } catch (error) { cleanupFailure('exit spy restore failure', error); }
+          try { process.exitCode = previousExitCode; } catch (error) { cleanupFailure('exitCode restore failure', error); }
+        }
+      }
+      if (failed || !drained) { retainedFixtures.add(root); if (sockPath) retainedFixtures.add(sockPath); }
+    }
+    if (failed) throw primary;
   });
 });
 

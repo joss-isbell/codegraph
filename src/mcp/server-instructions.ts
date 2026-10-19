@@ -91,6 +91,25 @@ ${QUERY_EXECUTION_GUIDANCE}
 `;
 
 /**
+ * Static handshake guidance before a default route has been verified.
+ * This one-time reply also needs the useful playbook if verification succeeds
+ * later, without predicting index absence or granting service authority.
+ */
+export const SERVER_INSTRUCTIONS_PENDING = `# Codegraph — default project verification pending
+
+Default project verification is pending. This connection has not yet verified
+its default project; that does not mean its root lacks an index, and does not
+grant query or writer permission.
+
+All configured tools remain available during verification. Pass \`projectPath\`
+to an indexed project when selecting one explicitly; actionable requests still
+wait for current route and service-policy checks. Once a default is verified,
+unqualified requests can use it. This initialize reply is a state snapshot,
+not a permission token; the query playbook below remains useful after verification.
+
+${SERVER_INSTRUCTIONS}`;
+
+/**
  * Instructions variant sent when the server's own root has NO codegraph index.
  *
  * The tools are still exposed (gating tool availability on whether `./` has an

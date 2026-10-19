@@ -442,8 +442,9 @@ describe('sessions sharing a daemon', () => {
     const engine = {
       ensureInitialized: async () => { /* already open */ },
       hasDefaultCodeGraph: () => true,
+      hasVerifiedDefaultRoute: () => true,
       getProjectPath: () => '/repo/shared',
-      retryInitializeSync: () => { /* nothing to retry */ },
+      retryInitialize: async () => { /* nothing to retry */ },
       getToolHandler: () => handler,
       getQueryExecutionContext: () => execution,
     } as unknown as MCPEngine;

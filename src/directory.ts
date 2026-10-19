@@ -497,6 +497,123 @@ export function resolveServerRoot(
   return { root: null, viaSubScan: false, candidates: subs };
 }
 
+/** Internal MCP routing: discovery is filesystem-only until this caller admits
+ * the exact own index. Public synchronous library/CLI helpers above retain
+ * their existing behavior and schema classification. */
+export interface McpIndexRoute { readonly root: string; readonly index: string }
+export interface McpRootResolution {
+  readonly route: McpIndexRoute | null;
+  readonly viaSubScan: boolean;
+  readonly candidates: readonly string[];
+}
+export interface McpResolutionOptions {
+  readonly admit: (route: McpIndexRoute, signal?: AbortSignal) => Promise<void>;
+  readonly signal?: AbortSignal;
+  readonly subprojectScan?: boolean;
+}
+export class McpIndexRouteUnavailableError extends Error {
+  constructor(readonly route: McpIndexRoute, readonly reason: 'missing' | 'changed' | 'invalid') {
+    super(`The admitted project at ${route.root} no longer has its verified own codegraph index (${reason}). ` +
+      'This call cannot use an ancestor index instead. Retry after its own index is available; ' +
+      'otherwise use your built-in tools (Read/Grep/Glob) for this project.');
+  }
+}
+
+function checkMcpCancellation(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    const error = new Error('CodeGraph request cancelled or abandoned.');
+    error.name = 'AbortError';
+    throw error;
+  }
+}
+
+/** Filesystem checks only: never interprets a database or opens SQLite. */
+export function captureMcpIndexRoute(root: string): McpIndexRoute | null {
+  const index = path.join(getCodeGraphDir(root), 'codegraph.db');
+  try {
+    if (!fs.statSync(index).isFile()) return null;
+    // Native realpaths supply the actual Windows casing for both identities.
+    // Unlike the rendezvous key, neither missing paths nor case-folded guesses
+    // can stand in for a verified root and its exact current own index.
+    return Object.freeze({ root: fs.realpathSync.native(root), index: fs.realpathSync.native(index) });
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return null;
+    throw new McpIndexRouteUnavailableError({ root, index }, 'missing');
+  }
+}
+
+/** Revalidate an already chosen route without permission or schema I/O. */
+export function assertMcpIndexRoute(route: McpIndexRoute): void {
+  try {
+    if (fs.realpathSync.native(route.root) !== route.root
+      || fs.realpathSync.native(path.join(getCodeGraphDir(route.root), 'codegraph.db')) !== route.index
+      || !fs.statSync(route.index).isFile()) {
+      throw new McpIndexRouteUnavailableError(route, 'changed');
+    }
+  } catch (error) {
+    if (error instanceof McpIndexRouteUnavailableError) throw error;
+    throw new McpIndexRouteUnavailableError(route, 'missing');
+  }
+}
+
+async function inspectMcpRoute(route: McpIndexRoute, options: McpResolutionOptions): Promise<boolean> {
+  checkMcpCancellation(options.signal);
+  assertMcpIndexRoute(route);
+  try { await options.admit(route, options.signal); }
+  catch (error) { checkMcpCancellation(options.signal); throw error; }
+  checkMcpCancellation(options.signal);
+  assertMcpIndexRoute(route);
+  // The captured filename is inspected only after permission, including when
+  // a small/empty or cached candidate can be classified without native I/O.
+  const initialized = hasCodeGraphSchema(route.index, fs.statSync(route.index));
+  assertMcpIndexRoute(route);
+  return initialized;
+}
+
+/** A held default/child/request route can never rediscover an ancestor. */
+export async function admitMcpRoute(
+  route: McpIndexRoute,
+  options: Pick<McpResolutionOptions, 'admit' | 'signal'>,
+): Promise<McpIndexRoute> {
+  const held = Object.freeze({ root: route.root, index: route.index });
+  if (!await inspectMcpRoute(held, options)) throw new McpIndexRouteUnavailableError(held, 'invalid');
+  return held;
+}
+
+export async function resolveMcpRoot(searchFrom: string, options: McpResolutionOptions): Promise<McpRootResolution> {
+  let current = path.resolve(searchFrom);
+  for (;;) {
+    checkMcpCancellation(options.signal);
+    const route = captureMcpIndexRoute(current);
+    if (route && await inspectMcpRoute(route, options)) return { route, viaSubScan: false, candidates: [] };
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  const base = path.resolve(searchFrom);
+  if (options.subprojectScan === false || !eligibleForSubprojectScan(base) || unsafeIndexRootReason(base) !== null) {
+    return { route: null, viaSubScan: false, candidates: [] };
+  }
+  const routes: McpIndexRoute[] = [];
+  const walk = async (dir: string, depth: number): Promise<void> => {
+    checkMcpCancellation(options.signal);
+    if (routes.length >= 64 || depth > 4) return;
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      if (routes.length >= 64) return;
+      checkMcpCancellation(options.signal);
+      if (!entry.isDirectory() || entry.name.startsWith('.') || SUBPROJECT_SCAN_SKIP.has(entry.name)) continue;
+      const child = path.join(dir, entry.name), route = captureMcpIndexRoute(child);
+      if (route && await inspectMcpRoute(route, options)) { routes.push(route); continue; }
+      await walk(child, depth + 1);
+    }
+  };
+  await walk(base, 1);
+  return { route: routes.length === 1 ? routes[0]! : null, viaSubScan: routes.length === 1, candidates: routes.map(route => route.root) };
+}
+
 /**
  * Unicode-aware word-boundary emulation for the keyword lists below. JS's `\b`
  * is ASCII-only — it fires only at `[A-Za-z0-9_]` edges — so it can never bound

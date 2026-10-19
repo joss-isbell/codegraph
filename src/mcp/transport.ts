@@ -190,6 +190,13 @@ abstract class LineBasedJsonRpcTransport implements JsonRpcTransport {
       return;
     }
 
+    await this.handleParsedValue(parsed);
+  }
+
+  /** Validate and dispatch an already parsed value without owning an input reader. */
+  protected async handleParsedValue(parsed: unknown): Promise<void> {
+    if (this.stopped) return;
+
     // Response to a server-initiated request (has id + result/error, no method).
     // Route it to the awaiting requester instead of the message handler — these
     // used to be dropped as "Invalid Request" because they carry no method.
@@ -261,6 +268,39 @@ abstract class LineBasedJsonRpcTransport implements JsonRpcTransport {
     if (obj.jsonrpc !== '2.0') return false;
     if (typeof obj.method !== 'string') return false;
     return true;
+  }
+}
+
+/**
+ * Internal carrier for a session behind an existing JSON-RPC input parser.
+ * The owner provides the output writer (encoded lines without a newline) and
+ * feeds parsed values. Dispatch remains concurrent so a running handler cannot block
+ * a later cancellation notification or response to a server-initiated request.
+ */
+export class ParsedMessageTransport extends LineBasedJsonRpcTransport {
+  constructor(private readonly writer: (line: string) => boolean | void) {
+    super();
+  }
+
+  start(handler: MessageHandler): void {
+    this.messageHandler = handler;
+  }
+
+  accept(parsed: unknown): Promise<void> {
+    return this.handleParsedValue(parsed);
+  }
+
+  stop(): void {
+    this.finish('Transport stopped');
+  }
+
+  protected write(line: string): boolean | void {
+    if (this.stopped) return false;
+    return this.writer(line);
+  }
+
+  protected idPrefix(): string {
+    return 'cg-srv';
   }
 }
 

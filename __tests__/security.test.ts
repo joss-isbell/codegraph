@@ -423,20 +423,16 @@ describe('MCP Input Validation', () => {
       },
       score: 1,
     }));
-    const fakeCg = {
-      searchNodes: () => many,
-      getFile: () => undefined,
-      // Search down-ranks generated files, and since #1500 that verdict comes
-      // from the index (path convention ∪ content banner) rather than the
-      // filename alone. No database here — none of these paths is generated.
-      generatedFilePredicate: () => () => false,
-    };
-    const fakeHandler = new ToolHandler(fakeCg as unknown as CodeGraph);
+    // Keep the real indexed graph, held route and admission; replace only the
+    // search output that this truncation case needs to make oversized.
+    const originalSearchNodes = cg.searchNodes;
+    cg.searchNodes = () => many as ReturnType<CodeGraph['searchNodes']>;
+    try {
+      const result = await handler.execute('codegraph_search', { query: 'x' });
 
-    const result = await fakeHandler.execute('codegraph_search', { query: 'x' });
-
-    expect(result.isError).toBeFalsy();
-    expect(result.content[0].text).toContain('... (output truncated)');
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain('... (output truncated)');
+    } finally { cg.searchNodes = originalSearchNodes; }
   });
 
   it('should reject non-string symbol in codegraph_impact', async () => {

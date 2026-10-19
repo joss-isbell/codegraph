@@ -106,6 +106,8 @@ function debug(msg: string): void {
 export interface WatchdogHandle {
   /** Stop heartbeating and shut the watchdog child down. Idempotent. */
   stop(): void;
+  /** Settles only on the actual native ChildProcess close event. */
+  readonly closed: Promise<void>;
 }
 
 /**
@@ -217,6 +219,10 @@ export function installMainThreadWatchdog(options: WatchdogOptions = {}): Watchd
     return null;
   }
 
+  // Install before any teardown: kill()/exit/error alone do not establish
+  // native close. The outer owner bounds its wait before replacing this child.
+  const closed = new Promise<void>(resolve => { child.once('close', () => resolve()); });
+
   const stdin = child.stdin;
   if (!stdin) {
     debug('child has no stdin pipe; not arming');
@@ -243,6 +249,7 @@ export function installMainThreadWatchdog(options: WatchdogOptions = {}): Watchd
 
   let stopped = false;
   return {
+    closed,
     stop(): void {
       if (stopped) return;
       stopped = true;

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { resolveQueryPolicy, resolveLegacyQueryPolicy, type QueryExecutionMode } from '../src/mcp/query-policy';
 
-describe('internal query policy', () => {
+describe('query policy compatibility and independent controls', () => {
   it('resolves the unlimited preset with independent finite overrides', () => {
     const policy = resolveQueryPolicy({ mode: ' unlimited ', poolSize: '00023' }, 'direct', 8);
     expect(policy.requested).toEqual({ mode: ' unlimited ', poolSize: '00023' });
@@ -57,13 +57,23 @@ describe('internal query policy', () => {
   it.each(['', ' ', 'Default', 'Unlimited', 'DEFAULT', 'unlimited x', '0'])('rejects mode %j with actionable guidance', (mode) => {
     expect(() => resolveQueryPolicy({ mode }, 'direct', 8)).toThrow(`CODEGRAPH_QUERY_MODE value ${JSON.stringify(mode)}; expected default or unlimited`);
   });
-  it.each(['', ' ', '-1', '+1', '1.0', '.5', '1e3', '0x10', 'NaN', 'Infinity', '-Infinity', 'abc', 'UNLIMITED', '1_000', '9007199254740992', '99999999999999999999999999999999999999'])
-  ('rejects pool size %j with setting, value and alternatives', (poolSize) => {
-    expect(() => resolveQueryPolicy({ poolSize }, 'direct', 8)).toThrow(`CODEGRAPH_QUERY_POOL_SIZE value ${JSON.stringify(poolSize)}; expected decimal whole numbers 0–9,007,199,254,740,991 or unlimited`);
+  // These spellings and fallback cases belonged to the existing public
+  // Number/floor parser. Revised #29 adds controls, not a syntax migration.
+  it.each([
+    ['', 2], [' ', 0], ['-1', 7], ['+1', 1], ['1.0', 1], ['.5', 0], ['1e3', 1000], ['0x10', 16],
+    ['NaN', 7], ['Infinity', 7], ['-Infinity', 7], ['abc', 7], ['UNLIMITED', 7], ['1_000', 7],
+    ['9007199254740992', 7], ['99999999999999999999999999999999999999', 7],
+  ] as const)('preserves legacy pool size %j as %i without a preset', (poolSize, maximum) => {
+    expect(resolveQueryPolicy({ poolSize }, 'direct', 8).concurrency)
+      .toEqual(maximum === 0 ? { kind: 'disabled' } : { kind: 'finite', maximum });
   });
-  it.each(['', ' ', '0', '999', '-1000', '+1000', '1000.0', '1e3', '0x1000', 'NaN', 'Infinity', 'abc', 'UNLIMITED', '2147483648', '9007199254740991'])
-  ('rejects timeout %j even when pooling is disabled', (busyTimeoutMs) => {
-    expect(() => resolveQueryPolicy({ poolSize: '0', busyTimeoutMs }, 'direct', 8)).toThrow(`CODEGRAPH_QUERY_BUSY_TIMEOUT_MS value ${JSON.stringify(busyTimeoutMs)}; expected decimal whole numbers 1,000–2,147,483,647 or unlimited`);
+  it.each([
+    ['', 45000], [' ', 45000], ['0', 45000], ['999', 45000], ['-1000', 45000], ['+1000', 1000],
+    ['1000.0', 1000], ['1e3', 1000], ['0x1000', 4096], ['NaN', 45000], ['Infinity', 45000],
+    ['abc', 45000], ['UNLIMITED', 45000], ['2147483648', 45000], ['9007199254740991', 45000],
+  ] as const)('preserves legacy timeout %j as %i without scheduling an overflowing timer', (busyTimeoutMs, milliseconds) => {
+    expect(resolveQueryPolicy({ poolSize: '1', busyTimeoutMs }, 'direct', 8).deadline)
+      .toEqual({ kind: 'finite', milliseconds });
   });
   it('accepts exact numeric boundaries, trimmed sentinels and leading zeroes', () => {
     expect(resolveQueryPolicy({ poolSize: ' 0009007199254740991 ', busyTimeoutMs: '02147483647' }, 'direct', 8).concurrency).toEqual({ kind: 'finite', maximum: 9007199254740991 });

@@ -296,7 +296,8 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(paths.some((p) => p.endsWith('/.codex/config.toml'))).toBe(true);
     // AGENTS.md sits at the project root, NOT under .codex/ — that's the
     // file Codex reads for repo instructions.
-    expect(paths.some((p) => p.endsWith('/AGENTS.md') && !p.includes('/.codex/'))).toBe(true);
+    expect(paths.filter((p) => p.endsWith('/AGENTS.md'))
+      .map((p) => path.relative(process.cwd(), p))).toEqual(['AGENTS.md']);
 
     const toml = fs.readFileSync(path.join(process.cwd(), '.codex', 'config.toml'), 'utf-8');
     expect(toml).toContain('[mcp_servers.codegraph]');

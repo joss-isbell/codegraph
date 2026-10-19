@@ -18,12 +18,12 @@ import { createQueryRequestContext } from './query-context';
 import { JsonRpcRequest, JsonRpcNotification, JsonRpcTransport, ErrorCodes } from './transport';
 import { MCPEngine } from './engine';
 import { tools } from './tools';
-import { SERVER_INSTRUCTIONS, SERVER_INSTRUCTIONS_NO_ROOT_INDEX } from './server-instructions';
+import { SERVER_INSTRUCTIONS, SERVER_INSTRUCTIONS_PENDING } from './server-instructions';
 import { CodeGraphPackageVersion } from './version';
-import { resolveServerRoot } from '../directory';
 import { getTelemetry, ClientInfo } from '../telemetry';
 import { getUpdateNotice } from '../upgrade/update-check';
 import { ExploreSessionState } from './explore-session-state';
+import { isServicePolicyRefusal, type ServicePolicyRefusal } from './query-service-compatibility';
 
 /**
  * MCP Server Info — kept on the session because some clients log it. The
@@ -113,6 +113,10 @@ export class MCPSession {
   private rootsAttempted = false;
   private resolvePromise: Promise<void> | null = null;
   private explicitProjectPath: string | null;
+  // Retain client selection even when its first attempt finds no index. A
+  // later retry must not silently substitute the launcher's CLI/cwd hint.
+  private selectedProjectHint: string | null = null;
+  private initialDefaultRefusal: ServicePolicyRefusal | null = null;
   /**
    * What `codegraph_explore` has already returned to THIS client, per project
    * (CG-17). Owned by the session, not the engine: the daemon shares one engine
@@ -172,6 +176,38 @@ export class MCPSession {
    */
   getExploreSessionState(): ExploreSessionState {
     return this.exploreSession;
+  }
+
+  /** Terminal only for the actual engine's initial-default outcome. Static
+   * discovery stays usable; this session retains sole tool-response ownership. */
+  refuseInitialDefault(refusal: ServicePolicyRefusal): void {
+    if (this.closed || this.initialDefaultRefusal) return;
+    this.initialDefaultRefusal = refusal;
+    for (const [id, lifetime] of this.requests) {
+      this.requests.delete(id);
+      lifetime.controller.abort();
+      this.sendInitialDefaultRefusal(id);
+    }
+    this.engine.cancelQuerySession(this.sessionId);
+  }
+
+  private sendInitialDefaultRefusal(id: string | number): void {
+    const refusal = this.initialDefaultRefusal;
+    if (!refusal) return;
+    // A broken outbound stream must not prevent aborting the other owned
+    // requests or replace the real permission refusal in the engine callback.
+    try {
+      this.transport.sendError(id, ErrorCodes.InternalError, refusal.message,
+        { code: refusal.code, reason: refusal.reason, projectRoot: refusal.projectRoot, guidance: refusal.guidance });
+    } catch (error) {
+      try { process.stderr.write(`[CodeGraph MCP] Terminal refusal delivery failed: ${String(error).slice(0, 512)}.\n`); }
+      catch { /* outbound streams are already unavailable */ }
+    }
+  }
+
+  private assertDefaultResolutionLive(): void {
+    if (this.initialDefaultRefusal) throw this.initialDefaultRefusal;
+    if (this.closed) throw new Error('MCP session closed during project resolution');
   }
 
   private async handleMessage(message: JsonRpcRequest | JsonRpcNotification): Promise<void> {
@@ -254,43 +290,32 @@ export class MCPSession {
     } else if (this.explicitProjectPath) {
       explicitPath = this.explicitProjectPath;
     }
+    if (params?.rootUri || params?.workspaceFolders?.[0]?.uri) this.selectedProjectHint = explicitPath;
+    else this.selectedProjectHint ??= explicitPath;
 
-    // Pick the instructions variant by the root's index state — synchronous
-    // and bounded (an existsSync walk-up plus, when that misses, the depth- and
-    // count-bounded workspace down-scan; no DB open, so the #172 respond-fast
-    // contract holds). This is the SAME resolution the engine's doInitialize
-    // runs (#1606), so the variant matches what the engine will actually adopt
-    // — a workspace whose single indexed sub-project becomes the default gets
-    // the full single-project playbook, race-free by construction (both sides
-    // compute it independently; no ordering between handshake and engine init
-    // is assumed). When the root ISN'T indexed (and nothing was adopted), send
-    // the per-project variant (tools are still exposed — see handleToolsList):
-    // it tells the agent there is no default project and to pass `projectPath`
-    // to any project that has a `.codegraph/`. Gating tool AVAILABILITY on
-    // whether `./` is indexed was the #964 bug — it broke monorepos (only
-    // sub-projects indexed) and never surfaced the tools after a mid-session
-    // `codegraph init`. When no explicit path is known yet (roots/list dance
-    // pending), cwd is the best predictor of where the default will resolve.
-    const indexed = resolveServerRoot(explicitPath ?? process.cwd()).root !== null;
+    // No schema probe chooses instructions before native caller permission.
+    // Only an already verified own index supports claiming a ready default.
+    const indexed = this.engine.hasVerifiedDefaultRoute();
 
     // Respond to the handshake BEFORE doing any heavy init — see issue #172.
     this.transport.sendResult(request.id, {
       protocolVersion: PROTOCOL_VERSION,
       capabilities: { tools: {} },
       serverInfo: SERVER_INFO,
-      instructions: initializeInstructions(indexed ? SERVER_INSTRUCTIONS : SERVER_INSTRUCTIONS_NO_ROOT_INDEX),
+      instructions: initializeInstructions(indexed ? SERVER_INSTRUCTIONS : SERVER_INSTRUCTIONS_PENDING),
     });
 
-    if (explicitPath) {
+    const selected = this.selectedProjectHint ?? explicitPath;
+    if (selected && !this.initialDefaultRefusal) {
       // Kick off engine init in the background. If another session in the
       // same daemon already opened the project, `ensureInitialized` is a
       // ~free no-op — N concurrent clients pay exactly one open.
-      this.resolvePromise = this.engine.ensureInitialized(explicitPath);
+      this.resolvePromise = this.engine.ensureInitialized(selected);
+      void this.resolvePromise.catch(() => { /* default calls retain the original typed refusal */ });
     }
   }
 
   private async handleToolsList(request: JsonRpcRequest): Promise<void> {
-    await this.retryInitIfNeeded();
     // Always expose the tools — even when the server root has no index. Gating
     // availability on whether `./` is indexed (the old behavior) breaks the
     // monorepo case where only sub-projects carry a `.codegraph/` (the agent
@@ -308,6 +333,7 @@ export class MCPSession {
   }
 
   private async handleToolsCall(request: JsonRpcRequest): Promise<void> {
+    if (this.initialDefaultRefusal) { this.sendInitialDefaultRefusal(request.id); return; }
     if (this.requests.has(request.id)) return; // duplicate live ids cannot produce two answers
     const lifetime = { controller: new AbortController(), commit: undefined as (() => void) | undefined };
     this.requests.set(request.id, lifetime);
@@ -337,7 +363,9 @@ export class MCPSession {
       }
 
       if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] toolsCall ${toolName} id=${String(request.id)} pre-init\n`);
-      await this.retryInitIfNeeded();
+      // Speculative default failure cannot poison an independently admitted
+      // explicit target; ToolHandler performs that target's own permission.
+      if (typeof toolArgs.projectPath !== 'string') await this.retryInitIfNeeded();
       if (lifetime.controller.signal.aborted || this.closed) return;
 
       if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] toolsCall ${toolName} id=${String(request.id)} dispatch\n`);
@@ -354,7 +382,8 @@ export class MCPSession {
       getTelemetry().recordUsage('mcp_tool', toolName, !result.isError, this.clientInfo);
     } catch (error) {
       if (!this.closed && !lifetime.controller.signal.aborted && this.requests.get(request.id) === lifetime) {
-        this.transport.sendError(request.id, ErrorCodes.InternalError, error instanceof Error ? error.message : String(error));
+        this.transport.sendError(request.id, ErrorCodes.InternalError, error instanceof Error ? error.message : String(error),
+          isServicePolicyRefusal(error) ? { code: error.code, reason: error.reason, projectRoot: error.projectRoot, guidance: error.guidance } : undefined);
       }
     } finally {
       if (this.requests.get(request.id) === lifetime) this.requests.delete(request.id);
@@ -370,28 +399,38 @@ export class MCPSession {
    *      that were `codegraph init`'d *after* the server started.
    */
   private async retryInitIfNeeded(): Promise<void> {
+    this.assertDefaultResolutionLive();
     if (this.resolvePromise) {
-      try { await this.resolvePromise; } catch { /* fall through to retry */ }
-      this.resolvePromise = null;
+      const pending = this.resolvePromise;
+      try { await pending; }
+      catch (error) { if (isServicePolicyRefusal(error)) throw error; }
+      finally { if (this.resolvePromise === pending) this.resolvePromise = null; }
     }
+    this.assertDefaultResolutionLive();
 
     if (this.engine.hasDefaultCodeGraph()) return;
 
-    const hint = this.explicitProjectPath ?? this.engine.getProjectPath();
+    const hint = this.selectedProjectHint ?? this.explicitProjectPath ?? this.engine.getProjectPath();
     if (!hint && !this.rootsAttempted) {
       this.rootsAttempted = true;
       this.resolvePromise = this.clientSupportsRoots
         ? this.initFromRoots()
         : this.engine.ensureInitialized(process.cwd());
-      try { await this.resolvePromise; } catch { /* fall through */ }
-      this.resolvePromise = null;
+      const pending = this.resolvePromise;
+      try { await pending; }
+      catch (error) { if (isServicePolicyRefusal(error)) throw error; }
+      finally { if (this.resolvePromise === pending) this.resolvePromise = null; }
+      this.assertDefaultResolutionLive();
       if (this.engine.hasDefaultCodeGraph()) return;
     }
 
-    // Last resort: walk from the best candidate (sync open). Picks up
+    // Last resort: await permission from the best candidate. Picks up
     // projects that appeared after the server started.
-    const candidate = hint ?? process.cwd();
-    this.engine.retryInitializeSync(candidate);
+    // roots/list (or another initialize) can select a stronger hint while the
+    // preceding await is pending; read the retained selection AFTER that wait.
+    const candidate = this.selectedProjectHint ?? this.explicitProjectPath ?? this.engine.getProjectPath() ?? process.cwd();
+    this.assertDefaultResolutionLive();
+    await this.engine.retryInitialize(candidate);
   }
 
   /**
@@ -405,6 +444,7 @@ export class MCPSession {
       const rootPath = firstRootPath(result);
       if (rootPath) {
         target = rootPath;
+        this.selectedProjectHint ??= rootPath;
       } else {
         process.stderr.write('[CodeGraph MCP] Client returned no workspace roots; falling back to process cwd.\n');
       }
@@ -412,6 +452,8 @@ export class MCPSession {
       const msg = err instanceof Error ? err.message : String(err);
       process.stderr.write(`[CodeGraph MCP] roots/list request failed (${msg}); falling back to process cwd.\n`);
     }
+    this.assertDefaultResolutionLive();
+    target = this.selectedProjectHint ?? target;
     await this.engine.ensureInitialized(target);
   }
 }

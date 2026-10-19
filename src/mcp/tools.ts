@@ -6,8 +6,10 @@
 
 import type CodeGraph from '../index';
 import type { QueryPool } from './query-pool';
+import type { IndexProgressLease, ProjectResourceObserver, ProjectWatchState } from './project-lifecycle';
 import { createQueryRequestContext, routeQueryRequest, type QueryExecutionContext, type QueryRequestContext } from './query-context';
-import { findNearestCodeGraphRoot, getCodeGraphDir, isInitialized, isSameIndexRoot } from '../directory';
+import { isServicePolicyRefusal } from './query-service-compatibility';
+import { admitMcpRoute, captureMcpIndexRoute, findNearestCodeGraphRoot, getCodeGraphDir, isInitialized, isSameIndexRoot, McpIndexRouteUnavailableError, resolveMcpRoot, type McpIndexRoute } from '../directory';
 // Path derivation does not load the heavy database module on the handshake path.
 const getDatabasePath = (root: string): string => joinPath(getCodeGraphDir(root), 'codegraph.db');
 import { WslSharedIndexError } from '../db/wsl-shared-index';
@@ -1899,9 +1901,14 @@ function resolveProjectIdleTimeoutMs(): number {
  * engine can release shared ownership safely on LRU eviction or shutdown.
  */
 export interface ProjectLifecycle {
-  open(root: string, open: () => CodeGraph): CodeGraph;
+  /** Mandatory permission is independent of the best-effort freshness gate. */
+  admit?(route: McpIndexRoute, signal?: AbortSignal): Promise<void>;
+  resourceObserver?: ProjectResourceObserver;
+  open(route: McpIndexRoute, signal?: AbortSignal): Promise<CodeGraph>;
   activate(cg: CodeGraph): Promise<void>;
   release(cg: CodeGraph): void | Promise<void>;
+  watchState?(cg: CodeGraph): ProjectWatchState | undefined;
+  rearmWatcher?(cg: CodeGraph): boolean;
 }
 
 /**
@@ -1927,7 +1934,8 @@ export class ToolHandler {
   private activeCalls = 0;
   private closing = false;
   private pendingCloses = 0;
-  private closeWaiters: Array<() => void> = [];
+  private closeWaiters: Array<{ resolve: () => void; reject: (error: unknown) => void }> = [];
+  private closeFailures: unknown[] = [];
   // The directory the server last searched for a default project. Surfaced in
   // the "not initialized" error so users can see why detection missed.
   private defaultProjectHint: string | null = null;
@@ -1941,7 +1949,10 @@ export class ToolHandler {
   // Why the default project failed to open, when that is worth telling the
   // agent instead of "no project loaded" — today only the Windows/WSL
   // shared-index error (#995). Engine-maintained; cleared by a successful open.
-  private defaultOpenFailure: WslSharedIndexError | null = null;
+  private defaultOpenFailure: WslSharedIndexError | McpIndexRouteUnavailableError | null = null;
+  // The default handle's original verified root/index binding. A later selector
+  // or symlink change must not authorize a new file while retaining this handle.
+  private defaultRoute: McpIndexRoute | null = null;
   // Per-start-path cache of the git worktree/index mismatch (issue #155). The
   // mismatch is a fixed property of (where the request came from → which
   // .codegraph/ it resolves to), so the up-to-two `git rev-parse` spawns run
@@ -1969,7 +1980,13 @@ export class ToolHandler {
   private queryPool: QueryPool | null = null;
   private queryDiagnostics: ((project: import('./query-diagnostics').QueryDiagnostics['project']) => import('./query-diagnostics').QueryDiagnostics) | null = null;
 
-  constructor(private cg: CodeGraph | null, private readonly execution?: QueryExecutionContext) {}
+  constructor(private cg: CodeGraph | null, private readonly execution?: QueryExecutionContext,
+    private readonly opener: { readOnly?: boolean; projectRoute?: McpIndexRoute } = {}) {
+    if (cg) {
+      const route = opener.projectRoute ?? captureMcpIndexRoute(cg.getProjectRoot());
+      this.defaultRoute = route ? Object.freeze({ root: route.root, index: route.index }) : null;
+    }
+  }
 
   /**
    * Engine-only: attach (or detach with null) the worker-thread query pool. The
@@ -1997,8 +2014,10 @@ export class ToolHandler {
   /**
    * Update the default CodeGraph instance (e.g. after lazy initialization)
    */
-  setDefaultCodeGraph(cg: CodeGraph): void {
+  setDefaultCodeGraph(cg: CodeGraph, route?: McpIndexRoute): void {
     this.cg = cg;
+    const held = route ?? captureMcpIndexRoute(cg.getProjectRoot());
+    this.defaultRoute = held ? Object.freeze({ root: held.root, index: held.index }) : null;
     this.defaultOpenFailure = null;
   }
 
@@ -2007,7 +2026,7 @@ export class ToolHandler {
    * call that needs it answers with that fix rather than "no project loaded".
    * `null` clears it.
    */
-  setDefaultOpenFailure(err: WslSharedIndexError | null): void {
+  setDefaultOpenFailure(err: WslSharedIndexError | McpIndexRouteUnavailableError | null): void {
     this.defaultOpenFailure = err;
   }
 
@@ -2049,7 +2068,7 @@ export class ToolHandler {
     const timeoutMs = resolveCatchUpGateTimeoutMs();
     if (timeoutMs <= 0) {
       // 0 = opt back into the original unbounded wait.
-      try { await gate; } catch { /* engine already logged */ }
+      try { await gate; } catch (error) { if (isServicePolicyRefusal(error)) throw error; /* engine already logged */ }
       return;
     }
     let timer: NodeJS.Timeout | undefined;
@@ -2059,7 +2078,7 @@ export class ToolHandler {
     });
     try {
       const outcome = await Promise.race([
-        gate.then(() => 'done' as const, () => 'done' as const),
+        gate.then(() => 'done' as const, error => { if (isServicePolicyRefusal(error)) throw error; return 'done' as const; }),
         timedOut,
       ]);
       if (outcome === 'timeout') {
@@ -2150,9 +2169,9 @@ export class ToolHandler {
     // sub-projects. With nothing to fall back to, EVERY call needs an explicit
     // projectPath, so mark it required in the schema — a high-salience nudge the
     // agent acts on, where SERVER_INSTRUCTIONS_NO_ROOT_INDEX's prose alone
-    // wasn't enough (the reporter had to add an AGENTS.md note). `this.cg` is
-    // settled by `retryInitIfNeeded()` before `handleToolsList` calls us, so a
-    // null here means "genuinely no default", not a startup race. When a default
+    // wasn't enough (the reporter had to add an AGENTS.md note). Tools/list is
+    // static during verification, so a null graph may also be awaiting route
+    // permission rather than proving an absent default. When a default
     // IS open we leave projectPath optional (below): a bare call falls back to
     // it, exactly as in the common single-project launch.
     if (!this.cg) return withRequiredProjectPath(visible);
@@ -2217,7 +2236,7 @@ export class ToolHandler {
    * Walks up parent directories to find the nearest .codegraph/ folder,
    * similar to how git finds .git/ directories.
    */
-  private getCodeGraph(projectPath?: string): CodeGraph {
+  private selectProjectRoot(projectPath?: string): string {
     if (!projectPath) {
       if (!this.cg) {
         if (this.defaultOpenFailure) throw this.defaultOpenFailure;
@@ -2238,7 +2257,7 @@ export class ToolHandler {
           'other indexed projects by projectPath in the same session.'
         );
       }
-      return this.freshen(this.cg);
+      return canonicalPath(this.cg.getProjectRoot());
     }
 
     // Reject sensitive system directories before opening. Only validate a
@@ -2277,12 +2296,22 @@ export class ToolHandler {
       );
     }
 
-    const cg = this.openProjectRoot(resolvedRoot, canonicalRoot);
+    return canonicalRoot;
+  }
+
+  private getCodeGraph(projectPath?: string): CodeGraph {
+    const canonicalRoot = this.selectProjectRoot(projectPath);
+    const cg = this.openProjectRoot(canonicalRoot, canonicalRoot);
+    this.assertNestedCoverage(projectPath, canonicalRoot, cg);
+    return cg;
+  }
+
+  private assertNestedCoverage(projectPath: string | undefined, canonicalRoot: string, cg: CodeGraph): void {
     // The walk above crosses git boundaries. A nested repository the ancestor
     // index leaves out (typically gitignored) would otherwise be answered from
     // the ancestor's code, looking like an answer about the requested project
     // (#2110) — so it gets the same guidance as a project with no index at all.
-    const nested = this.uncoveredNestedRepo(projectPath, canonicalRoot, cg);
+    const nested = projectPath ? this.uncoveredNestedRepo(projectPath, canonicalRoot, cg) : null;
     if (nested) {
       throw new NotIndexedError(
         `The project at ${projectPath} isn't indexed with codegraph: it is its own git repository ` +
@@ -2293,15 +2322,20 @@ export class ToolHandler {
         `in ${nested.root} to enable it.`
       );
     }
-    return cg;
   }
 
   /** An admitted route is already resolved: never walk to an ancestor again. */
   private getAdmittedCodeGraph(project: NonNullable<QueryRequestContext['project']>): CodeGraph {
+    this.assertAdmittedRoute(project);
+    // Same-root valid database replacement retains the ordinary reopen behavior.
+    return this.openProjectRoot(project.root, project.root);
+  }
+
+  private assertAdmittedRoute(project: McpIndexRoute): void {
     let ownIndex = false;
     try {
-      ownIndex = realpathSync(project.root) === project.root
-        && realpathSync(getDatabasePath(project.root)) === project.index
+      ownIndex = realpathSync.native(project.root) === project.root
+        && realpathSync.native(getDatabasePath(project.root)) === project.index
         && isInitialized(project.root);
     } catch { /* Missing or inaccessible own index is recoverable, never an ancestor route. */ }
     if (!ownIndex) {
@@ -2311,8 +2345,20 @@ export class ToolHandler {
         'otherwise use your built-in tools (Read/Grep/Glob) for this project.'
       );
     }
-    // Same-root valid database replacement retains the ordinary reopen behavior.
-    return this.openProjectRoot(project.root, project.root);
+  }
+
+  private async acquireAdmittedCodeGraph(project: NonNullable<QueryRequestContext['project']>, signal?: AbortSignal): Promise<CodeGraph> {
+    this.assertAdmittedRoute(project);
+    const open = this.findOpenProject(project.root, project.root);
+    if (open) return open;
+    if (!this.projectLifecycle) return this.openProjectRoot(project.root, project.root);
+    const cg = await this.projectLifecycle.open(project, signal);
+    // All concurrent admissions share the coordinator's stable actual reader.
+    // The cache retains every engine lease until its active-call drain finishes.
+    this.projectCache.set(project.root, cg);
+    this.projectUsedAt.set(project.root, Date.now());
+    this.trimProjects();
+    return cg;
   }
 
   /**
@@ -2320,6 +2366,17 @@ export class ToolHandler {
    * instance, a cached one, or a newly opened (and cached) one.
    */
   private openProjectRoot(resolvedRoot: string, canonicalRoot: string): CodeGraph {
+    const existing = this.findOpenProject(resolvedRoot, canonicalRoot);
+    if (existing) return existing;
+    if (this.projectLifecycle) throw new Error('Engine projects require asynchronous exact-route acquisition before dispatch.');
+    const cg = loadCodeGraph().openSync(canonicalRoot, { readOnly: this.opener.readOnly ?? this.execution?.capability === 'read-only' });
+    this.projectCache.set(canonicalRoot, cg);
+    this.projectUsedAt.set(canonicalRoot, Date.now());
+    this.trimProjects();
+    return cg;
+  }
+
+  private findOpenProject(resolvedRoot: string, canonicalRoot: string): CodeGraph | null {
     // If the path resolves to the default project, reuse the already-open
     // default instance rather than opening a SECOND connection to the same DB.
     // A duplicate connection serializes reads against the watcher's auto-sync
@@ -2355,12 +2412,7 @@ export class ToolHandler {
       }
     }
 
-    const open = () => loadCodeGraph().openSync(canonicalRoot, { readOnly: this.execution?.capability === 'read-only' });
-    const cg = this.projectLifecycle?.open(canonicalRoot, open) ?? open();
-    this.projectCache.set(canonicalRoot, cg);
-    this.projectUsedAt.set(canonicalRoot, Date.now());
-    this.trimProjects();
-    return cg;
+    return null;
   }
 
   /**
@@ -2391,17 +2443,20 @@ export class ToolHandler {
     }
   }
 
-  private async awaitProjectGate(projectPath: string): Promise<void> {
-    const cg = this.getCodeGraph(projectPath);
+  private async awaitProjectGate(cg: CodeGraph): Promise<void> {
     if (!this.projectLifecycle || cg === this.cg) return;
     let gate = this.projectGates.get(cg);
     if (!gate) {
-      gate = this.projectLifecycle.activate(cg).catch(() => { /* engine logs */ });
+      gate = this.projectLifecycle.activate(cg).catch(error => {
+        if (isServicePolicyRefusal(error)) throw error;
+        /* engine logs ordinary freshness failures */
+      });
       this.projectGates.set(cg, gate);
-      void gate.then(() => {
+      const finished = (): void => {
         if (this.projectGates.get(cg) === gate) this.projectGates.delete(cg);
         this.trimProjects();
-      });
+      };
+      void gate.then(finished, finished);
     }
     await this.awaitCatchUpGate(gate);
   }
@@ -2423,14 +2478,20 @@ export class ToolHandler {
       this.projectUsedAt.delete(root);
       if (this.projectLifecycle) {
         this.pendingCloses++;
-        void Promise.resolve(this.projectLifecycle.release(cg)).finally(() => {
+        void Promise.resolve().then(() => this.projectLifecycle?.release(cg)).catch(error => {
+          this.closeFailures.push(error);
+          process.stderr.write(`[CodeGraph MCP] Cached project cleanup failed: ${String(error).slice(0, 2048)}\n`);
+        }).finally(() => {
           this.pendingCloses--;
           this.trimProjects();
         });
       } else cg.close();
     }
-    if (this.closing && this.projectCache.size === 0 && this.pendingCloses === 0) {
-      for (const resolve of this.closeWaiters.splice(0)) resolve();
+    if (this.closing && this.activeCalls === 0 && this.projectCache.size === 0 && this.pendingCloses === 0) {
+      for (const waiter of this.closeWaiters.splice(0)) {
+        if (this.closeFailures.length) waiter.reject(new AggregateError(this.closeFailures, 'Cached project cleanup failed'));
+        else waiter.resolve();
+      }
     }
     this.scheduleIdleRelease(idleMs);
   }
@@ -2490,8 +2551,15 @@ export class ToolHandler {
     this.idleReleaseTimer = null;
     this.nestedRepoCache.clear();
     this.trimProjects();
-    if (this.projectCache.size === 0 && this.activeCalls === 0 && this.pendingCloses === 0) return Promise.resolve();
-    return new Promise((resolve) => this.closeWaiters.push(resolve));
+    if (this.projectCache.size === 0 && this.activeCalls === 0 && this.pendingCloses === 0) {
+      return this.closeFailures.length ? Promise.reject(new AggregateError(this.closeFailures, 'Cached project cleanup failed')) : Promise.resolve();
+    }
+    return new Promise((resolve, reject) => this.closeWaiters.push({ resolve, reject }));
+  }
+
+  /** Internal drain fact, independent of any settled cleanup error. */
+  hasUnjoinedProjectWork(): boolean {
+    return this.activeCalls !== 0 || this.projectCache.size !== 0 || this.pendingCloses !== 0;
   }
 
   /**
@@ -2548,7 +2616,7 @@ export class ToolHandler {
    * (e.g. nothing initialized yet), it reports "no mismatch" so a tool is never
    * broken by this check.
    */
-  private worktreeMismatchFor(projectPath?: string): WorktreeIndexMismatch | null {
+  private worktreeMismatchFor(projectPath?: string, admitted?: CodeGraph): WorktreeIndexMismatch | null {
     const startPath = projectPath ?? this.defaultProjectHint ?? process.cwd();
 
     // The verdict depends on BOTH the start path AND the index root it resolves
@@ -2562,7 +2630,7 @@ export class ToolHandler {
     // that first verdict until restart (#926).
     let indexRoot: string;
     try {
-      indexRoot = this.getCodeGraph(projectPath).getProjectRoot();
+      indexRoot = (admitted ?? this.getCodeGraph(projectPath)).getProjectRoot();
     } catch {
       // No resolvable project (or any other resolution error) → nothing to warn.
       return null;
@@ -2585,9 +2653,9 @@ export class ToolHandler {
    * is no mismatch. `codegraph_status` is excluded — it embeds its own verbose
    * warning — so it stays out of this path.
    */
-  private withWorktreeNotice(result: ToolResult, projectPath?: string): ToolResult {
+  private withWorktreeNotice(result: ToolResult, projectPath?: string, admitted?: CodeGraph): ToolResult {
     if (result.isError) return result;
-    const mismatch = this.worktreeMismatchFor(projectPath);
+    const mismatch = this.worktreeMismatchFor(projectPath, admitted);
     if (!mismatch) return result;
 
     const notice = worktreeMismatchNotice(mismatch);
@@ -2682,12 +2750,21 @@ export class ToolHandler {
     return result;
   }
 
-  private withStalenessNotice(result: ToolResult, projectPath?: string): ToolResult {
+  /** Watch facts belong to the actual owned writer, not the stable RO reader. */
+  private watchState(cg: CodeGraph): ProjectWatchState {
+    return this.projectLifecycle?.watchState?.(cg) ?? {
+      active: cg.isWatching?.() ?? false, degraded: cg.isWatcherDegraded?.() ?? false,
+      recovering: cg.isWatcherRecovering?.() ?? false, reason: cg.getWatcherDegradedReason?.() ?? null,
+      pending: cg.getPendingFiles?.() ?? [],
+    };
+  }
+
+  private withStalenessNotice(result: ToolResult, projectPath?: string, admitted?: CodeGraph): ToolResult {
     if (result.isError) return result;
 
     let cg: CodeGraph;
     try {
-      cg = this.getCodeGraph(projectPath);
+      cg = admitted ?? this.getCodeGraph(projectPath);
     } catch {
       return result; // no default project — leave as is
     }
@@ -2716,20 +2793,20 @@ export class ToolHandler {
     // only know degraded state for a project we watch.)
     let degraded = false;
     try {
-      degraded = cg.isWatcherDegraded?.() ?? false;
+      degraded = this.watchState(cg).degraded;
     } catch {
       degraded = false;
     }
     if (degraded) {
       const [head, ...tail] = result.content;
       if (!head || head.type !== 'text') return result;
-      if (cg.isWatcherRecovering?.()) {
+      if (this.watchState(cg).recovering) {
         const composed = `${formatRecoveringBanner()}\n\n${head.text}`;
         return { ...result, content: [{ type: 'text', text: composed }, ...tail] };
       }
       let reason: string | null = null;
       try {
-        reason = cg.getWatcherDegradedReason?.() ?? null;
+        reason = this.watchState(cg).reason;
       } catch {
         reason = null;
       }
@@ -2741,7 +2818,7 @@ export class ToolHandler {
     // newer pending-files API. Treat missing/throwing as "no pending files."
     let pending: PendingFile[] = [];
     try {
-      pending = cg.getPendingFiles?.() ?? [];
+      pending = this.watchState(cg).pending;
     } catch {
       return result;
     }
@@ -2794,6 +2871,7 @@ export class ToolHandler {
     if (lifetime?.signal.aborted) return this.textResult('CodeGraph request cancelled or abandoned.');
     if (this.closing) return this.textResult('This MCP session is closing; retry with a connected session.');
     this.activeCalls++;
+    const progress = new Map<string, IndexProgressLease>();
     try {
       // Block the first tool call on the engine's post-open reconcile so we
       // never serve rows for files deleted/edited while no MCP server was
@@ -2803,10 +2881,6 @@ export class ToolHandler {
       // gate stays installed until reconciliation settles, including on timeout.
       // Catch-up failures are logged by the engine; we proceed regardless so a
       // transient sync error never breaks tools.
-      if (this.catchUpGate) {
-        const gate = this.catchUpGate;
-        await this.awaitCatchUpGate(gate);
-      }
       if (lifetime?.signal.aborted) return this.textResult('CodeGraph request cancelled or abandoned.');
       // Honor the optional tool allowlist (CODEGRAPH_MCP_TOOLS): a trimmed
       // surface rejects ablated tools defensively even if a client cached them.
@@ -2821,13 +2895,6 @@ export class ToolHandler {
       if (typeof pathCheck === 'object' && pathCheck !== undefined) {
         return pathCheck;
       }
-      // An explicit project gets the same first-call guarantee as the default
-      // (#1835): its post-open catch-up sync finishes (time-boxed) before we
-      // serve it. Resolved on the main thread so the watcher lives here even
-      // when dispatch is off-loaded to a worker.
-      if (typeof pathCheck === 'string') {
-        await this.awaitProjectGate(pathCheck);
-      }
       // The `path` and `pattern` properties used by codegraph_files are
       // also path-shaped — apply the same cap.
       if (args.path !== undefined) {
@@ -2839,17 +2906,55 @@ export class ToolHandler {
         if (typeof check === 'object' && check !== undefined) return check;
       }
 
-      const project = await this.getCodeGraph(args.projectPath as string | undefined);
+      const sourcePath = typeof pathCheck === 'string' ? pathCheck : undefined;
+      const admission = { signal: lifetime?.signal,
+        admit: async (candidate: McpIndexRoute, signal?: AbortSignal): Promise<void> => {
+          const observer = this.projectLifecycle?.resourceObserver;
+          if (observer && !progress.has(candidate.index)) {
+            progress.set(candidate.index, await observer.acquireIndexProgress(candidate, signal));
+          }
+          await this.projectLifecycle?.admit?.(candidate, signal);
+        } };
+      let own: McpIndexRoute;
+      if (sourcePath !== undefined) {
+        if (existsSync(sourcePath)) {
+          const pathError = validateProjectPath(sourcePath);
+          if (pathError) throw new PathRefusalError(pathError);
+        }
+        const selected = await resolveMcpRoot(sourcePath, { ...admission, subprojectScan: false });
+        if (!selected.route) throw new NotIndexedError(
+          `The project at ${sourcePath} isn't indexed with codegraph (no verified own index found walking up from it). ` +
+          'Use your built-in tools (Read/Grep/Glob) for that codebase. Indexing is the user\'s decision — ' +
+          "they can run 'codegraph init' in that project to enable it."
+        );
+        own = selected.route;
+      } else {
+        const root = this.selectProjectRoot(); // default lookup performs no schema probe
+        if (!this.defaultRoute) throw new McpIndexRouteUnavailableError({ root, index: getDatabasePath(root) }, 'missing');
+        own = await admitMcpRoute(this.defaultRoute, admission);
+      }
+      const route = { ...own, route: sourcePath !== undefined ? 'explicit' as const : 'default' as const };
       if (lifetime?.signal.aborted) return this.textResult('CodeGraph request cancelled or abandoned.');
+      const project = await this.acquireAdmittedCodeGraph(route, lifetime?.signal);
+      this.assertNestedCoverage(sourcePath, route.root, project);
+      if (sourcePath) await this.awaitProjectGate(project);
+      if (this.catchUpGate) await this.awaitCatchUpGate(this.catchUpGate);
+      if (lifetime?.signal.aborted) return this.textResult('CodeGraph request cancelled or abandoned.');
+      // Refresh caller permission after freshness waits, then retain the same
+      // own identity; neither a new owner nor a replacement can become an
+      // unadmitted schema probe or an ancestor route.
+      await admitMcpRoute(own, admission);
+      this.getAdmittedCodeGraph(route);
       // Carry resolved routing separately from public args. Default calls may
       // need an explicit root on the worker wire without becoming explicit calls.
       const request = requestContext ?? (this.execution ? createQueryRequestContext(this.execution, 'untracked', 'untracked') : undefined);
-      const context = request ? routeQueryRequest(request, typeof pathCheck === 'string' ? 'explicit' : 'default',
-        realpathSync(project.getProjectRoot()), realpathSync(getDatabasePath(project.getProjectRoot()))) : undefined;
+      const context = request ? routeQueryRequest(request, route.route, route.root, route.index) : undefined;
       // Recover a watcher disabled by prolonged lock contention on the next call.
       // The stale banner remains until the watcher finishes its full scan;
       // frequent calls cannot bypass its cooldown (#1959).
-      if (project.rearmWatcherAfterLockContention?.()) {
+      const rearmed = this.projectLifecycle
+        ? this.projectLifecycle.rearmWatcher?.(project) ?? false : project.rearmWatcherAfterLockContention?.();
+      if (rearmed) {
         process.stderr.write('[CodeGraph MCP] Re-armed file watcher; full catch-up pending.\n');
       }
 
@@ -2859,7 +2964,7 @@ export class ToolHandler {
       // a worker (whose read connection has no watcher). It also skips the
       // auto-banner wrapper to avoid duplicating its own pending-files section.
       if (toolName === 'codegraph_status') {
-        return await this.handleStatus(args);
+        return await this.handleStatus(args, project, own);
       }
 
       // A configured pool owns reads even while cold, recovering or failed.
@@ -2882,13 +2987,13 @@ export class ToolHandler {
       // keep the main handler's workspace-specific not-indexed guidance.
       const pooled = this.queryPool !== null;
       const projectPath = project.getProjectRoot();
-      const wasDegraded = project.isWatcherDegraded?.();
+      const wasDegraded = this.watchState(project).degraded;
       const raw = pooled
         ? await this.queryPool!.run(toolName, { ...dispatchArgs, projectPath }, context, lifetime?.signal)
         : await this.executeReadTool(toolName, dispatchArgs, context);
       const answeredFrom = raw._cgAnswerFiles;
       delete raw._cgAnswerFiles;
-      if (!raw.isError && answeredFrom && (wasDegraded || project.isWatcherDegraded?.())) {
+      if (!raw.isError && answeredFrom && (wasDegraded || this.watchState(project).degraded)) {
         const validation = await validateAnswerFiles(project.getProjectRoot(), answeredFrom);
         if (validation.stale.length || validation.unchecked.length) {
           // Rejected source must not enter the session's emission history.
@@ -2913,16 +3018,20 @@ export class ToolHandler {
       // internal bookkeeping and must never reach the client, whether or not a
       // caller passed session state.
       const result = this.takeExploreEmission(raw, lifetime?.signal.aborted ? undefined : sessionState, lifetime);
-      const withWorktree = this.withWorktreeNotice(result, args.projectPath as string | undefined);
-      return this.withStalenessNotice(withWorktree, args.projectPath as string | undefined);
+      const withWorktree = this.withWorktreeNotice(result, args.projectPath as string | undefined, project);
+      return this.withStalenessNotice(withWorktree, args.projectPath as string | undefined, project);
     } catch (err) {
+      if (isServicePolicyRefusal(err)) throw err;
+      if (lifetime?.signal.aborted || (err as Error | null)?.name === 'AbortError') {
+        return this.textResult('CodeGraph request cancelled or abandoned.');
+      }
       // Expected condition, not a malfunction: answer as a SUCCESS so the
       // agent keeps trusting the toolset for projects that ARE indexed.
       // (An isError here teaches session-long abandonment — see NotIndexedError.)
       // A running `codegraph index` rebuild is the same kind of expected,
       // temporary condition (#1325). Matched by name: tools.ts stays free of
       // the writer-lock module on the MCP startup path.
-      if (err instanceof NotIndexedError || (err as Error | null)?.name === 'RebuildInProgressError') {
+      if (err instanceof NotIndexedError || err instanceof McpIndexRouteUnavailableError || (err as Error | null)?.name === 'RebuildInProgressError') {
         return this.textResult((err as Error).message);
       }
       // Windows and WSL sharing one index (#995): the user's fix, not a malfunction.
@@ -2939,6 +3048,13 @@ export class ToolHandler {
         'continue without codegraph for this task.'
       );
     } finally {
+      for (const lease of progress.values()) {
+        try { await lease.release(); }
+        catch (secondary) {
+          this.closeFailures.push(secondary);
+          process.stderr.write(`[CodeGraph MCP] Request progress cleanup failed: ${String(secondary).slice(0, 2048)}\n`);
+        }
+      }
       this.activeCalls--;
       this.trimProjects();
     }
@@ -7990,8 +8106,8 @@ export class ToolHandler {
   /**
    * Handle codegraph_status
    */
-  private async handleStatus(args: Record<string, unknown>): Promise<ToolResult> {
-    let cg = this.getCodeGraph(args.projectPath as string | undefined);
+  private async handleStatus(args: Record<string, unknown>, admitted?: CodeGraph, heldRoute?: McpIndexRoute): Promise<ToolResult> {
+    let cg = admitted ?? this.getCodeGraph(args.projectPath as string | undefined);
     // Same trick as withStalenessNotice — when an explicit projectPath
     // resolves to the same project as the default session cg, prefer the
     // default so getPendingFiles() (only populated by the default's watcher)
@@ -8010,7 +8126,7 @@ export class ToolHandler {
     // Queries then reflect that tree's branch, not the worktree being edited.
     // status shows the verbose, multi-line form; the read tools get the compact
     // one-liner via withWorktreeNotice. Both share the cached detection.
-    const mismatch = this.worktreeMismatchFor(args.projectPath as string | undefined);
+    const mismatch = this.worktreeMismatchFor(args.projectPath as string | undefined, cg);
 
     const lines: string[] = [
       '**CodeGraph Status**',
@@ -8030,7 +8146,7 @@ export class ToolHandler {
     // filesystem fallback can stall on a large/busy checkout, but status must
     // not block the shared daemon's transport (#1959). Unknown is never zero.
     const lastIndexedAt = cg.getLastIndexedAt();
-    const changes = await measurePendingChanges(cg.getProjectRoot());
+    const changes = await measurePendingChanges(cg.getProjectRoot(), undefined, heldRoute);
     lines.push(
       `**Latest file indexed:** ${lastIndexedAt == null ? 'never' : new Date(lastIndexedAt).toISOString()}`,
       changes
@@ -8096,14 +8212,15 @@ export class ToolHandler {
     // stopped, getPendingFiles() is empty (so no "Pending sync" section below)
     // but the index is frozen — call that out explicitly here, the one place an
     // agent asks "is the index caught up?".
-    if (cg.isWatcherDegraded()) {
-      const recovering = cg.isWatcherRecovering();
+    const watch = this.watchState(cg);
+    if (watch.degraded) {
+      const recovering = watch.recovering;
       lines.push(
         '',
         recovering ? '**Auto-sync recovering:**' : '**Auto-sync disabled:**',
         recovering
           ? '- File watching restarted; full index catch-up has not completed.'
-          : `- ${cg.getWatcherDegradedReason() ?? 'live file watching stopped'}`,
+          : `- ${watch.reason ?? 'live file watching stopped'}`,
         '- The index may be stale; Read files directly for current content.'
       );
     }
@@ -8112,7 +8229,7 @@ export class ToolHandler {
     // (issue #403). Surfacing it inside `status` gives the agent a single
     // place to ask "is the index caught up?" rather than inferring from
     // banners on other tool calls.
-    const pending = cg.getPendingFiles();
+    const pending = watch.pending;
     if (pending.length > 0) {
       lines.push('', '**Pending sync:**');
       const now = Date.now();

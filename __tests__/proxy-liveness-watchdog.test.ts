@@ -22,6 +22,12 @@ function alive(pid: number): boolean {
 async function exercise(mode: 'connecting-wedge' | 'fallback-wedge' | 'slow-fallback'): Promise<void> {
   const child = spawn(process.execPath, ['-e', `
     const { runLocalHandshakeProxy } = require(${JSON.stringify(MODULE)});
+    const { createQueryExecutionContext } = require(${JSON.stringify(path.resolve(__dirname, '../dist/mcp/query-context.js'))});
+    const { requestedQueryPolicy, resolveLegacyQueryPolicy } = require(${JSON.stringify(path.resolve(__dirname, '../dist/mcp/query-policy.js'))});
+    const execution = createQueryExecutionContext(
+      resolveLegacyQueryPolicy(requestedQueryPolicy({}), 'read-only-fallback', 1, { poolEnabled: false }),
+      { readOnly: true, writer: false, synchronization: false },
+    );
     const mode = ${JSON.stringify(mode)};
     const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
     function wedge() {
@@ -39,6 +45,9 @@ async function exercise(mode: 'connecting-wedge' | 'fallback-wedge' | 'slow-fall
       },
       makeEngine: () => ({
         ensureInitialized: async () => {},
+        // This fault-injection engine owns no writer or handover lifecycle.
+        getQueryExecutionContext: () => execution,
+        isReadOnly: () => true,
         getToolHandler: () => ({ execute: async () => {
           if (mode === 'fallback-wedge') wedge();
           // Longer than two watchdog deadlines, but yielding healthy work.

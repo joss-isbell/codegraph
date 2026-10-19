@@ -27,9 +27,11 @@ import type { QueryExecutionContext, QueryRequestContext } from './query-context
 import { immutable } from './query-policy';
 import { collectBeforeExit } from '../worker-teardown';
 import type CodeGraph from '../index';
+import { assertMcpIndexRoute, type McpIndexRoute } from '../directory';
 
 interface WorkerInit {
   root: string | null;
+  projectRoute?: McpIndexRoute;
   execution?: QueryExecutionContext;
 }
 
@@ -50,7 +52,7 @@ const loadToolHandler = (): typeof import('./tools').ToolHandler =>
 
 if (parentPort) {
   const port = parentPort;
-  const { root, execution } = immutable(workerData as WorkerInit);
+  const { root, projectRoute, execution } = immutable(workerData as WorkerInit);
 
   // Open the default project's READ connection once, if present. Other repos are
   // opened lazily on first cross-project (projectPath) call by the ToolHandler's
@@ -60,10 +62,18 @@ if (parentPort) {
   let cg: CodeGraph | null = null;
   let initError: string | null = null;
   try {
-    cg = root ? loadCodeGraph().openSync(root, { readOnly: execution?.capability === 'read-only' }) : null;
-    handler = new (loadToolHandler())(cg, execution);
+    if (projectRoute) {
+      if (projectRoute.root !== root) throw new Error('Query worker received a conflicting held default route.');
+      assertMcpIndexRoute(projectRoute);
+    }
+    // Actual native reader mode is independent of the immutable engine policy.
+    // Main-thread admission/freshness precedes dispatch; workers reassert the
+    // held route before their own open/reopen, and own no parent SQL observer.
+    cg = root ? loadCodeGraph().openSync(root, { readOnly: true }) : null;
+    handler = new (loadToolHandler())(cg, execution, { readOnly: true, projectRoute });
   } catch (err) {
-    cg?.close();
+    try { cg?.close(); }
+    catch (secondary) { process.stderr.write(`[CodeGraph MCP] Query reader cleanup failed: ${String(secondary).slice(0, 2048)}\n`); }
     initError = err instanceof Error ? err.message : String(err);
   }
 

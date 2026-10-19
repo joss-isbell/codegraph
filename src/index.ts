@@ -125,6 +125,10 @@ export interface OpenOptions {
 
   /** Whether to run in read-only mode */
   readOnly?: boolean;
+
+  /** @internal MCP-owned writer admission after the sync mutex wait. The
+   * optional returned assertion runs synchronously at the write boundary. */
+  beforeSync?: () => Promise<void | (() => void)>;
 }
 
 /**
@@ -173,7 +177,8 @@ export class CodeGraph {
   private constructor(
     db: DatabaseConnection,
     queries: QueryBuilder,
-    projectRoot: string
+    projectRoot: string,
+    private readonly beforeSync?: OpenOptions['beforeSync'],
   ) {
     this.db = db;
     this.queries = queries;
@@ -394,7 +399,7 @@ export class CodeGraph {
     const dbPath = getDatabasePath(resolvedRoot);
     const db = DatabaseConnection.open(dbPath, { readOnly: options.readOnly });
     let instance: CodeGraph;
-    try { instance = new CodeGraph(db, new QueryBuilder(db.getDb()), resolvedRoot); }
+    try { instance = new CodeGraph(db, new QueryBuilder(db.getDb()), resolvedRoot, options.beforeSync); }
     catch (err) { db.close(); throw err; }
 
     // Sync if requested
@@ -461,7 +466,7 @@ export class CodeGraph {
   /**
    * Open synchronously (without sync)
    */
-  static openSync(projectRoot: string, options: Pick<OpenOptions, 'readOnly'> = {}): CodeGraph {
+  static openSync(projectRoot: string, options: Pick<OpenOptions, 'readOnly' | 'beforeSync'> = {}): CodeGraph {
     const resolvedRoot = path.resolve(projectRoot);
 
     // Check if initialized
@@ -478,7 +483,7 @@ export class CodeGraph {
     // Open database
     const dbPath = getDatabasePath(resolvedRoot);
     const db = DatabaseConnection.open(dbPath, { readOnly: options.readOnly });
-    try { return new CodeGraph(db, new QueryBuilder(db.getDb()), resolvedRoot); }
+    try { return new CodeGraph(db, new QueryBuilder(db.getDb()), resolvedRoot, options.beforeSync); }
     catch (err) { db.close(); throw err; }
   }
 
@@ -835,6 +840,10 @@ export class CodeGraph {
    */
   async sync(options: IndexOptions = {}): Promise<SyncResult> {
     return this.indexMutex.withLock(async () => {
+      if (this.beforeSync) {
+        const assertFresh = await this.beforeSync();
+        if (assertFresh) assertFresh();
+      }
       const startedAt = Date.now();
       try {
         this.fileLock.acquire();

@@ -640,6 +640,9 @@ that drive the graph directly: `DatabaseConnection`, `QueryBuilder`,
 
 ## Configuration
 
+For the Issue #29 source candidate's optional MCP query concurrency and busy-wait
+settings, see [Query configuration](docs/design/query-policy-internal.md#configure-query-limits).
+
 Next to none — CodeGraph is **zero-config by default**, with nothing to write or
 keep in sync to get started. Language support is automatic from the file
 extension; there's nothing to wire up per language. The one optional file is for

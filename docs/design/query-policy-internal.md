@@ -1,55 +1,119 @@
-# Internal query policy and request context (Issue #9)
+# Query configuration and request context
 
-This is an internal preparation seam. Public startup still uses the original
-permissive numeric parser and default 45-second pooled busy timer. Independent
-pool and waiting sentinels are available; `CODEGRAPH_QUERY_MODE` does not activate a preset yet.
-Read-only fallback remains unpooled by default; Issue #11 permits an explicitly
-selected positive finite or unlimited pool. Service compatibility and replacement
-behavior are unchanged. No installation or live service is changed.
+## Configure query limits
 
-## Policy boundary
+This guide describes the revised Issue #29 **source candidate**, not an accepted
+release or an installed-runtime change. Its controls apply to direct stdio MCP,
+writable fallback, read-only fallback and shared project-daemon execution.
+Source inspection alone is not proof of runtime uptake; focused Ticket #29
+results and combined verification in #21 establish that separately.
 
-- `query-policy.ts` keeps raw `RequestedQueryPolicy` separate from immutable
-  `ResolvedQueryPolicy`. `resolveQueryPolicy` implements the settled strict
-  contract. It is not the public environment adapter until Issue #15.
-- `resolveLegacyQueryPolicy` snapshots existing settings at engine construction.
-  It preserves numeric coercion and flooring,
-  ignored malformed input and numeric timeout flooring. Issue #13 adds the
-  trimmed, case-sensitive independent `CODEGRAPH_QUERY_BUSY_TIMEOUT_MS=unlimited`
-  sentinel and prevents timer overflow; malformed numeric input still falls back
-  to 45 seconds until strict public validation in #15. It deliberately ignores
-  the new mode input. Its direct/writable defaults are bounded to two workers;
-  shared-daemon defaults use cores minus one bounded to 1–16. Issue #10 removes
-  both explicit finite override clamps; supported finite maxima are exact lazy
-  demand ceilings. Read-only defaults
-  disable pooling, unless a valid positive finite or unlimited override explicitly selects
-  local read-only workers. `resolvePoolSize` remains the old parser's compatibility seam.
-- Strict resolution uses decimal digits only, trimmed case-sensitive sentinels,
-  exact safe pool integers 0–9,007,199,254,740,991 and finite deadlines
-  1,000–2,147,483,647 ms. An explicitly disabled pool has an inapplicable deadline;
-  its still-validated timeout input is retained separately. Overrides are
-  independent. The unlimited preset or unlimited pool override requests idle
-  retirement; disabling only the timer does not. Classification is
-  `default`/`custom`/`unlimited`, separate from deadline applicability.
-- `MCPEngineOptions.queryPolicy` accepts an already-resolved internal policy.
-  The engine, dispatcher, pool and worker receive the same immutable policy and
-  authority. A supplied policy bypasses legacy pool/env reconstruction and caps.
-  `QueryPool` represents an absent timer with `null`, never a huge finite timer.
-  Startup pacing remains distinct from the maximum. Unlimited pool selection
-  and unused-worker retirement are implemented by #14; the strict public preset
-  and attachment safety remain downstream.
-- `getQueryExecutionState` separates resolution from current construction and
-  dispatch: read-only/disabled execution reports main-thread inapplicability.
-  A constructed cold/recovering pool reports worker dispatch with `ready:false`;
-  permanent failure reports unavailable dispatch and a failed lifecycle, never a
-  main-thread escape. Actual retention reports the constructed pool's policy. This is an
-  internal diagnostics input, not an additional MCP tool or public claim.
-- `connectWithHello` resolves a prospective **shared-daemon** policy, independently
-  of a direct/fallback engine, and sends it in the internal client hello. Issue
-  #16 must compare it with actual service facts. This change does not compare,
-  reject, mutate or replace services based on policy.
+Set these environment variables in the configuration that launches CodeGraph:
 
-## Execution and ownership boundary
+| Setting | Meaning |
+| --- | --- |
+| `CODEGRAPH_QUERY_MODE=unlimited` | Convenience preset: no configured worker/admission maximum and no CodeGraph busy timer. |
+| `CODEGRAPH_QUERY_POOL_SIZE=unlimited` | Remove only the configured worker/admission maximum. |
+| `CODEGRAPH_QUERY_POOL_SIZE=<count>` | Use a finite worker ceiling; `0` deliberately disables the pool. |
+| `CODEGRAPH_QUERY_BUSY_TIMEOUT_MS=unlimited` | Omit only the CodeGraph pooled busy timer; this is not a huge finite timeout. |
+| `CODEGRAPH_QUERY_BUSY_TIMEOUT_MS=<milliseconds>` | Bound pooled waiting from admission through queueing and execution. |
+
+Each explicit per-control value overrides **only its own** preset selection.
+For example, the following are independent combinations, not new modes:
+
+| Selected values | Effective behavior |
+| --- | --- |
+| Mode `unlimited`, no independent overrides | Unlimited pool and absent busy timer. |
+| Pool `4`, busy timeout `unlimited` | At most four workers; no CodeGraph busy timer. |
+| Pool `unlimited`, busy timeout `60000` | No configured worker ceiling; a 60-second CodeGraph busy timer. |
+| Mode `unlimited`, pool `4` | Finite pool of four; busy timer still absent. |
+| Mode `unlimited`, busy timeout `60000` | Unlimited pool; finite 60-second busy timer. |
+| Pool `0`, with any busy setting or preset | Main-thread reads; the pool busy timer is inapplicable. |
+
+Remove a variable to stop overriding it. Mode is unset or `default` for ordinary
+defaults, or `unlimited` for the preset. Mode values and the independent
+`unlimited` sentinels are trimmed and case-sensitive. An unsupported mode,
+including an empty mode, is rejected with the setting and original value.
+
+### Defaults and compatible numeric settings
+
+With no applicable selection, direct and writable fallback use cores minus one
+bounded to 1–2 workers; the shared daemon uses cores minus one bounded to 1–16.
+Pooled busy waiting defaults to **45,000 ms**. Read-only fallback is **unpooled
+by default**: a positive resolved finite count, independent unlimited pool, or
+the preset opts it into workers. Setting only its busy timeout does not create
+a pool. Read-only owner and worker connections remain read-only, without writer
+or synchronization authority.
+
+Existing independent-setting parsing remains compatible; no numeric syntax
+migration is required:
+
+- **Pool numbers:** JavaScript numeric conversion followed by flooring accepts
+  spellings such as `+2`, `0x10`, `1e3` and `2.9` (respectively 2, 16, 1000 and 2).
+  Nonnegative safe whole counts through `9007199254740991` are supported after
+  flooring, including finite ceilings above 16. Workers grow on demand rather
+  than allocating the maximum eagerly. Zero disables pooling.
+- **Pool fallback:** an unset or empty value selects ordinary mode defaults.
+  Whitespace-only numeric input converts to zero. Malformed, negative,
+  non-finite or unsafe numeric input retains the legacy cores-minus-one fallback
+  bounded to 1–16, including on direct/writable routes. Such input does not opt
+  read-only fallback into a pool. Prefer an explicit count or remove the value
+  when choosing a policy deliberately.
+- **Busy numbers:** numeric values from `1000` through `2147483647` ms are
+  floored. Unset, empty, malformed, non-finite, too-small or oversized values
+  fall back to 45,000 ms; zero does not disable the timer. Oversized finite
+  input uses that fallback rather than scheduling an overflowing timer.
+- **Explicit overrides:** even an empty or malformed independent value overrides
+  that side of the preset using the fallback rules above. `default` is a mode
+  value, not an independent-control sentinel. When the pool is disabled, its
+  busy timer is inapplicable regardless of the parsed timeout.
+
+### Shared service uptake and use
+
+Changing a client's environment does not change an already-running service.
+Attachment checks the service's reported implementation, canonical project and
+actual effective policy; compatible sessions reuse the project's engine/pool
+while retaining separate request and exploration history. A service that cannot
+prove compatibility, or has different effective controls, is refused rather
+than silently serving with old limits or interrupting unknown/healthy work.
+Use controls compatible with its actual policy, or allow its existing sessions
+and service to drain naturally before reconnecting with the selected policy.
+A refusal is not successful uptake. Existing fenced stale-record recovery must
+still re-admit and verify the replacement; it is not permission to stop a live
+service or create a competing writer. Fallback engines remain exceptional local
+resources, not another pool per session on a compatible shared service.
+
+### Limits outside these settings
+
+Unlimited means absence of the selected **CodeGraph configured ceiling**, not
+infinite hardware capacity. Active demand can grow worker count, CPU and memory
+use; no RAM savings or idle-to-zero product guarantee follows. Worker startup,
+failure recovery, cancellation and safe cleanup remain separate from busy
+waiting. A finite busy response does not interrupt synchronous work already
+executing. Calling applications retain independent deadlines: a host can stop
+waiting before CodeGraph returns, even when CodeGraph's own busy timer is absent.
+
+## Current implementation boundary
+
+`query-policy.ts` captures raw settings once and resolves an immutable policy.
+The preset supplies omitted independent values to `resolveLegacyQueryPolicy`;
+the retained `source: 'strict'` diagnostic tag identifies captured startup, not
+a stricter numeric grammar. Mode validation is the new syntax boundary.
+`MCPEngineOptions.queryPolicy` carries the selected policy to the dispatcher,
+pool and workers rather than rebuilding it from a later environment snapshot.
+`QueryPool` represents the absent timer as `null`. Internal execution diagnostics
+distinguish resolution, actual construction/dispatch and effective service
+policy; they are not an extra MCP tool or evidence of installed uptake.
+
+## Historical implementation notes (Issues #9–#14)
+
+The following records preserve earlier implementation and validation context.
+Stage-specific future work, numerical experiment bounds and historical platform
+receipts are not new acceptance requirements or current runtime claims. Revised
+#29 requires focused Windows checks of the requested controls and retained
+protections; ordinary combined build/regression verification belongs to #21.
+
+### Execution and ownership boundary
 
 - `QueryExecutionContext` is clone-safe and recursively frozen. Its generation
   identifies an engine, its capability distinguishes read-only authority, and
@@ -78,7 +142,7 @@ behavior are unchanged. No installation or live service is changed.
   capability. Main-thread read-only default and explicit routes continue through
   the engine's read-only project lifecycle.
 
-## Worker readiness and capacity boundary (Issue #10)
+### Worker readiness and capacity boundary (Issue #10)
 
 - A pool's presence owns every validated read. Cold starts, a recovering empty
   ready set and terminal failure never select owner-thread execution. Status,
@@ -117,7 +181,7 @@ behavior are unchanged. No installation or live service is changed.
   worker crash fixture collects before self-exit; failed initialization closes
   any connection it already opened.
 
-## Request abandonment and handover (Issue #12)
+### Request abandonment and handover (Issue #12)
 
 - The immutable worker envelope retains engine generation, session, request and
   admission identities. Owner-only `QueryRequestLifetime` carries an AbortSignal
@@ -183,7 +247,7 @@ behavior are unchanged. No installation or live service is changed.
   Windows and Linux receipts, original failures, final worker exits and cleanup
   tails are retained; source or bound artifact changes invalidate an attempt.
 
-## Independent waiting boundary (Issue #13)
+### Independent waiting boundary (Issue #13)
 
 - The existing busy-timeout override can omit the pool admission timer entirely.
   It preserves mode capacity and ordinary retention; it does not activate the
@@ -200,8 +264,9 @@ behavior are unchanged. No installation or live service is changed.
 - Startup readiness, bounded recovery, transport/catch-up and shutdown safeguards
   remain separate. The absent busy timer is no permanent-failure settlement
   mechanism. Calling applications retain independent deadlines; a long-enough
-  controlled client proves CodeGraph waiting only. #15 integrates cancellation
-  and the complete strict preset/input contract; #16 completes attachment safety.
+  controlled client proves CodeGraph waiting only. At this stage the public
+  preset and attachment integration were downstream; revised #29 consolidates
+  that work while preserving compatible independent-setting parsing.
 - Controlled host-facing proofs release a real built SQLite worker call at
   47 seconds, with a 90-second experiment bound and an independent 80-second
   client deadline, in direct, writable-fallback and shared-daemon modes. The test
@@ -210,29 +275,21 @@ behavior are unchanged. No installation or live service is changed.
   `process.hrtime.bigint` timestamps; epoch timestamps remain context only.
   Ordinary default/explicit project queries run beside this proof.
 
-## Validation boundary
+### Historical validation boundary
 
-The policy matrix, real SQLite/worker protocol, all four host-facing modes and
-default/explicit project routes are checked beneath the already agreed seams.
-Existing writer locks, catch-up, session emission history, fallback handover and
-replacement suites remain regression evidence. Run all checks with the proved
-`scripts/validation/runner.py`, using a separate complete build and bound current
-`dist`, runtime and both dependency trees. `query-tests.py` uses Vitest 2's Node
-API with an explicit empty workspace, no implicit build and an attempt-local Vite
-cache. Its JSON result must contain every test tail; only predeclared exact
-platform-gated skips are accepted. A separate diagnostic collection retains
-Vitest's unhandled errors and actual exit state through shutdown; both the full
-report and an empty error collection with exit 0 are required. The actual adapter
-producer/consumer proof accepts a clean run and rejects an unhandled rejection
-even when its test assertion passes. No held project or installed registry is used.
+Earlier checks used `scripts/validation/runner.py` and `query-tests.py` with
+bound builds/runtime/dependencies, isolated state and complete test/shutdown
+tails. Their failed or incomplete results remain evidence, not passes. Reuse
+valid unchanged evidence with explicit applicability to the current candidate;
+the earlier broad matrix and evidence-platform work are not a new campaign.
 
-## Read-only fallback boundary (Issue #11)
+### Read-only fallback boundary (Issue #11)
 
 - The existing finite pool-size setting now selects read-only workers explicitly.
   Unset/malformed/nonapplicable selections stay unpooled; zero keeps main-thread
-  reads and an inapplicable pool deadline. Legacy permissive numeric parsing
-  remains until #15. A constructed finite pool remains authoritative while cold
-  or recovering, using #10's timer-independent failure contract.
+  reads and an inapplicable pool deadline. Permissive numeric parsing remains
+  compatible in revised #29. A constructed finite pool remains authoritative
+  while cold or recovering, using #10's timer-independent failure contract.
 - A read-only engine's default, explicit, lazy worker and replacement connections
   stay read-only. It acquires no writer/synchronization lease, starts no watcher,
   performs no catch-up, migration, bulk-load repair or WAL maintenance, and does
@@ -246,8 +303,8 @@ even when its test assertion passes. No held project or installed registry is us
   facts identify `shared-project` scope. No additional MCP diagnostic or knob was
   added.
 - Read-only activation supports explicitly selected finite and unlimited pools.
-  Unset/default and explicit zero remain unpooled. Public unlimited preset uptake,
-  cancellation/drain and service compatibility remain downstream.
+  Unset/default and explicit zero remain unpooled. At this stage public preset
+  uptake, cancellation/drain and service compatibility were downstream work.
 - Real worker/SQLite tests cover cold default, same/other explicit and rootless
   routes, directory aliases, session emission stripping/isolation, genuine CLI
   service-unavailable fallback beside a live native-watching writer, unchanged
@@ -257,7 +314,7 @@ even when its test assertion passes. No held project or installed registry is us
   ordinary platform guard. All checks use the proved supervisor and receipt
   consumer; no live held index or installed service is touched.
 
-## Independent unlimited pool and idle retirement (Issue #14)
+### Independent unlimited pool and idle retirement (Issue #14)
 
 - `CODEGRAPH_QUERY_POOL_SIZE=unlimited` independently selects pooled execution
   without a configured worker or admission maximum in direct, writable fallback,

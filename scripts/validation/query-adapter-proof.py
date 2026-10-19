@@ -31,12 +31,13 @@ for name, rejection in [('clean', False), ('unhandled', True)]:
     # This deliberately synthetic, non-Git source root binds every fixture byte.
     # The outer runner separately binds the actual product/adapter Git snapshot.
     (fixture / 'baseline-source-commit.txt').write_text(os.environ['BASELINE_SOURCE_COMMIT'] + '\n', encoding='utf-8')
-    # The single assertion passes in both cases. Only the real Vitest unhandled
+    # The assertions pass in both cases. Only the real Vitest unhandled
     # rejection channel distinguishes the second producer/consumer chain.
     test = "import { it, expect } from 'vitest';\nit('adapter proof assertion', async () => {\n  expect(2 + 2).toBe(4);\n"
     if rejection:
         test += "  Promise.reject(new Error('ticket-13-unhandled-proof'));\n  await new Promise(resolve => setTimeout(resolve, 100));\n"
     test += "});\n"
+    test += "it.each(['default', 'DEFAULT'])('case-sensitive adapter identity %s', name => { expect(name.length).toBe(7); });\n"
     (test_dir / 'adapter.test.ts').write_text(test, encoding='utf-8')
     attempt = out / (name + '-attempt')
     plan = {
@@ -44,7 +45,11 @@ for name, rejection in [('clean', False), ('unhandled', True)]:
         'deadlineSeconds': 90, 'scenarios': ['query-tests'],
         'command': [sys.executable, str(root / 'scripts/validation/query-tests.py'), '__tests__/adapter.test.ts'],
         'environment': {'BASELINE_ROOT': str(fixture), 'BASELINE_RUNTIME': str(runtime), 'QUERY_EXPECTED_SKIPS': '[]'},
-        'artifacts': [str(runtime), str(root / 'node_modules'), str(fixture)],
+        # The installed workspace package may be an actual junction into ui.
+        # Its ordinary target stays independently strict, never followed by an
+        # inventory shortcut or exempted from the native input policy.
+        'artifacts': [str(runtime), str(root / 'node_modules'), str(fixture)]
+                     + ([str(root / 'ui')] if (root / 'ui').is_dir() else []),
     }
     plan_path = out / (name + '.plan.json')
     write(plan_path, plan)
@@ -54,8 +59,15 @@ for name, rejection in [('clean', False), ('unhandled', True)]:
     tests = json.loads((attempt / 'tests.json').read_text())
     diagnostics = json.loads((attempt / 'query-diagnostics.json').read_text())
     checkpoints = diagnostics['checkpoints']
-    assertion(scenario, 'fixture assertion passes in both actual Vitest runs', tests['success'] is True
-              and tests['numTotalTests'] == 1 and tests['numPassedTests'] == 1 and tests['numFailedTests'] == 0, case=name)
+    identities = [(Path(suite['name']).name, test['fullName']) for suite in tests['testResults']
+                  for test in suite['assertionResults']]
+    assertion(scenario, 'actual adapter keeps exact file and case-sensitive test identities',
+              len(identities) == 3 and set(identities) == {
+                  ('adapter.test.ts', 'adapter proof assertion'),
+                  ('adapter.test.ts', 'case-sensitive adapter identity default'),
+                  ('adapter.test.ts', 'case-sensitive adapter identity DEFAULT')}, case=name, identities=identities)
+    assertion(scenario, 'fixture assertions pass in both actual Vitest runs', tests['success'] is True
+              and tests['numTotalTests'] == 3 and tests['numPassedTests'] == 3 and tests['numFailedTests'] == 0, case=name)
     assertion(scenario, 'complete actual adapter diagnostic collection shape was accepted',
               any(row.get('name') == 'Vitest error diagnostics have the complete declared shape'
                   and row.get('passed') is True for row in receipt['events']), case=name)
