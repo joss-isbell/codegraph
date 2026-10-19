@@ -25,7 +25,7 @@ import { StoreWriter, StoreBundle, finalizeStoreBundle } from './store-writer';
 import { materializeKernelResult } from './kernel';
 import { detectGeneratedFile } from './generated-detection';
 import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, isMpegTransportStream, hasMpegTsExtension, MPEG_TS_SNIFF_BYTES, hasGrammarLoadFailure } from './grammars';
-import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, PROJECT_CONFIG_FILENAME } from '../project-config';
+import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
 import { validatePathWithinRoot, normalizePath } from '../utils';
@@ -453,6 +453,74 @@ function listGitIgnoredDirectories(rootDir: string): string[] {
   }
 }
 
+interface NestedGitignoreMatcher {
+  root: string;
+  matcher: Ignore;
+}
+
+/** Directory-rooted rules, not a snapshot of filenames that happened to exist. */
+function listNestedGitignoreMatchers(rootDir: string): NestedGitignoreMatcher[] {
+  try {
+    const options = {
+      encoding: 'utf8' as const, timeout: 60_000, maxBuffer: 50 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'ignore'] as ['ignore', 'pipe', 'ignore'], windowsHide: true,
+    };
+    const out = execFileSync('git', ['-C', rootDir, 'ls-files', '-z', '--cached', '--others', '--exclude-standard', '--', ':(glob)**/.gitignore'], options);
+    let ignoredOut = '';
+    try {
+      ignoredOut = execFileSync('git', ['-C', rootDir, 'ls-files', '-z', '-o', '-i', '--exclude-standard', '--', ':(glob)**/.gitignore'], options);
+    } catch { /* Ordinary tracked/untracked rules remain available. */ }
+    const entries = new Set([...out.split('\0'), ...ignoredOut.split('\0')].filter(Boolean));
+    const matchers: NestedGitignoreMatcher[] = [];
+    for (const entry of entries) {
+      const parts = entry.split(/[\\/]/);
+      if (path.isAbsolute(entry) || parts.includes('..') || parts.length < 2 || parts.at(-1) !== '.gitignore') continue;
+      const patterns = readGitignorePatterns(path.join(rootDir, ...parts));
+      if (!patterns) continue;
+      const matcher = ignore().add(patterns);
+      matcher.ignores('.codegraph-probe');
+      matchers.push({ root: `${parts.slice(0, -1).join('/')}/`, matcher });
+    }
+    return matchers.sort((a, b) => a.root.length - b.root.length || a.root.localeCompare(b.root));
+  } catch {
+    return [];
+  }
+}
+
+function embeddedPathIgnored(rootMatcher: Ignore, nestedMatchers: NestedGitignoreMatcher[], rel: string): boolean {
+  let ignored = rootMatcher.ignores(rel);
+  for (const nested of nestedMatchers) {
+    if (!rel.startsWith(nested.root) || rel === nested.root) continue;
+    const result = nested.matcher.test(rel.slice(nested.root.length));
+    if (result.ignored) ignored = true;
+    else if (result.unignored) ignored = false;
+  }
+  return ignored;
+}
+
+function embeddedPathParents(rel: string): string[] {
+  const parts = rel.replace(/[\\/]+$/, '').split('/').filter(Boolean);
+  const parents: string[] = [];
+  for (let index = 1; index < parts.length; index++) parents.push(`${parts.slice(0, index).join('/')}/`);
+  return parents;
+}
+
+/** An ignored ancestor makes deeper rule files inactive, even if they negate it. */
+function eligibleNestedGitignoreMatchers(rootMatcher: Ignore, nestedMatchers: NestedGitignoreMatcher[]): NestedGitignoreMatcher[] {
+  const eligible: NestedGitignoreMatcher[] = [];
+  for (const nested of nestedMatchers) {
+    if (embeddedPathParents(nested.root).some((parent) => embeddedPathIgnored(rootMatcher, eligible, parent)) ||
+        embeddedPathIgnored(rootMatcher, eligible, nested.root)) continue;
+    eligible.push(nested);
+  }
+  return eligible;
+}
+
+function embeddedIgnoreMatches(rootMatcher: Ignore, nestedMatchers: NestedGitignoreMatcher[], rel: string): boolean {
+  return embeddedPathIgnored(rootMatcher, nestedMatchers, rel) ||
+    embeddedPathParents(rel).some((parent) => embeddedPathIgnored(rootMatcher, nestedMatchers, parent));
+}
+
 /**
  * An `ignore` matcher seeded with the built-in defaults, merged with the project's
  * root .gitignore so a negation there (e.g. `!vendor/`) overrides a default, plus
@@ -746,7 +814,7 @@ function classifyGitDir(absDir: string): 'embedded' | 'worktree' | 'none' {
  * from npm git-dependencies — that never makes it project code) and CodeGraph
  * data dirs. Depth- and entry-capped so a huge ignored tree can't stall the scan.
  */
-function findNestedGitRepos(absDir: string, relPrefix: string): string[] {
+function findNestedGitRepos(absDir: string, relPrefix: string, requireComplete = false): string[] {
   const found: string[] = [];
   const defaults = defaultsOnlyIgnore();
   const queue: Array<{ abs: string; rel: string; depth: number }> = [
@@ -756,6 +824,9 @@ function findNestedGitRepos(absDir: string, relPrefix: string): string[] {
   while (queue.length > 0) {
     const { abs, rel, depth } = queue.shift()!;
     if (++examined > EMBEDDED_REPO_SEARCH_ENTRIES) {
+      if (requireComplete) {
+        throw new Error(`Selected embedded-repository discovery exceeded the ${EMBEDDED_REPO_SEARCH_ENTRIES}-directory limit under ${relPrefix || '.'}; synchronization aborted`);
+      }
       logDebug('Embedded-repo search entry cap hit — deeper repos (if any) not discovered', { under: relPrefix });
       break;
     }
@@ -836,11 +907,11 @@ export function preloadLanguagesForFiles(
 }
 
 export class ScopeIgnore {
-  private embedded: Array<{ root: string; matcher: Ignore }>;
+  private embedded: Array<{ root: string; matcher: Ignore; nestedMatchers?: NestedGitignoreMatcher[] }>;
   private defaults: Ignore = defaultsOnlyIgnore();
   constructor(
     private rootMatcher: Ignore,
-    embedded: Array<{ root: string; matcher: Ignore }>,
+    embedded: Array<{ root: string; matcher: Ignore; nestedMatchers?: NestedGitignoreMatcher[] }>,
     /**
      * Project `codegraph.json` `exclude` patterns (#999), matched against the
      * full root-relative path. Wins over everything else — an explicit user
@@ -864,6 +935,9 @@ export class ScopeIgnore {
   }
 
   ignores(rel: string): boolean {
+    // Git enumeration does not know CodeGraph's private storage policy. Keep
+    // internal directories out of every scope route, even an explicit include.
+    if (rel.split('/').slice(0, -1).some((part) => part === '.git' || isCodeGraphDataDir(part))) return true;
     // User `exclude` (#999) is checked first and against the full root-relative
     // path: it must drop git-TRACKED paths (which `.gitignore` can't) and apply
     // everywhere, including ancestors of embedded repos.
@@ -880,14 +954,14 @@ export class ScopeIgnore {
         return false;
       }
     }
-    for (const { root, matcher } of this.embedded) {
+    for (const { root, matcher, nestedMatchers = [] } of this.embedded) {
       if (rel.startsWith(root)) {
         const inner = rel.slice(root.length);
         if (inner === '') return false;
         // Built-in defaults apply to the FULL path uniformly (#407) — an
         // embedded repo inside node_modules (an npm git-dependency) must stay
         // excluded even though its own rules wouldn't ignore its files.
-        return this.defaults.ignores(rel) || matcher.ignores(inner);
+        return this.defaults.ignores(rel) || embeddedIgnoreMatches(matcher, nestedMatchers, inner);
       }
     }
     // Never prune a directory that leads to an embedded repo.
@@ -915,7 +989,12 @@ export function buildScopeIgnore(rootDir: string, embeddedRoots?: Iterable<strin
   }
   return new ScopeIgnore(
     rootMatcher,
-    roots.map((root) => ({ root, matcher: buildDefaultIgnore(path.join(rootDir, root)) })),
+    roots.map((root) => {
+      const embeddedRoot = path.join(rootDir, root);
+      const matcher = buildDefaultIgnore(embeddedRoot);
+      for (const dir of listGitIgnoredDirectories(embeddedRoot)) matcher.add(dir);
+      return { root, matcher, nestedMatchers: eligibleNestedGitignoreMatchers(matcher, listNestedGitignoreMatchers(embeddedRoot)) };
+    }),
     loadExcludeMatcher(rootDir),
     include,
     include ? includeStaticRoots(loadIncludePatterns(rootDir)) : [],
@@ -962,14 +1041,15 @@ function gitlinkEmbeddedRepoSkipped(
  * (#514) only for directories the project opted in via `codegraph.json`
  * `includeIgnored` (#622, #699); otherwise `.gitignore` is respected and they
  * are not discovered (#970, #976). Recursive (an embedded repo can embed further
- * repos). Returns [] for non-git roots: the filesystem walk handles nested repos
- * there already.
+ * repos). A non-Git root discovers only explicitly selected repositories below
+ * the allowlist's static prefixes; the ordinary filesystem walk stays scoped.
  */
 export function discoverEmbeddedRepoRoots(rootDir: string): string[] {
+  let isGitRepo = true;
   try {
     execFileSync('git', ['rev-parse', '--git-dir'], { cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
   } catch {
-    return [];
+    isGitRepo = false;
   }
   const out: string[] = [];
   const defaults = defaultsOnlyIgnore();
@@ -1017,7 +1097,14 @@ export function discoverEmbeddedRepoRoots(rootDir: string): string[] {
       visit(path.join(repoAbs, rel), full);
     }
   };
-  visit(rootDir, '');
+  if (isGitRepo) {
+    visit(rootDir, '');
+  } else if (includeIgnored) {
+    for (const rel of findExplicitIncludedEmbeddedRepos(rootDir, includeIgnored)) {
+      out.push(rel);
+      visit(path.join(rootDir, rel), rel);
+    }
+  }
   return out;
 }
 
@@ -1105,6 +1192,21 @@ function findIgnoredEmbeddedRepos(repoDir: string, includeIgnored: Ignore | null
     }
   }
   return repos;
+}
+
+/** The reviewed bounded discovery path for explicitly selected non-Git roots. */
+function findExplicitIncludedEmbeddedRepos(rootDir: string, includeIgnored: Ignore | null): string[] {
+  if (!includeIgnored) return [];
+  const found = new Set<string>();
+  for (const root of includeStaticRoots(loadIncludeIgnoredPatterns(rootDir))) {
+    const abs = root ? path.join(rootDir, root) : rootDir;
+    if (!fs.existsSync(abs)) continue;
+    for (const rel of findNestedGitRepos(abs, root, true)) {
+      const normalized = normalizePath(rel.endsWith('/') ? rel : `${rel}/`);
+      if (includeIgnored.ignores(normalized)) found.add(normalized);
+    }
+  }
+  return [...found].sort();
 }
 
 /**
@@ -1769,6 +1871,33 @@ function scanDirectoryWalk(
       }
     }
   }
+  // The filesystem walk cannot see selected repositories beneath an ignored
+  // ancestor. Use the same bounded allowlist discovery as watching, then let
+  // each child Git checkout enumerate its own applicable ignore rules.
+  const includeIgnored = loadIncludeIgnoredMatcher(rootDir);
+  const explicitRoots = findExplicitIncludedEmbeddedRepos(rootDir, includeIgnored);
+  if (explicitRoots.length > 0) {
+    const embeddedFiles = new Set<string>();
+    const embeddedRoots = new Set<string>();
+    for (const root of explicitRoots) {
+      embeddedRoots.add(root);
+      collectGitFiles(path.join(rootDir, root), root, embeddedFiles, embeddedRoots, includeIgnored);
+    }
+    const embeddedScope = buildScopeIgnore(rootDir, embeddedRoots);
+    const seen = new Set(files);
+    for (const filePath of embeddedFiles) {
+      if (embeddedScope.ignores(filePath)) continue;
+      if (!isSourceFile(filePath, overrides, rootDir)) {
+        tallySkip(stats, filePath);
+        continue;
+      }
+      if (!seen.has(filePath)) {
+        files.push(filePath);
+        seen.add(filePath);
+        onProgress?.(++count, filePath);
+      }
+    }
+  }
   return files;
 }
 
@@ -1850,13 +1979,6 @@ export class ExtractionOrchestrator {
    * hasn't run yet so single-file re-index paths can detect on the spot.
    */
   private detectedFrameworkNames: string[] | null = null;
-  /**
-   * Scope matcher for SCOPED syncs, memoized on the mtimes of the two root
-   * files it is derived from (`codegraph.json`, `.gitignore`). See
-   * {@link scopedSyncMatcher}.
-   */
-  private scopedMatcher: { key: string; matcher: ScopeIgnore } | null = null;
-
   constructor(rootDir: string, queries: QueryBuilder) {
     this.rootDir = rootDir;
     this.queries = queries;
@@ -1869,36 +1991,11 @@ export class ExtractionOrchestrator {
    * rule, a built-in default) is treated exactly as the full walk would treat
    * it: absent, hence removed if tracked, never parsed (#1590).
    *
-   * Memoized on the root config + root `.gitignore` mtimes: building the
-   * matcher runs embedded-repo discovery (`git ls-files`), which would defeat
-   * the scoped path's whole point (skipping O(repo) work) if paid per sync.
-   * Two `stat`s per sync while nothing changed. An embedded repo created
-   * between config edits joins the scoped matcher on the next full sync, the
-   * same lifecycle the watcher's own matcher already has.
+   * Build once per scoped batch. Root-only memoization misses child/deeper
+   * ignore replacements and applicable Git configuration/exclude changes.
    */
   private scopedSyncMatcher(): ScopeIgnore {
-    // Bust when any root-level exclude source the matcher reads may have
-    // changed. Nested `.gitignore` edits force a full watcher sync, which
-    // clears this cache (see the full-reconcile branch in sync()).
-    const gitDir = resolveGitDir(this.rootDir);
-    const key = [
-      PROJECT_CONFIG_FILENAME,
-      '.gitignore',
-      gitDir ? path.join(gitDir, 'info', 'exclude') : '',
-    ]
-      .map((name) => {
-        if (!name) return '-';
-        try {
-          return String(fs.statSync(path.isAbsolute(name) ? name : path.join(this.rootDir, name)).mtimeMs);
-        } catch {
-          return '-';
-        }
-      })
-      .join('|');
-    if (this.scopedMatcher && this.scopedMatcher.key === key) return this.scopedMatcher.matcher;
-    const matcher = buildScopeIgnore(this.rootDir);
-    this.scopedMatcher = { key, matcher };
-    return matcher;
+    return buildScopeIgnore(this.rootDir);
   }
 
   /**
@@ -3336,10 +3433,6 @@ export class ExtractionOrchestrator {
       filesChecked = unique.length;
       if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-scoped: ${Date.now() - tSyncScan}ms (${unique.length} paths, ${trackedFiles.length} tracked)`);
     } else {
-      // Full reconcile: drop the memoized scope matcher so a nested
-      // `.gitignore` / exclude-standard change that forced this full sync is
-      // visible to the next scoped sync (#1728).
-      this.scopedMatcher = null;
       currentFiles = await scanDirectoryAsync(this.rootDir);
       if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-scan: ${Date.now() - tSyncScan}ms (${currentFiles.length} files)`);
       filesChecked = currentFiles.length;

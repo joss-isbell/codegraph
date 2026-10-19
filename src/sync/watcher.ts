@@ -35,7 +35,8 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { isSourceFile, buildScopeIgnore, type ScopeIgnore } from '../extraction';
+import { isSourceFile, buildScopeIgnore, discoverEmbeddedRepoRoots, type ScopeIgnore } from '../extraction';
+import { readGitScopeInputs } from '../extraction/scope-inputs';
 import { loadExtensionOverrides, PROJECT_CONFIG_FILENAME } from '../project-config';
 import { logDebug, logWarn } from '../errors';
 import { normalizePath } from '../utils';
@@ -269,6 +270,12 @@ export class FileWatcher {
   private recursiveWatcher: fs.FSWatcher | null = null;
   /** Linux directory watches / macOS and Windows supplemental symlink streams. */
   private dirWatchers = new Map<string, fs.FSWatcher>();
+  /** Parent-directory streams for applicable Git metadata / external inputs. */
+  private scopeInputWatchers = new Map<string, fs.FSWatcher>();
+  private scopeInputPaths = new Map<string, string>();
+  private scopeRepoRoots: string[] = [];
+  private scopeInputSignature = '';
+  private scopeRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   /** Set once the per-directory watch cap is hit, so we log only once. */
   private dirCapWarned = false;
   /**
@@ -411,10 +418,9 @@ export class FileWatcher {
       return false;
     }
 
-    // Reuse the indexer's ignore set so the watcher and indexer agree on scope.
-    this.ignoreMatcher = buildScopeIgnore(this.projectRoot);
-
     try {
+      // Reuse the indexer's ignore set and inventory the inputs that define it.
+      this.rebuildScope();
       if (this.inertForTests) {
         // Test-only: install no OS watcher; the seam drives events instead.
         this.inert = true;
@@ -423,6 +429,7 @@ export class FileWatcher {
       } else {
         this.refreshWatchTree();
       }
+      this.refreshScopeInputWatches();
 
       // The per-directory (Linux) path catches watch-resource exhaustion inside
       // watchDirectory and degrades synchronously rather than throwing, so it never
@@ -540,7 +547,7 @@ export class FileWatcher {
     // Recursive streams cost more than inotify entries. Keep a separate hard
     // ceiling while honouring a lower user-configured directory watch budget.
     const cap = recursive ? Math.min(256, maxDirWatches()) : maxDirWatches();
-    if (this.dirWatchers.size >= cap) {
+    if (this.dirWatchers.size + this.scopeInputWatchers.size >= cap) {
       if (!this.dirCapWarned) {
         this.dirCapWarned = true;
         logWarn('File watcher hit directory-watch cap; remaining subtrees rely on manual/periodic sync', { cap });
@@ -590,6 +597,12 @@ export class FileWatcher {
       return;
     }
     const full = path.join(dir, String(filename));
+    // Selected child metadata and external/config inputs define scope even
+    // when their parent (.git, or an explicitly ignored directory) is hidden.
+    if (this.scopeInputPaths.has(this.scopePathKey(full))) {
+      this.scheduleScopeInputRefresh(full);
+      return;
+    }
     const rel = normalizePath(path.relative(this.projectRoot, full));
     if (!rel || rel === '.') {
       this.scheduleTreeRefresh();
@@ -640,12 +653,7 @@ export class FileWatcher {
       return;
     }
     if (this.ignoreMatcher && this.ignoreMatcher.ignores(rel)) return;
-    // A nested `.gitignore` (an embedded child repo's own rules, #514, or a
-    // subdirectory rule the git-backed full scan honors) is only a scope
-    // change when it sits INSIDE the current scope — checked after the matcher
-    // on purpose, so the thousands of package-local `.gitignore`s an
-    // `npm install` writes under an ignored `node_modules/` never trigger a
-    // rebuild storm.
+    // A nested rule file uses the existing in-scope source-tree event route.
     if (rel.endsWith('/.gitignore')) {
       this.refreshScope(rel);
       return;
@@ -704,10 +712,120 @@ export class FileWatcher {
    */
   private refreshScope(rel: string): void {
     logDebug('Scope config changed; rebuilding watcher scope', { file: rel });
-    this.ignoreMatcher = buildScopeIgnore(this.projectRoot);
-    this.scheduleTreeRefresh();
+    try {
+      this.rebuildScope();
+      this.refreshScopeInputWatches();
+      this.scheduleTreeRefresh();
+    } catch (error) {
+      // Keep the last verified matcher/input coverage. The full sync retries
+      // the same invalid/inaccessible scope through the existing failure path
+      // instead of throwing out of an OS callback or claiming fresh membership.
+      logWarn('Could not refresh watcher scope; scheduling full reconciliation', {
+        error: String(error),
+      });
+    }
     this.needsFullScan = true;
     this.scheduleSync();
+  }
+
+  private scopePathKey(file: string): string {
+    const absolute = path.resolve(file);
+    return process.platform === 'win32' ? absolute.toLowerCase() : absolute;
+  }
+
+  /** One shared bounded discovery; publish new scope only after all inputs read. */
+  private rebuildScope(): void {
+    const embeddedRoots = discoverEmbeddedRepoRoots(this.projectRoot);
+    const repoRoots = [this.projectRoot, ...embeddedRoots.map((root) => path.join(this.projectRoot, root))];
+    const inventories = repoRoots.map((root) => readGitScopeInputs(root));
+    const matcher = buildScopeIgnore(this.projectRoot, embeddedRoots);
+    this.ignoreMatcher = matcher;
+    this.scopeRepoRoots = repoRoots;
+    this.scopeInputSignature = inventories.map((input) => input.signature).join('|');
+    this.scopeInputPaths = new Map(inventories.flatMap((input) =>
+      input.inputPaths.map((file) => [this.scopePathKey(file), file] as const)
+    ));
+  }
+
+  /** Coalesce native duplicate/metadata events and ignore unchanged file reads. */
+  private scheduleScopeInputRefresh(file: string): void {
+    if (this.scopeRefreshTimer || this.stopped) return;
+    this.scopeRefreshTimer = setTimeout(() => {
+      this.scopeRefreshTimer = null;
+      try {
+        const signature = this.scopeRepoRoots.map((root) => readGitScopeInputs(root).signature).join('|');
+        if (signature === this.scopeInputSignature) {
+          this.refreshScopeInputWatches();
+          return;
+        }
+      } catch {
+        // refreshScope retains old coverage and schedules the failing full sync.
+      }
+      this.refreshScope(file);
+    }, 50);
+  }
+
+  /**
+   * Watch containing directories, not individual file inodes: editor/Git atomic
+   * replacement and delete/restore must keep delivering events.
+   */
+  private refreshScopeInputWatches(): void {
+    if (this.inertForTests || this.inert || this.stopped) return;
+    const desired = new Set<string>();
+    for (const file of this.scopeInputPaths.values()) {
+      const rel = normalizePath(path.relative(this.projectRoot, file));
+      // Ordinary in-project inputs are already covered by the source tree.
+      // .git metadata is deliberately pruned there, including on Linux.
+      if (rel && !rel.startsWith('../') && !path.isAbsolute(rel) &&
+          !this.isAlwaysIgnored(rel) && !this.shouldIgnoreDir(path.dirname(file))) continue;
+      const dir = path.dirname(file);
+      try {
+        if (fs.statSync(dir).isDirectory()) desired.add(dir);
+      } catch { /* no input directory to watch */ }
+    }
+    for (const [dir, watcher] of this.scopeInputWatchers) {
+      if (!desired.has(dir)) {
+        watcher.close();
+        this.scopeInputWatchers.delete(dir);
+      }
+    }
+    for (const dir of desired) {
+      if (this.stopped || this.inotifyLimitWarned) return;
+      if (this.scopeInputWatchers.has(dir)) continue;
+      const cap = supportsRecursiveWatch() ? Math.min(256, maxDirWatches()) : maxDirWatches();
+      if (this.dirWatchers.size + this.scopeInputWatchers.size >= cap) {
+        if (!this.dirCapWarned) {
+          this.dirCapWarned = true;
+          logWarn('File watcher hit directory-watch cap; remaining scope inputs rely on manual/periodic sync', { cap });
+        }
+        return;
+      }
+      try {
+        const watcher = watchImpl(dir, { persistent: true }, (_event, filename) => {
+          if (this.stopped) return;
+          const changed = filename == null ? null : this.scopePathKey(path.join(dir, String(filename)));
+          if (changed === null || this.scopeInputPaths.has(changed)) this.scheduleScopeInputRefresh(dir);
+        });
+        this.scopeInputWatchers.set(dir, watcher);
+        watcher.on('error', (error: unknown) => {
+          if (isWatchResourceExhaustion(error)) {
+            this.degrade(EXHAUSTION_REASON, { error: String(error), dir });
+            return;
+          }
+          if (isInotifyWatchExhaustion(error)) this.warnInotifyLimit({ error: String(error), dir });
+          watcher.close();
+          this.scopeInputWatchers.delete(dir);
+          this.scheduleScopeInputRefresh(dir);
+        });
+      } catch (error) {
+        if (isWatchResourceExhaustion(error)) {
+          this.degrade(EXHAUSTION_REASON, { error: String(error), dir });
+          return;
+        }
+        if (isInotifyWatchExhaustion(error)) this.warnInotifyLimit({ error: String(error), dir });
+        else logWarn('Could not watch Git scope input directory', { dir, error: String(error) });
+      }
+    }
   }
 
   /**
@@ -861,6 +979,8 @@ export class FileWatcher {
    */
   stop(): void {
     this.stopped = true;
+    if (this.scopeRefreshTimer) clearTimeout(this.scopeRefreshTimer);
+    this.scopeRefreshTimer = null;
     if (this.treeRefreshTimer) clearTimeout(this.treeRefreshTimer);
     this.treeRefreshTimer = null;
     this.knownDirs.clear();
@@ -888,6 +1008,13 @@ export class FileWatcher {
       }
     }
     this.dirWatchers.clear();
+    for (const watcher of this.scopeInputWatchers.values()) {
+      try { watcher.close(); } catch { /* already closed */ }
+    }
+    this.scopeInputWatchers.clear();
+    this.scopeInputPaths.clear();
+    this.scopeRepoRoots = [];
+    this.scopeInputSignature = '';
     this.dirCapWarned = false;
     this.inotifyLimitWarned = false;
     this.lockRetryCount = 0;
