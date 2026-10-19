@@ -24,6 +24,7 @@ import { ParseWorkerPool, resolveParsePoolSize, resolveParseTimeoutMs } from './
 import { StoreWriter, StoreBundle, finalizeStoreBundle } from './store-writer';
 import { materializeKernelResult } from './kernel';
 import { detectGeneratedFile } from './generated-detection';
+import { expandUserPath, resolveGitDir } from './scope-inputs';
 import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, isMpegTransportStream, hasMpegTsExtension, MPEG_TS_SNIFF_BYTES, hasGrammarLoadFailure } from './grammars';
 import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
@@ -355,36 +356,6 @@ function readGitignorePatterns(giPath: string): string {
     );
   }
   return kept.join('\n');
-}
-
-/**
- * Resolve the repository GIT_DIR for `repoRoot` (a `.git` directory, or the
- * target of a `.git` file pointer). Null when this isn't a git checkout.
- */
-function resolveGitDir(repoRoot: string): string | null {
-  const gitPath = path.join(repoRoot, '.git');
-  let st: fs.Stats;
-  try {
-    st = fs.statSync(gitPath);
-  } catch {
-    return null;
-  }
-  if (st.isDirectory()) return gitPath;
-  if (!st.isFile()) return null;
-  try {
-    const raw = fs.readFileSync(gitPath, 'utf8').match(/^gitdir:\s*(.+)$/m)?.[1]?.trim();
-    if (!raw) return null;
-    return path.isAbsolute(raw) ? path.normalize(raw) : path.resolve(repoRoot, raw);
-  } catch {
-    return null;
-  }
-}
-
-/** Expand a leading `~/` the way git does for `core.excludesFile`. */
-function expandUserPath(p: string): string {
-  if (p === '~') return os.homedir();
-  if (p.startsWith('~/')) return path.join(os.homedir(), p.slice(2));
-  return p;
 }
 
 /**

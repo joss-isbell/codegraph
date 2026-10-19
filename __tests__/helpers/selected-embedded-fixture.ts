@@ -37,7 +37,7 @@ export function createSelectedEmbeddedFixture(container?: string) {
   write('hidden/loose.ts', 'export function looseHiddenFact() { return 0; }\n');
   write('hidden/source/entry.ts', "import { sourceLeaf } from './leaf';\nimport { dependencyFact } from '../deps/pkg/dep';\nexport function sourceEntry() { return sourceLeaf() + dependencyFact(); }\n");
   write('hidden/source/leaf.ts', 'export function sourceLeaf() { return 11; }\n');
-  write('hidden/source/.gitignore', 'root-ignored.ts\nsealed/\n!sealed/reopened/\n');
+  write('hidden/source/.gitignore', 'root-ignored.ts\nsealed/\n!sealed/reopened/\n.gitignore\n');
   write('hidden/source/codegraph.json', JSON.stringify({ exclude: ['leaf.ts'] }));
   write('hidden/source/root-ignored.ts', 'export function rootIgnoredFact() {}\n');
   write('hidden/source/explicit.ts', 'export function explicitlyExcludedFact() {}\n');

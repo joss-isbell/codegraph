@@ -12,6 +12,36 @@ export interface GitScopeInputs {
 
 const cachedInputs = new Map<string, GitScopeInputs>();
 
+/**
+ * Resolve the repository GIT_DIR for `repoRoot` (a `.git` directory, or the
+ * target of a `.git` file pointer). Null when this isn't a git checkout.
+ */
+export function resolveGitDir(repoRoot: string): string | null {
+  const gitPath = path.join(repoRoot, '.git');
+  let st: fs.Stats;
+  try {
+    st = fs.statSync(gitPath);
+  } catch {
+    return null;
+  }
+  if (st.isDirectory()) return gitPath;
+  if (!st.isFile()) return null;
+  try {
+    const raw = fs.readFileSync(gitPath, 'utf8').match(/^gitdir:\s*(.+)$/m)?.[1]?.trim();
+    if (!raw) return null;
+    return path.isAbsolute(raw) ? path.normalize(raw) : path.resolve(repoRoot, raw);
+  } catch {
+    return null;
+  }
+}
+
+/** Expand a leading `~/` the way git does for `core.excludesFile`. */
+export function expandUserPath(p: string): string {
+  if (p === '~') return os.homedir();
+  if (p.startsWith('~/')) return path.join(os.homedir(), p.slice(2));
+  return p;
+}
+
 function inputSignature(paths: string[]): string {
   const hash = createHash('sha256');
   for (const file of paths) {
@@ -65,14 +95,9 @@ export function readGitScopeInputs(repoRoot: string): GitScopeInputs {
     return absolute;
   };
   const marker = path.join(root, '.git');
-  let gitDir: string | null = null;
+  const gitDir = resolveGitDir(root);
   try {
-    if (fs.statSync(marker).isDirectory()) gitDir = marker;
-    else {
-      add(marker);
-      const pointer = fs.readFileSync(marker, 'utf8').match(/^gitdir:\s*(.+)$/m)?.[1]?.trim();
-      if (pointer) gitDir = path.resolve(root, pointer);
-    }
+    if (fs.statSync(marker).isFile()) add(marker);
   } catch { /* non-Git parent; its selected children are inventoried separately */ }
   if (gitDir) {
     // Match the existing scanner's .git-directory/file resolution policy.
@@ -89,9 +114,7 @@ export function readGitScopeInputs(repoRoot: string): GitScopeInputs {
   if (value) {
     // Mirror readGitExcludeExtraPatterns, including its current relative-path
     // behavior. This inventory must not introduce new matching semantics.
-    const expanded = value === '~' ? os.homedir()
-      : value.startsWith('~/') ? path.join(os.homedir(), value.slice(2)) : value;
-    add(path.resolve(expanded));
+    add(path.resolve(expandUserPath(value)));
   }
   const inputPaths = [...inputs].sort();
   const result = { inputPaths, signature: inputSignature(inputPaths) };

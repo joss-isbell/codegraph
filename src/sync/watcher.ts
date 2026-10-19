@@ -652,12 +652,15 @@ export class FileWatcher {
       this.refreshScope(rel);
       return;
     }
-    if (this.ignoreMatcher && this.ignoreMatcher.ignores(rel)) return;
-    // A nested rule file uses the existing in-scope source-tree event route.
+    // Git reads a nested rule file even when the rule file itself is ignored;
+    // only an ignored parent makes that layer unreachable. Keep ignored trees
+    // (including package-local node_modules rules) out of the refresh route.
     if (rel.endsWith('/.gitignore')) {
+      if (this.ignoreMatcher?.ignores(normalizePath(path.dirname(rel)) + '/')) return;
       this.refreshScope(rel);
       return;
     }
+    if (this.ignoreMatcher && this.ignoreMatcher.ignores(rel)) return;
     if (!isSourceFile(rel, loadExtensionOverrides(this.projectRoot), this.projectRoot)) {
       this.maybeScheduleForRemovedDir(rel);
       return;
