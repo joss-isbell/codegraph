@@ -858,7 +858,10 @@ export class MCPServer {
       assertStartupRoute(route);
       const probe = await connectAnyCandidate();
       if (probe) return probe;
-      assertNoLiveQueryDaemon(root);
+      // A preflight-permitted primary candidate can own the daemon lock before
+      // binding. Only its exact held-route seed may reach the bounded ACK-to-
+      // attachment wait below; permission itself grants no service authority.
+      if (capturedSeed?.result.kind !== 'permitted') assertNoLiveQueryDaemon(root);
       const bootstrapResult = capturedSeed?.result ?? await spawnDetachedDaemon(route, startup, false, signal);
       if (bootstrapResult.kind === 'refused') throw bootstrapResult.refusal;
       cancelled(signal);
