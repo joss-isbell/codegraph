@@ -813,7 +813,10 @@ function findNestedGitRepos(absDir: string, relPrefix: string, requireComplete =
     let entries: fs.Dirent[];
     try {
       entries = fs.readdirSync(abs, { withFileTypes: true });
-    } catch {
+    } catch (cause) {
+      if (requireComplete) {
+        throw new Error(`Selected embedded-repository discovery could not read ${abs}; synchronization aborted`, { cause });
+      }
       continue;
     }
     for (const entry of entries) {
