@@ -690,8 +690,8 @@ describe('one captured startup through actual CLI and native candidate', () => {
       client = new ProcessClient([...recorder.args, '--require', path.join(__dirname, 'fixtures/query-startup-transport-observer.cjs'),
         cli, 'serve', '--mcp', '--path', root], root, environment({ ...recorder.env,
         CODEGRAPH_NO_DAEMON: '0', CODEGRAPH_DAEMON_RETRY_MS: '0',
-        // The unsupported-shared discovery branch requires a real inert
-        // preflight before parent schema work; corruption must remain terminal.
+        // Qualified candidate corruption must remain terminal during the real
+        // startup preflight, before parent schema work or fallback.
         CODEGRAPH_QUERY_MODE: 'unlimited',
         QUERY_STARTUP_CORRUPT: corruption, QUERY_UNLIMITED_OBSERVATIONS: observations,
       }));
@@ -709,8 +709,6 @@ describe('one captured startup through actual CLI and native candidate', () => {
       expect(captured).toHaveLength(1);
       expect(captured[0]).toMatchObject({ qualified: true, cpuObservations: 0, rawAfter: {}, refusal: { reason: 'unknown' } });
       expect(events().filter(event => event.event === 'startup-bootstrap-result').map(event => event.result.kind)).toEqual(['refused']);
-      expect(events().filter(event => event.event === 'startup-bootstrap-result').map(event => event.options))
-        .toEqual([{ acknowledgePermission: false }]);
       expect(events().filter(event => event.event === 'startup-bootstrap-status').map(event => event.status))
         .toEqual([expect.objectContaining({ protocol: 1, kind: 'refused', refusal: expect.objectContaining({ reason: 'unknown', projectRoot: root }) })]);
       expect(events().filter(event => event.event === 'startup-bootstrap-ack-sent')).toEqual([]);

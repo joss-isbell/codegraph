@@ -88,7 +88,7 @@ describe('query execution diagnostics', () => {
         socket.once('close', () => { clearTimeout(timer); failure ? reject(failure) : resolve(result); });
       });
       expect(hello.queryExecution).toMatchObject({ schemaVersion: 1,
-        implementation: { policySchemaVersion: 1, support: { combinedPreset: false } }, requested: {},
+        implementation: { policySchemaVersion: 1, support: { combinedPreset: true } }, requested: {},
         effective: { executionMode: 'shared-daemon', concurrency: { kind: 'finite' }, deadline: { kind: 'finite', milliseconds: 45000 } },
         ownership: { pid: child.pid, resourceScope: 'shared-project' }, lifecycle: { state: 'cold', workers: 0, ready: false },
         project: { route: 'default', root, index: fs.realpathSync(getDatabasePath(root)) } });

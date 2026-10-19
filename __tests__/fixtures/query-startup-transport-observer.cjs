@@ -250,7 +250,7 @@ if (!threads.isMainThread && threads.workerData?.execution) {
     const corruption = process.env.QUERY_STARTUP_CORRUPT;
     if (corruption === 'missing') delete options.env[metadata];
     if (corruption === 'extra-key') options.env[metadata] = '{"protocol":1,"cpuCount":3,"extra":true}';
-    if (corruption === 'control') options.env.CODEGRAPH_QUERY_POOL_SIZE = '';
+    if (corruption === 'control') options.env.CODEGRAPH_QUERY_MODE = 'unlimited x';
     const child = originalSpawn.call(this, command, args, options);
     const inheritedDescriptors = [...new Set(options.stdio.filter(value => typeof value === 'number'))];
     for (const descriptor of inheritedDescriptors) {

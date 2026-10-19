@@ -161,7 +161,43 @@ if (threads.isMainThread) {
   const port = threads.parentPort;
   const safeExit = reason => {
     const { collectBeforeExit } = require('../../dist/worker-teardown');
-    const collected = collectBeforeExit();
+    const vm = require('node:vm'), v8 = require('node:v8');
+    const originalContext = vm.runInNewContext, originalFlags = v8.setFlagsFromString;
+    // Buffer only within the real collection call: evidence I/O must not sit
+    // between its existing flag changes, context acquisition and invocation.
+    const collection = [];
+    let collectionOverflow = false;
+    const note = value => { if (collection.length < 8) collection.push(value); else collectionOverflow = true; };
+    const observe = (stage, target, returned) => new Proxy(target, {
+      apply(target, receiver, args) {
+        note({ stage, state: 'called', flags: stage === 'acquire-flags' ? args[0] : undefined });
+        let result;
+        try { result = Reflect.apply(target, receiver, args); }
+        catch (error) { note({ stage, state: 'threw', error }); throw error; }
+        note({ stage, state: 'returned', resultType: typeof result });
+        return returned ? returned(result) : result;
+      },
+    });
+    v8.setFlagsFromString = observe('acquire-flags', originalFlags);
+    vm.runInNewContext = new Proxy(originalContext, {
+      apply(target, receiver, args) {
+        if (args[0] !== 'gc') return Reflect.apply(target, receiver, args);
+        return Reflect.apply(observe('acquire-context', target, result =>
+          typeof result === 'function' ? observe('invoke', result) : result), receiver, args);
+      },
+    });
+    let collected;
+    try { collected = collectBeforeExit(); }
+    finally { vm.runInNewContext = originalContext; v8.setFlagsFromString = originalFlags; }
+    for (const fact of collection) {
+      const { error, ...value } = fact;
+      let failure;
+      if (fact.state === 'threw') {
+        try { failure = String(error).slice(0, 2048); } catch { failure = 'unformattable native collection error'; }
+      }
+      record({ event: 'exit-collection-observation', reason, ...value, failure });
+    }
+    record({ event: 'exit-collection-observation-complete', reason, collected, overflow: collectionOverflow, records: collection.length });
     record({ event: 'safe-self-exit', reason, collected, code: 73 });
     process.exit(73);
   };
