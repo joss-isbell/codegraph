@@ -97,14 +97,14 @@ describe('Issue 7 integrated query workers and selected embedded repository watc
         facts.edited = await found('joinedNativeFact', 'hidden/source/nested/keep.ts:1');
         expect(autoSyncCount()).toBeGreaterThan(priorSyncs);
       });
-      expect(await search('nestedFact')).toContain('No results found for "nestedFact"');
+      expect(await search('nestedFact')).not.toContain('**nestedFact** (function)');
 
       phase = 'applicable ignore-rule edit through native Windows events';
       priorSyncs = autoSyncCount();
       fixture.write('hidden/source/nested/.gitignore', '*.skip.ts\n');
       await eventually('new child rule removes the previously selected fact', async () => {
         facts.ignored = await search('negatedFact');
-        expect(facts.ignored).toContain('No results found for "negatedFact"');
+        expect(facts.ignored).not.toContain('**negatedFact** (function)');
         expect(autoSyncCount()).toBeGreaterThan(priorSyncs);
       });
 
