@@ -1,0 +1,187 @@
+{
+  "schema": "cg47.public-figure-provenance.v1",
+  "rendererSha256": "C06322BCE1A57CBE9F710B65AA65E0D424338EA9029F5C6F714A1610CB149334",
+  "matplotlib": "3.11.2",
+  "unit": {
+    "name": "MiB",
+    "bytes": 1048576
+  },
+  "arms": [
+    {
+      "armAlias": "control",
+      "label": "Control (observer off)",
+      "nativeSourceAlias": "control-native-samples",
+      "phaseSourceAlias": "control-phases",
+      "reviewSourceAlias": "role-review",
+      "isolates": []
+    },
+    {
+      "armAlias": "observer",
+      "label": "Observer on",
+      "nativeSourceAlias": "observer-native-samples",
+      "phaseSourceAlias": "observer-phases",
+      "reviewSourceAlias": "role-review",
+      "isolates": [
+        {
+          "alias": "observer-isolate-01",
+          "label": "Proxy main isolate",
+          "sourceAlias": "observer-isolate-01"
+        },
+        {
+          "alias": "observer-isolate-02",
+          "label": "Engine main isolate",
+          "sourceAlias": "observer-isolate-02"
+        },
+        {
+          "alias": "observer-isolate-03",
+          "label": "Example pool worker A",
+          "sourceAlias": "observer-isolate-03"
+        },
+        {
+          "alias": "observer-isolate-04",
+          "label": "Example pool worker B",
+          "sourceAlias": "observer-isolate-04"
+        },
+        {
+          "alias": "observer-isolate-05",
+          "label": "Example pool worker C",
+          "sourceAlias": "observer-isolate-05"
+        },
+        {
+          "alias": "observer-isolate-06",
+          "label": "Later reheat worker",
+          "sourceAlias": "observer-isolate-06"
+        }
+      ]
+    }
+  ],
+  "sources": [
+    {
+      "alias": "role-review",
+      "sha256": "1A63EAD4A045D2ACD931ABBEB5BAE3C7EC1E507594BFF9DFF043EAA5759755FD",
+      "bytes": 8115
+    },
+    {
+      "alias": "closed-seal",
+      "sha256": "6736B56C2A233A61F0CEBDAD451CE1AAF79385FE01B0212414B063C95A94548D",
+      "bytes": 24748
+    },
+    {
+      "alias": "control-native-samples",
+      "sha256": "E86040340BBF8B1EFD5C87E3B16315E90028DE57B33DCFDFD4BCA8D67CB5A2CD",
+      "bytes": 1289321
+    },
+    {
+      "alias": "control-native-incarnations",
+      "sha256": "A4FB4F2929A5D99C9C08A410C54A5D4AE4020AA32B3F475A5A1A397A0761859D",
+      "bytes": 95699
+    },
+    {
+      "alias": "control-phases",
+      "sha256": "ED16C6DC9452F21F4521A4E663F3B6AE8B73B03C3468095A7511DCF9A903CF83",
+      "bytes": 412585
+    },
+    {
+      "alias": "observer-native-samples",
+      "sha256": "FA3EEBFCE635807F9DC93FD61BAD5B35AF2752C3D891E16C31C0C6AC6CD4E7A0",
+      "bytes": 1287168
+    },
+    {
+      "alias": "observer-native-incarnations",
+      "sha256": "1111281D54981CF24DF67EC9905959AA558981EEA30771254DA43E7F11577F06",
+      "bytes": 96211
+    },
+    {
+      "alias": "observer-phases",
+      "sha256": "62A4D4CD130E06E68C4E202F07D42C22D868980D8FB40A2CE53D02BC3A5FB03F",
+      "bytes": 413458
+    },
+    {
+      "alias": "observer-isolate-01",
+      "sha256": "E5E388B10D58198E0C630ED7D87C69FFF3C532A224D3BDA3CFB5A238BB76DA8D",
+      "bytes": 604145
+    },
+    {
+      "alias": "observer-isolate-02",
+      "sha256": "A5C953D9223016351410626DB7FB515866D234AA565AD9FD8E7B8BFB70C02CF3",
+      "bytes": 2447595
+    },
+    {
+      "alias": "observer-isolate-03",
+      "sha256": "CCBDE3FB5C186336A92F72CE2F20BA94CE99562FDFF3D0E01EF794706FF35CB3",
+      "bytes": 105303
+    },
+    {
+      "alias": "observer-isolate-04",
+      "sha256": "045FBC3E0BCA4340CE6D53082D37F00B3A87FCB08AA7C3921D81CBEB7908BA0B",
+      "bytes": 69996
+    },
+    {
+      "alias": "observer-isolate-05",
+      "sha256": "3F2A2388BB6B77577633DCD2ADE355E938F35C363497751E0A7C23C66CE59007",
+      "bytes": 55133
+    },
+    {
+      "alias": "observer-isolate-06",
+      "sha256": "D2F077F9348F70CD07DFB571B52AE92E5ABB9F32D9359EFFF2D8ED1CC19B4348",
+      "bytes": 55779
+    }
+  ],
+  "scope": "Separate positively identified main engine/proxy private commit; separate selected periodic isolate heaps. Not a product-group total or physical-RAM measure.",
+  "metricDefinitions": {
+    "privateCommitMiB": "Windows Process(*) Private Bytes divided by 1048576; private committed virtual memory for one native process incarnation, including its threads.",
+    "heapUsed": "Periodic process.memoryUsage().heapUsed divided by 1048576 for one V8 isolate.",
+    "heapTotal": "Periodic process.memoryUsage().heapTotal divided by 1048576 for one V8 isolate; contains heapUsed, not additive."
+  },
+  "gapPolicy": {
+    "nativeSeconds": {
+      "control": 1.5,
+      "observer": 1.5
+    },
+    "isolateSeconds": {
+      "control": 1.75,
+      "observer": 1.75
+    },
+    "missing": "Missing/invalid observations and declared time/sequence gaps break curves. No fake zero or gap-fill; no event-weighted snapshot substitution."
+  },
+  "coverage": "Main-owner selection and helper/expected-incarnation context are independently reviewed. Global quiet ticks do not prove an owner's alive lifetime. Samples are approximately 1 Hz, not exact continuous peaks.",
+  "visualQa": "Actual native and isolate PNG exports inspected at original size and in 1024-pixel-wide report previews. Labels, phase boundaries, zero-based measured axes, line styles, selection caveat and scope footer are readable without overlap. The unobserved reheat isolate panel has no numeric scale or fake zero. Final containing Markdown layout remains a publication review boundary.",
+  "wholeGroupCoverage": false,
+  "outputs": [
+    {
+      "name": "figure-captions.md",
+      "sha256": "2E8C17726FE5BD716753EAF5AB7C4599307127E07201EC8417E44A284D59E5CF",
+      "bytes": 1537
+    },
+    {
+      "name": "isolate-heaps-data.csv",
+      "sha256": "3644374681CFE94DA5685B712D6AB5D1486739F141337C1236EA7238025D5AB1",
+      "bytes": 319303
+    },
+    {
+      "name": "isolate-heaps-observer.png",
+      "sha256": "F38941797B53F5486B77C07BEE81F6B123C5D1F7C196B69C95052419A8D52767",
+      "bytes": 348487
+    },
+    {
+      "name": "isolate-heaps-observer.svg",
+      "sha256": "63BA58891F612E990DB65A0F811A1992D6CD6B535468EBDF2D0DF26092A0EF49",
+      "bytes": 214961
+    },
+    {
+      "name": "main-process-private-commit-data.csv",
+      "sha256": "FD1820FD271820C7C6DA296C49E185B08D9BA759F1BED64355D58EE7EC99C6F0",
+      "bytes": 302929
+    },
+    {
+      "name": "main-process-private-commit.png",
+      "sha256": "5B64D721ED62BAD5673ADC88C02C1CDA73F205F938227259DC23FD95E3EEAD0F",
+      "bytes": 179994
+    },
+    {
+      "name": "main-process-private-commit.svg",
+      "sha256": "DF30279DC76235653C2128C5C791C640D62AD9B806782114B64976060B28DD9E",
+      "bytes": 111214
+    }
+  ]
+}

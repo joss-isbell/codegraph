@@ -1,0 +1,163 @@
+{
+  "schema": "cg47.public-figure-provenance.v1",
+  "rendererSha256": "D0CB1F2360CF82C928A586559EE5E4532B9F8AADFB1235068D39FDED0250137C",
+  "matplotlib": "3.11.2",
+  "unit": {
+    "name": "MiB",
+    "bytes": 1048576
+  },
+  "arms": [
+    {
+      "armAlias": "agent",
+      "label": "Ordinary agent (3 MCP calls / 3 turns)",
+      "nativeSourceAlias": "agent-native-samples",
+      "phaseSourceAlias": "agent-phases-canonical",
+      "reviewSourceAlias": "agent-role-review",
+      "isolates": [
+        {
+          "alias": "agent-isolate-01",
+          "label": "Proxy main isolate",
+          "sourceAlias": "agent-isolate-01"
+        },
+        {
+          "alias": "agent-isolate-02",
+          "label": "Engine main isolate",
+          "sourceAlias": "agent-isolate-02"
+        },
+        {
+          "alias": "agent-isolate-03",
+          "label": "Initial query worker",
+          "sourceAlias": "agent-isolate-03"
+        },
+        {
+          "alias": "agent-isolate-04",
+          "label": "Reheat query worker",
+          "sourceAlias": "agent-isolate-04"
+        }
+      ]
+    }
+  ],
+  "sources": [
+    {
+      "alias": "agent-role-review",
+      "sha256": "41C17EBE6F312064DCD8668E93E62669E1E5805D759569DAEC96BCFEA80BA7AF",
+      "bytes": 8096
+    },
+    {
+      "alias": "agent-closed-seal",
+      "sha256": "22321FCA16CDDF39E45A1B5E93C905A892443C19957B3CD6B7EB1E10F8DDBA4C",
+      "bytes": 39632
+    },
+    {
+      "alias": "agent-native-samples",
+      "sha256": "3E8788A1FD79D57576AE135C612BC0490A6FC89BFDF4029A1CA24B3FCF7A471F",
+      "bytes": 1144864
+    },
+    {
+      "alias": "agent-native-incarnations",
+      "sha256": "CC5ACA4FC92F5ADDF3E89E022D379F3EE69E52FD35BE8FCCD7E6A7FBBDB6AA7B",
+      "bytes": 4637
+    },
+    {
+      "alias": "agent-native-review",
+      "sha256": "E7BB88F7443AABC8E1333CE612582347AEB1E0D81FF9DE47CA563912C5D73160",
+      "bytes": 2943662
+    },
+    {
+      "alias": "agent-closed-review",
+      "sha256": "3944E730D1CC036EBD38E8B5A3310B90CBD93735302650A55B8F4DC5A2EB9ACA",
+      "bytes": 58085
+    },
+    {
+      "alias": "agent-client-phases",
+      "sha256": "CF3DAC71753A1426479BA424B736340073F5243F0742571467AD51E7CA436E60",
+      "bytes": 13986
+    },
+    {
+      "alias": "agent-client-result",
+      "sha256": "5F12F4F948BED82BD67F0E721EBA043A17FB1B4DFEF5AADE84CD80CAAD4B77FA",
+      "bytes": 14561
+    },
+    {
+      "alias": "agent-phases-canonical",
+      "sha256": "9CAE274787D14368B009D9C7CA9524D4BC9850ACAF5DA5C1FD82FB7279BAD6F5",
+      "bytes": 1134
+    },
+    {
+      "alias": "agent-isolate-01",
+      "sha256": "FDC29FB2553156067B523F7781F09F29B88E9F4DBFC3FE730C43EBC537DDB066",
+      "bytes": 678153
+    },
+    {
+      "alias": "agent-isolate-02",
+      "sha256": "B45DB48831CC750910DA659129342DC63B9F0CB5DFBE62863AEECD1A333A852A",
+      "bytes": 869371
+    },
+    {
+      "alias": "agent-isolate-03",
+      "sha256": "775E2768722301C81CA31C56B51A5FAC0ED3EEC2536E6E68A4E82643928A5DC6",
+      "bytes": 44070
+    },
+    {
+      "alias": "agent-isolate-04",
+      "sha256": "490D210F37D96474636D3C056B1C35FB0758DF532447107FD22492123F115602",
+      "bytes": 34407
+    }
+  ],
+  "scope": "Separate positively identified main engine/proxy private commit; separate selected periodic isolate heaps. Not a product-group total or physical-RAM measure.",
+  "windowContext": "Separate ordinary single-lead agent arm: three MCP calls across three completed model turns, not the deterministic matched burst. Plot starts at the actual first model-turn offer and ends at actual reheat-turn completion. Active/model-turn intervals are not CodeGraph-only execution. Actual connected quiet bounds come from the client result after native snapshots, not raw phase envelopes. Initial standing, the later scheduled 60-second post-reheat quiet and post-exit observation are excluded; that later quiet is not the same equilibrium window. No post-exit zero tail. Reheat worker has only three periodic samples in the plotted window: points, not a supported continuous trend.",
+  "metricDefinitions": {
+    "privateCommitMiB": "Windows Process(*) Private Bytes divided by 1048576; private committed virtual memory for one native process incarnation, including its threads.",
+    "heapUsed": "Periodic process.memoryUsage().heapUsed divided by 1048576 for one V8 isolate.",
+    "heapTotal": "Periodic process.memoryUsage().heapTotal divided by 1048576 for one V8 isolate; contains heapUsed, not additive."
+  },
+  "gapPolicy": {
+    "nativeSeconds": {
+      "agent": 1.5
+    },
+    "isolateSeconds": {
+      "agent": 1.75
+    },
+    "missing": "Missing/invalid observations and declared time/sequence gaps break curves. No fake zero or gap-fill; no event-weighted snapshot substitution."
+  },
+  "coverage": "Main-owner selection and helper/expected-incarnation context are independently reviewed. Global quiet ticks do not prove an owner's alive lifetime. Samples are approximately 1 Hz, not exact continuous peaks.",
+  "visualQa": "Actual native and four-isolate PNG exports inspected at full size and in 1024-pixel-wide report previews. Native/heap units, actual phase labels, separate owner scope and ordinary single-lead three-call/three-turn demand labels are readable. Heap legend headroom prevents curve/text overlap. Three reheat periodic observations are points only; no later-quiet or post-exit tail is plotted. Final containing Markdown layout remains report-owner integration review.",
+  "wholeGroupCoverage": false,
+  "outputs": [
+    {
+      "name": "figure-captions-agent.md",
+      "sha256": "FD4D1CD521CA8C5971037BE5449FC63D4B66981C1503BCC42B1EE40B69D7CBAA",
+      "bytes": 2236
+    },
+    {
+      "name": "isolate-heaps-agent-data.csv",
+      "sha256": "45C850EC8D5EC40C6BAB280F3EBCB6D485C66E57C85BEA1A01AF5EC57E02FF3D",
+      "bytes": 367392
+    },
+    {
+      "name": "isolate-heaps-agent.png",
+      "sha256": "FB4F90A10A69EEA3B745FB681691047231677C10706BCB670DE5612C854AB616",
+      "bytes": 251452
+    },
+    {
+      "name": "isolate-heaps-agent.svg",
+      "sha256": "9FD25C492A2EE360CA23E913B1072D0C441BB3119F150866390D35488A2830C2",
+      "bytes": 166451
+    },
+    {
+      "name": "main-process-private-commit-agent-data.csv",
+      "sha256": "270E5F60F66918E5E77EA30E67411E15CB756B3E2D3FEFFC78F47555CBFE5202",
+      "bytes": 173872
+    },
+    {
+      "name": "main-process-private-commit-agent.png",
+      "sha256": "04357619198B1E555AA9B0CCB652AE3293379ABF7A146C11E32B489E0B11FC1A",
+      "bytes": 128885
+    },
+    {
+      "name": "main-process-private-commit-agent.svg",
+      "sha256": "1AF0D5E14F8AA67D3FCC8AE4AD87DE8A2D55CAEC92FEDE800BD55416B4ED1C66",
+      "bytes": 85418
+    }
+  ]
+}
